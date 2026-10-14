@@ -1,6 +1,6 @@
 //! A bounded, non-following scanner. Plans select entries; they are not filesystem snapshots.
 use crate::{Error, Result, check_cancel, source_file, validate_path};
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fs::{self, File, ReadDir};
 use std::io;
@@ -8,14 +8,13 @@ use std::mem::size_of;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::time::SystemTime;
 use vartacopy_platform_windows as platform;
 
 pub const MAX_ENTRIES: usize = 100_000;
 pub const MAX_DEPTH: usize = 256;
 pub const MAX_PLAN_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReparsePolicy {
     #[default]
@@ -23,7 +22,7 @@ pub enum ReparsePolicy {
     Skip,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ScanLimits {
     pub max_entries: usize,
     pub max_depth: usize,
@@ -46,7 +45,7 @@ pub struct ScanOptions {
     pub limits: ScanLimits,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     File,
@@ -55,19 +54,19 @@ pub enum EntryKind {
     Unsupported,
 }
 
-#[derive(Debug)]
-pub(crate) struct Snapshot {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
     pub identity: platform::Identity,
-    modified: SystemTime,
+    modified: u64,
     length: u64,
     attributes: u32,
-    streams: Vec<platform::Stream>,
+    pub(crate) streams: Vec<platform::Stream>,
 }
 impl Snapshot {
     pub(crate) fn validate(&self, file: &File, path: &Path, directory: bool) -> Result<()> {
         let metadata = file.metadata()?;
         if self.identity != platform::identity(file)?
-            || self.modified != metadata.modified()?
+            || self.modified != metadata.last_write_time()
             || (!directory && self.length != metadata.len())
             || self.attributes != metadata.file_attributes()
             || self.streams != platform::streams(path)?
@@ -243,7 +242,7 @@ fn inspect(
     entry.streams = streams.len();
     entry.snapshot = Some(Snapshot {
         identity: platform::identity(&file)?,
-        modified: metadata.modified()?,
+        modified: metadata.last_write_time(),
         length: metadata.len(),
         attributes: metadata.file_attributes(),
         streams,

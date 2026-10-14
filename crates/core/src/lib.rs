@@ -1,5 +1,6 @@
 //! Windows-only verified copy engine, bounded planning, and directory traversal.
 //! ACL/owner are inherited at the destination. Move and durable resume are not implemented.
+pub mod journal;
 pub mod planner;
 pub mod tree;
 use serde::Serialize;
@@ -16,6 +17,12 @@ const BUFFER_SIZE: usize = 1024 * 1024;
 pub enum Error {
     #[error("{0}")]
     Io(#[from] io::Error),
+    #[error("journal database error: {0}")]
+    Database(#[from] rusqlite::Error),
+    #[error("journal serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("journal rejected: {0}")]
+    Journal(String),
     #[error("operation cancelled")]
     Cancelled,
     #[error("verification failed: {0}")]
@@ -34,7 +41,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize)]
 pub enum Conflict {
     Error,
     Skip,

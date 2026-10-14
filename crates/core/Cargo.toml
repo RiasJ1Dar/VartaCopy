@@ -10,10 +10,11 @@ vartacopy-platform-windows = { path = "../platform-windows" }
 blake3.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.40", features = ["bundled", "serialize"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-rusqlite = { version = "0.40", features = ["bundled"] }
 
 [lints]
 workspace = true

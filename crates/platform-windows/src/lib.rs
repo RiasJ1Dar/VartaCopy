@@ -8,11 +8,11 @@ use std::mem::{offset_of, size_of};
 use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::*;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Identity {
     pub volume_serial: u64,
     pub file_id: [u8; 16],
@@ -34,11 +34,91 @@ impl From<&Path> for PathRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stream {
     /// Empty for the unnamed data stream, otherwise the full :name:$DATA suffix.
+    #[serde(with = "native_os")]
     pub name: OsString,
     pub size: u64,
+}
+
+mod native_os {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+    use std::os::windows::ffi::OsStringExt;
+    pub fn serialize<S: Serializer>(value: &OsStr, serializer: S) -> Result<S::Ok, S::Error> {
+        value
+            .encode_wide()
+            .collect::<Vec<u16>>()
+            .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<OsString, D::Error> {
+        let units = Vec::<u16>::deserialize(deserializer)?;
+        if units.len() > 32767 || units.contains(&0) {
+            return Err(serde::de::Error::custom("invalid native string"));
+        }
+        Ok(OsString::from_wide(&units))
+    }
+}
+
+/// Metadata-only handle pins an object name without denying SQLite/data writes.
+pub fn guard_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if is_reparse(&file.metadata()?) || !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ordinary file required",
+        ));
+    }
+    Ok(file)
+}
+
+pub fn exclusive_lock(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if is_reparse(&file.metadata()?) || !file.metadata()?.is_file() {
+        return Err(io::Error::other("lock must be an ordinary file"));
+    }
+    Ok(file)
+}
+
+pub fn link_count(file: &File) -> io::Result<u32> {
+    // SAFETY: this output struct contains only integers and integer structs.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: file and correctly sized output pointer remain valid.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.nNumberOfLinks)
+}
+
+/// SQLite WAL storage is restricted to a local fixed volume.
+pub fn require_local_fixed_volume(path: &Path) -> io::Result<()> {
+    let name = wide(path.as_os_str())?;
+    let mut root = vec![0u16; 32768];
+    // SAFETY: both buffers are valid and root has the advertised capacity.
+    if unsafe { GetVolumePathNameW(name.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: GetVolumePathNameW wrote a NUL-terminated volume root.
+    if unsafe { GetDriveTypeW(root.as_ptr()) } != 3 {
+        // DRIVE_FIXED
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "journal requires a local fixed volume",
+        ));
+    }
+    Ok(())
 }
 
 fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
@@ -219,6 +299,7 @@ pub struct Stage {
     path: PathBuf,
     published: bool,
     delete_requested: bool,
+    cleanup_on_drop: bool,
 }
 
 impl Stage {
@@ -243,11 +324,40 @@ impl Stage {
             path,
             published: false,
             delete_requested: false,
+            cleanup_on_drop: true,
         })
     }
 
     pub fn file(&mut self) -> &mut File {
         &mut self.file
+    }
+
+    /// Adopt only an exact recorded staging identity. Never clean a mismatching file.
+    pub fn reopen(path: &Path, expected: &Identity) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(0x8000_0000 | 0x4000_0000 | 0x0001_0000)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if is_reparse(&file.metadata()?) || identity(&file)? != *expected {
+            return Err(io::Error::other(
+                "staging identity mismatch; file was not adopted",
+            ));
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            published: false,
+            delete_requested: false,
+            cleanup_on_drop: false,
+        })
+    }
+
+    /// Once ownership is journaled, retain the stage for explicit recovery.
+    pub fn preserve(&mut self) {
+        self.cleanup_on_drop = false;
     }
     pub fn path(&self) -> &Path {
         &self.path
@@ -335,6 +445,9 @@ impl Stage {
 
 impl Drop for Stage {
     fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
         if let Err(error) = self.discard() {
             eprintln!(
                 "vartacopy: staging cleanup failed for {}: {error}",

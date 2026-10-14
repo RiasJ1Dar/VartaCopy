@@ -594,6 +594,7 @@ dependencies = [
  "blake3",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "vartacopy-platform-windows",
