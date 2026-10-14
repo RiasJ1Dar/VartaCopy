@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "VartaCopy — цільова архітектура",
+    "output": ".archify/architecture-rustcopy-20261014-203000/rustcopy.html",
+    "quality_profile": "showcase",
+    "locale": "en"
+  },
+  "components": [
+    {
+      "id": "interfaces",
+      "type": "frontend",
+      "label": "GUI та CLI",
+      "sublabel": "Команди, прогрес, конфлікти",
+      "pos": [
+        40,
+        40
+      ],
+      "size": [
+        210,
+        90
+      ]
+    },
+    {
+      "id": "planner",
+      "type": "backend",
+      "label": "План операції",
+      "sublabel": "Сканер, правила, можливості",
+      "pos": [
+        370,
+        40
+      ],
+      "size": [
+        210,
+        90
+      ]
+    },
+    {
+      "id": "scheduler",
+      "type": "backend",
+      "label": "Черга за носіями",
+      "sublabel": "Пауза, ліміти, повтори",
+      "pos": [
+        710,
+        40
+      ],
+      "size": [
+        210,
+        90
+      ]
+    },
+    {
+      "id": "transfer",
+      "type": "backend",
+      "label": "Копіювання та verify",
+      "sublabel": "Усі потоки → readback → хеш",
+      "tag": "Publish лише після verify",
+      "pos": [
+        710,
+        290
+      ],
+      "size": [
+        210,
+        100
+      ]
+    },
+    {
+      "id": "journal",
+      "type": "database",
+      "label": "Журнал SQLite",
+      "sublabel": "План, intent, checkpoint, result",
+      "pos": [
+        370,
+        290
+      ],
+      "size": [
+        210,
+        100
+      ]
+    },
+    {
+      "id": "recovery",
+      "type": "backend",
+      "label": "Відновлення",
+      "sublabel": "Звірка стану перед resume",
+      "pos": [
+        370,
+        550
+      ],
+      "size": [
+        210,
+        100
+      ]
+    },
+    {
+      "id": "windows",
+      "type": "backend",
+      "label": "Windows adapter",
+      "sublabel": "File ID, ADS, ACL, публікація",
+      "tag": "Move: verify + commit → delete",
+      "pos": [
+        710,
+        550
+      ],
+      "size": [
+        210,
+        100
+      ]
+    },
+    {
+      "id": "filesystem",
+      "type": "external",
+      "label": "Файлова система",
+      "sublabel": "Джерело, staging, результат",
+      "pos": [
+        1040,
+        550
+      ],
+      "size": [
+        190,
+        100
+      ]
+    },
+    {
+      "id": "explorer",
+      "type": "frontend",
+      "label": "Explorer",
+      "sublabel": "Контекстне меню, локальний IPC",
+      "tag": "Після стабілізації ядра",
+      "pos": [
+        40,
+        290
+      ],
+      "size": [
+        210,
+        100
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "command",
+      "from": "interfaces",
+      "to": "planner",
+      "label": "Запит"
+    },
+    {
+      "id": "schedule",
+      "from": "planner",
+      "to": "scheduler",
+      "label": "Завдання"
+    },
+    {
+      "id": "dispatch",
+      "from": "scheduler",
+      "to": "transfer",
+      "label": "Виконання",
+      "variant": "emphasis"
+    },
+    {
+      "id": "intent",
+      "from": "planner",
+      "to": "journal",
+      "label": "План та intent"
+    },
+    {
+      "id": "checkpoint",
+      "from": "transfer",
+      "to": "journal",
+      "label": "Стан та хеші"
+    },
+    {
+      "id": "recover",
+      "from": "journal",
+      "to": "recovery",
+      "label": "Незавершені"
+    },
+    {
+      "id": "reconcile",
+      "from": "recovery",
+      "to": "windows",
+      "label": "Звірка"
+    },
+    {
+      "id": "io",
+      "from": "transfer",
+      "to": "windows",
+      "label": "Потоки та метадані",
+      "variant": "emphasis"
+    },
+    {
+      "id": "disk",
+      "from": "windows",
+      "to": "filesystem",
+      "label": "I/O"
+    },
+    {
+      "id": "shell",
+      "from": "explorer",
+      "to": "planner",
+      "label": "IPC"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Перший робочий зріз",
+      "items": [
+        "Це проєкт майбутньої системи, а не карта вже готових функцій.",
+        "Зараз: Rust workspace, Windows CLI для одного файла, staging, BLAKE3 readback, явні помилки.",
+        "Далі: дерево каталогів, журнал і відновлення; GUI після перевірки ядра."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Сильні сторони аналогів",
+      "items": [
+        "TeraCopy: зручна черга, конфлікти, зрозумілі результати перевірки.",
+        "FastCopy: спеціалізація I/O за носіями та вимірювана продуктивність.",
+        "Robocopy: повтори й метадані; rsync: відновлення та перевірка вмісту.",
+        "Kevat, BetterCopy, parcopy: Rust, потокова обробка та простий CLI."
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Правила цілісності",
+      "items": [
+        "Однакові size і mtime не доводять однаковий вміст.",
+        "Move видаляє джерело лише після перевірки всіх вибраних потоків і метаданих та фіксації результату.",
+        "Журнал і файлова система не утворюють спільну транзакцію: потрібна звірка після збою.",
+        "Непідтримувані метадані й помилки не можна приховувати успішним статусом."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Відновлення та розвиток",
+      "items": [
+        "Відновлення повертає завдання в чергу тільки після звірки File ID, потоків і контрольних сум.",
+        "Windows: зберігати UTF-16 без втрат; reparse points обробляти за явною політикою.",
+        "1.0: GUI, Explorer, тестування SSD/HDD/USB/SMB і контрольовані benchmark.",
+        "Пізніше: кілька цілей, VSS, LocalSend та інші ОС — окремими етапами."
+      ]
+    }
+  ]
+}

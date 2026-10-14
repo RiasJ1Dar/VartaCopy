@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "architecture",
+  "quality": "showcase",
+  "specification": {
+    "path": "D:\\teracopy\\.archify\\architecture-rustcopy-20261014-203000\\candidate.json",
+    "sha256": "f40099bd827304fd946f5b5403a31d1277f3dc50c6186d5f2c7c02cbf9ce61eb",
+    "bytes": 6610
+  },
+  "artifact": {
+    "path": "D:\\teracopy\\.archify\\architecture-rustcopy-20261014-203000\\rustcopy.html",
+    "sha256": "03bd177a86f33d9fa676077f3571338f0c6eb1b1070e1ae353ad528cac21b2b2",
+    "bytes": 827364
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "D:\\teracopy\\.archify\\architecture-rustcopy-20261014-203000\\rustcopy.finalize.json",
+    "summaryReceipt": "D:\\teracopy\\.archify\\architecture-rustcopy-20261014-203000\\rustcopy.finalize-summary.json",
+    "browserCheckReceipt": "D:\\teracopy\\.archify\\architecture-rustcopy-20261014-203000\\rustcopy.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.1.0",
+    "availableVersion": "3.1.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-14T14:35:34.527Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 4967
+}
