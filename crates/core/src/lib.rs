@@ -1,7 +1,9 @@
 //! Windows-only verified copy engine, bounded planning, and directory traversal.
 //! ACL/owner are inherited at the destination. Move and durable resume are not implemented.
+pub mod control;
 pub mod journal;
 pub mod planner;
+pub mod recovery;
 pub mod tree;
 use serde::Serialize;
 use std::ffi::OsStr;

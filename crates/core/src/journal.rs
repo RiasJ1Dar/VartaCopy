@@ -16,6 +16,13 @@ use vartacopy_platform_windows as platform;
 
 const APPLICATION_ID: i32 = 0x56415254;
 const VERSION: i32 = 1;
+pub fn default_path() -> Result<PathBuf> {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| Error::Journal("LOCALAPPDATA is not configured".into()))?;
+    let directory = PathBuf::from(root).join("VartaCopy");
+    std::fs::create_dir_all(&directory)?;
+    Ok(directory.join("jobs.sqlite3"))
+}
 fn sql_num<T: TryInto<i64>>(value: T) -> Result<i64> {
     value
         .try_into()
@@ -466,6 +473,17 @@ impl Journal {
             params![job, sql_num(ordinal)?],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn retarget(&mut self, job: i64, ordinal: usize, target: &Path) -> Result<()> {
+        if self.db.execute(
+            "UPDATE entries SET target=?3 WHERE job_id=?1 AND ordinal=?2 AND state='publishing'",
+            params![job, sql_num(ordinal)?, encode_path(target)],
+        )? != 1
+        {
+            return Err(Error::Journal("retarget requires publishing state".into()));
+        }
         Ok(())
     }
 

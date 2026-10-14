@@ -2,6 +2,80 @@ use std::fs;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Output};
 
+#[test]
+fn cli_enqueue_jobs_resume_and_idempotent_completed_job() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("file");
+    let destination = root.path().join("dest");
+    let journal = root.path().join("jobs.sqlite");
+    fs::create_dir(&destination).unwrap();
+    fs::write(&source, b"durable").unwrap();
+    let output = cli(&[
+        "copy".as_ref(),
+        source.as_os_str(),
+        destination.as_os_str(),
+        "--journal".as_ref(),
+        journal.as_os_str(),
+        "--enqueue".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = queued["id"].as_i64().unwrap().to_string();
+    assert_eq!(queued["status"], "queued");
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    let output = cli(&[
+        "jobs".as_ref(),
+        "--journal".as_ref(),
+        journal.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let jobs: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(jobs.as_array().unwrap().len(), 1);
+    for _ in 0..2 {
+        let output = cli(&[
+            "resume".as_ref(),
+            id.as_ref(),
+            "--journal".as_ref(),
+            journal.as_os_str(),
+            "--json".as_ref(),
+        ]);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"],
+            "completed"
+        );
+        assert_eq!(fs::read(destination.join("file")).unwrap(), b"durable");
+    }
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+}
+
+#[test]
+fn cli_durable_conflict_is_not_false_success_and_keeps_job_for_inspection() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("file");
+    let destination = root.path().join("dest");
+    let journal = root.path().join("jobs.sqlite");
+    fs::create_dir(&destination).unwrap();
+    fs::write(&source, b"new").unwrap();
+    fs::write(destination.join("file"), b"original").unwrap();
+    let output = cli(&[
+        "copy".as_ref(),
+        source.as_os_str(),
+        destination.as_os_str(),
+        "--journal".as_ref(),
+        journal.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "interrupted");
+    assert!(report["job_id"].is_i64());
+    assert!(report["error"].is_string());
+    assert_eq!(fs::read(destination.join("file")).unwrap(), b"original");
+}
+
 fn cli(args: &[&std::ffi::OsStr]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_vartacopy"))
         .args(args)

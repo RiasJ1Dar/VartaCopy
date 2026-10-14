@@ -368,7 +368,10 @@ impl Stage {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
-        if is_reparse(&attributes.metadata()?) || identity(&attributes)? != *expected {
+        if is_reparse(&attributes.metadata()?)
+            || identity(&attributes)? != *expected
+            || link_count(&attributes)? != 1
+        {
             return Err(io::Error::other(
                 "staging identity mismatch; attributes unchanged",
             ));
@@ -399,7 +402,8 @@ impl Stage {
             .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
-        if is_reparse(&file.metadata()?) || identity(&file)? != *expected {
+        if is_reparse(&file.metadata()?) || identity(&file)? != *expected || link_count(&file)? != 1
+        {
             return Err(io::Error::other(
                 "staging identity mismatch; file was not adopted",
             ));

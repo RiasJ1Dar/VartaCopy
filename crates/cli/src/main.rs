@@ -7,8 +7,10 @@ use std::sync::{
 };
 use vartacopy_core::{
     Conflict, Error,
+    control::Control,
+    journal::{self, Journal},
     planner::{self, ReparsePolicy, ScanLimits, ScanOptions},
-    tree,
+    recovery, tree,
 };
 
 #[derive(Parser)]
@@ -18,6 +20,9 @@ use vartacopy_core::{
     about = "Verified Windows file and directory copy"
 )]
 struct Args {
+    /// Persistent job database; enables resumable copy.
+    #[arg(long, global = true)]
+    journal: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -30,6 +35,9 @@ enum Command {
         destination: PathBuf,
         #[arg(long)]
         dry_run: bool,
+        /// Save the plan without starting it.
+        #[arg(long)]
+        enqueue: bool,
         #[arg(long, value_enum, default_value = "error")]
         on_conflict: Policy,
         /// Refuse reparse points, or explicitly skip them with a partial result.
@@ -48,6 +56,21 @@ enum Command {
     Verify {
         left: PathBuf,
         right: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List saved jobs (pages of up to 256).
+    Jobs {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume or reconcile a persisted job.
+    Resume {
+        job_id: i64,
         #[arg(long)]
         json: bool,
     },
@@ -80,12 +103,17 @@ fn emit<T: serde::Serialize + std::fmt::Debug>(
     Ok(())
 }
 
-fn run(args: Args, cancel: &AtomicBool) -> Result<u8, Box<dyn std::error::Error>> {
+fn run(
+    args: Args,
+    cancel: &AtomicBool,
+    control: &Control,
+) -> Result<u8, Box<dyn std::error::Error>> {
     match args.command {
         Command::Copy {
             source,
             destination,
             dry_run,
+            enqueue,
             on_conflict,
             reparse,
             max_entries,
@@ -114,6 +142,22 @@ fn run(args: Args, cancel: &AtomicBool) -> Result<u8, Box<dyn std::error::Error>
                 Policy::Skip => Conflict::Skip,
                 Policy::KeepBoth => Conflict::KeepBoth,
             };
+            if args.journal.is_some() || enqueue {
+                let path = match args.journal {
+                    Some(path) => path,
+                    None => journal::default_path()?,
+                };
+                let mut journal = Journal::open(&path)?;
+                let id = journal.enqueue(&plan, conflict)?;
+                if enqueue {
+                    emit(&journal.job(id)?, json)?;
+                    return Ok(0);
+                }
+                let report = recovery::run(&mut journal, id, control, &mut |_| Ok(()))?;
+                let code = report.exit_code();
+                emit(&report, json)?;
+                return Ok(code);
+            }
             let outcome = tree::execute(&plan, conflict, cancel)?;
             let code = outcome.exit_code();
             emit(&outcome, json)?;
@@ -127,6 +171,30 @@ fn run(args: Args, cancel: &AtomicBool) -> Result<u8, Box<dyn std::error::Error>
             )?;
             Ok(0)
         }
+        Command::Jobs {
+            limit,
+            offset,
+            json,
+        } => {
+            let path = match args.journal {
+                Some(path) => path,
+                None => journal::default_path()?,
+            };
+            let journal = Journal::open(&path)?;
+            emit(&journal.jobs(limit, offset)?, json)?;
+            Ok(0)
+        }
+        Command::Resume { job_id, json } => {
+            let path = match args.journal {
+                Some(path) => path,
+                None => journal::default_path()?,
+            };
+            let mut journal = Journal::open(&path)?;
+            let report = recovery::run(&mut journal, job_id, control, &mut |_| Ok(()))?;
+            let code = report.exit_code();
+            emit(&report, json)?;
+            Ok(code)
+        }
     }
 }
 
@@ -134,14 +202,22 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let cancel = Arc::new(AtomicBool::new(false));
     let signal = cancel.clone();
-    if let Err(error) = ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed)) {
+    let control = Arc::new(Control::default());
+    let control_signal = control.clone();
+    if let Err(error) = ctrlc::set_handler(move || {
+        signal.store(true, Ordering::Relaxed);
+        control_signal.cancel();
+    }) {
         eprintln!("vartacopy: cannot install cancellation handler: {error}");
         return ExitCode::from(1);
     }
     let json = match &args.command {
-        Command::Copy { json, .. } | Command::Verify { json, .. } => *json,
+        Command::Copy { json, .. }
+        | Command::Verify { json, .. }
+        | Command::Jobs { json, .. }
+        | Command::Resume { json, .. } => *json,
     };
-    match run(args, &cancel) {
+    match run(args, &cancel, &control) {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             let cancelled = error

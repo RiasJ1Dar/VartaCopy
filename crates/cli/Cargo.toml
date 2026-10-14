@@ -9,6 +9,14 @@ publish.workspace = true
 name = "vartacopy"
 path = "src/main.rs"
 
+[[bin]]
+name = "vartacopy-fault"
+path = "src/bin/fault.rs"
+required-features = ["test-harness"]
+
+[features]
+test-harness = []
+
 [dependencies]
 vartacopy-core = { path = "../core" }
 clap = { version = "4", features = ["derive"] }
