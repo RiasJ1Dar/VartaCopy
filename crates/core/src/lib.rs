@@ -1,5 +1,7 @@
-//! Initial Windows-only, verified single-file copy engine.
-//! ACL/owner are inherited at the destination; directory traversal and move are not implemented.
+//! Windows-only verified copy engine, bounded planning, and directory traversal.
+//! ACL/owner are inherited at the destination. Move and durable resume are not implemented.
+pub mod planner;
+pub mod tree;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -18,6 +20,11 @@ pub enum Error {
     Cancelled,
     #[error("verification failed: {0}")]
     Verification(String),
+    #[error("scan limit exceeded: {resource} (limit {limit})")]
+    ScanLimit {
+        resource: &'static str,
+        limit: usize,
+    },
     #[error("operation failed: {primary}; staging cleanup also failed: {cleanup}")]
     Cleanup {
         primary: Box<Error>,

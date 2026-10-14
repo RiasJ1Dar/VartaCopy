@@ -12,7 +12,7 @@ use serde::Serialize;
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::*;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Identity {
     pub volume_serial: u64,
     pub file_id: [u8; 16],
@@ -68,6 +68,30 @@ pub fn open_source(path: &Path) -> io::Result<File> {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "reparse point refused",
+        ));
+    }
+    Ok(file)
+}
+
+/// Open an existing directory without following its final reparse point.
+/// Denying DELETE sharing pins its name while descendants are accessed.
+pub fn open_directory(path: &Path, write_attributes: bool) -> io::Result<File> {
+    let access = FILE_READ_ATTRIBUTES
+        | if write_attributes {
+            FILE_WRITE_ATTRIBUTES
+        } else {
+            0
+        };
+    let file = OpenOptions::new()
+        .access_mode(access)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "expected an ordinary directory; reparse points are refused",
         ));
     }
     Ok(file)
@@ -138,7 +162,13 @@ pub fn streams(path: &Path) -> io::Result<Vec<Stream>> {
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // Directories have no unnamed $DATA stream. EOF is an empty manifest,
+        // whereas an unsupported filesystem remains an explicit error.
+        if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+            return Ok(Vec::new());
+        }
+        return Err(error);
     }
     let result = (|| {
         let mut output = Vec::new();
@@ -315,6 +345,17 @@ impl Drop for Stage {
 }
 
 pub fn copy_basic_metadata(source: &File, destination: &File) -> io::Result<()> {
+    set_basic_metadata(source, destination)?;
+    destination.sync_all()
+}
+
+/// Apply directory times/flags after children. This makes no directory-fsync
+/// or power-loss durability claim; it does not flush a directory handle.
+pub fn copy_directory_metadata(source: &File, destination: &File) -> io::Result<()> {
+    set_basic_metadata(source, destination)
+}
+
+fn set_basic_metadata(source: &File, destination: &File) -> io::Result<()> {
     // SAFETY: this Windows output struct contains only integer fields.
     let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
     // SAFETY: info is a writable buffer with the correct layout and size.
@@ -349,5 +390,5 @@ pub fn copy_basic_metadata(source: &File, destination: &File) -> io::Result<()> 
     {
         return Err(io::Error::last_os_error());
     }
-    destination.sync_all()
+    Ok(())
 }
