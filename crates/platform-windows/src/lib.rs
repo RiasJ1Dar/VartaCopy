@@ -1,6 +1,33 @@
 //! Windows file primitives. Publication is by handle and never replaces a name.
 #![cfg(windows)]
 
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn rename_buffer_terminates_every_utf16_alignment() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        for length in 1..=16 {
+            let name = format!("{}-дані.bin", "x".repeat(length));
+            let target = canonical.join(name);
+            let mut stage = Stage::create(&canonical).unwrap();
+            stage.file().write_all(b"payload").unwrap();
+            stage.file().sync_all().unwrap();
+            stage.publish(&target).unwrap();
+            drop(stage);
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"payload",
+                "{}",
+                target.display()
+            );
+        }
+        assert_eq!(std::fs::read_dir(&canonical).unwrap().count(), 16);
+    }
+}
+
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -334,6 +361,37 @@ impl Stage {
 
     /// Adopt only an exact recorded staging identity. Never clean a mismatching file.
     pub fn reopen(path: &Path, expected: &Identity) -> io::Result<Self> {
+        // Clear readonly only on the exact owned object, then recheck identity
+        // after reopening for data writes. No write is made on a mismatching handle.
+        let attributes = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if is_reparse(&attributes.metadata()?) || identity(&attributes)? != *expected {
+            return Err(io::Error::other(
+                "staging identity mismatch; attributes unchanged",
+            ));
+        }
+        use std::os::windows::fs::MetadataExt;
+        if attributes.metadata()?.file_attributes() & FILE_ATTRIBUTE_READONLY != 0 {
+            // SAFETY: integer-only struct; zero timestamps leave them unchanged.
+            let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+            basic.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+            // SAFETY: writable-attributes owned handle and exact output layout.
+            if unsafe {
+                SetFileInformationByHandle(
+                    attributes.as_raw_handle() as HANDLE,
+                    FileBasicInfo,
+                    (&basic as *const FILE_BASIC_INFO).cast(),
+                    size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        drop(attributes);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -372,10 +430,21 @@ impl Stage {
             .open(stream_path(&self.path, name))
     }
 
+    pub fn open_stream(&self, name: &OsStr) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(stream_path(&self.path, name))
+    }
+
     pub fn publish(&mut self, destination: &Path) -> io::Result<()> {
         let target = wide(destination.as_os_str())?;
         let bytes = (target.len() - 1) * size_of::<u16>();
-        let total = offset_of!(FILE_RENAME_INFO, FileName) + bytes;
+        // Win32 requires a terminating NUL even though FileNameLength excludes it.
+        // Include it explicitly: alignment padding is not guaranteed to provide one.
+        let total = offset_of!(FILE_RENAME_INFO, FileName) + target.len() * size_of::<u16>();
         let total_u32 =
             u32::try_from(total).map_err(|_| io::Error::other("rename buffer too large"))?;
         let mut storage = vec![0u64; total.max(size_of::<FILE_RENAME_INFO>()).div_ceil(8)];
@@ -389,7 +458,7 @@ impl Stage {
             std::ptr::copy_nonoverlapping(
                 target.as_ptr(),
                 (*info).FileName.as_mut_ptr(),
-                target.len() - 1,
+                target.len(),
             );
             SetFileInformationByHandle(
                 self.file.as_raw_handle() as HANDLE,
