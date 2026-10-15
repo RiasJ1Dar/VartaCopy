@@ -1,17 +1,17 @@
 {
   "schemaVersion": 1,
-  "receiptId": "5be83b69-765f-4963-9f59-37d347d0782f",
+  "receiptId": "37dc1e71-6b0c-4363-b598-0f1925f71e91",
   "status": "current",
   "command": "deliver",
   "type": "architecture",
   "input": "D:\\teracopy\\.archify\\architecture-rustcopy-20261014-203000\\candidate.json",
   "output": "D:\\teracopy\\.archify\\architecture-rustcopy-20261014-203000\\rustcopy.html",
   "specification": {
-    "sha256": "ecebcb6c3c6fd3423412b000cc1981d5511a1f2a4957960a4ad6ef864e073b75",
-    "bytes": 6715
+    "sha256": "db2ef3fc4d20d6c7c0a8bc0bcd96fe38597a2360309730995aa29b7240b31b40",
+    "bytes": 7070
   },
   "artifact": {
-    "sha256": "80e3c2452340b3da6ecc383817d918ae97641f55833312d455255a7534765fcd",
-    "bytes": 827471
+    "sha256": "fd37ae03e4edfaf592ab1c3d4924ca0833c08cfcfd96978b7471ef9b0dbfb406",
+    "bytes": 827587
   }
 }

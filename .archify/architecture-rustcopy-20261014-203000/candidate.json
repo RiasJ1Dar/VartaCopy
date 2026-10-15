@@ -205,11 +205,12 @@
   "cards": [
     {
       "dot": "cyan",
-      "title": "Перший робочий зріз",
+      "title": "Реалізовано на 15.10.2026",
       "items": [
-        "Це проєкт майбутньої системи, а не карта вже готових функцій.",
-        "Зараз: Windows CLI для файлів і дерев, обмежений план, staging, BLAKE3 readback, явні часткові результати.",
-        "Далі: журнал і відновлення; повний reference CLI та GUI після перевірки відповідних контрактів."
+        "Схема показує цільову систему; не всі компоненти вже реалізовані.",
+        "Зараз: Windows GUI та CLI, план файлів і дерев, BLAKE3 readback, SQLite v2 та chunk recovery.",
+        "Працюють: збережена черга, reorder, pause/resume, історія, issue pages, JSON export і повторна перевірка копії.",
+        "Далі: повні metadata capabilities, move/overwrite, scheduler за носіями, filters та Explorer integration."
       ]
     },
     {
