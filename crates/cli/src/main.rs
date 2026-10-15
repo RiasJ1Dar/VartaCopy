@@ -29,6 +29,14 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Install, remove, or inspect per-user Explorer context menu integration.
+    Explorer {
+        #[arg(value_enum)]
+        action: ExplorerAction,
+        /// GUI executable; defaults to vartacopy-gui.exe next to this CLI.
+        #[arg(long)]
+        gui: Option<PathBuf>,
+    },
     /// Copy a file or tree into an existing directory; directory trees are never merged.
     Copy {
         source: PathBuf,
@@ -132,6 +140,12 @@ enum Command {
     },
 }
 #[derive(Clone, Copy, ValueEnum)]
+enum ExplorerAction {
+    Install,
+    Remove,
+    Status,
+}
+#[derive(Clone, Copy, ValueEnum)]
 enum Direction {
     Up,
     Down,
@@ -171,6 +185,31 @@ fn run(
     control: &Control,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     match args.command {
+        Command::Explorer { action, gui } => {
+            let gui = match gui {
+                Some(path) => path,
+                None => std::env::current_exe()?.with_file_name("vartacopy-gui.exe"),
+            };
+            match action {
+                ExplorerAction::Install => {
+                    vartacopy_shell_windows::registration::install(&gui)?;
+                    println!(
+                        "Explorer menu installed for current user (Windows 11: Show more options)"
+                    );
+                }
+                ExplorerAction::Remove => {
+                    vartacopy_shell_windows::registration::remove(&gui)?;
+                    println!("VartaCopy Explorer menu removed");
+                }
+                ExplorerAction::Status => {
+                    println!(
+                        "installed={}",
+                        vartacopy_shell_windows::registration::installed(&gui)?
+                    );
+                }
+            }
+            Ok(0)
+        }
         Command::Copy {
             source,
             destination,
@@ -355,6 +394,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     let json = match &args.command {
+        Command::Explorer { .. } => false,
         Command::Copy { json, .. }
         | Command::Verify { json, .. }
         | Command::Jobs { json, .. }

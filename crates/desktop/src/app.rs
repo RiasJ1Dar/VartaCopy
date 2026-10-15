@@ -93,6 +93,8 @@ pub struct App {
     base_styles: [egui::Style; 2],
     contrast: Option<system_style::Palette>,
     settings_watch: Option<system_style::Watch>,
+    shell: Option<mpsc::Receiver<Vec<PathBuf>>>,
+    shell_action: Option<mpsc::Receiver<std::io::Result<String>>>,
     banner: Option<String>,
     picker: Option<mpsc::Receiver<(Picker, Option<PathBuf>)>>,
     closing: bool,
@@ -208,6 +210,8 @@ impl App {
             base_styles,
             contrast,
             settings_watch,
+            shell: None,
+            shell_action: None,
             banner: None,
             picker: None,
             closing: false,
@@ -222,6 +226,50 @@ impl App {
                 self.banner = Some(e);
                 false
             }
+        }
+    }
+    pub fn attach_shell(&mut self, marker: &[u16], sources: Vec<PathBuf>) -> std::io::Result<()> {
+        self.shell = Some(
+            self.settings_watch
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("native window required"))?
+                .shell(marker)?,
+        );
+        if !sources.is_empty() {
+            self.add_sources(sources)?;
+        }
+        Ok(())
+    }
+    fn shell_registration(&mut self, install: bool) {
+        if self.shell_action.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.context.clone();
+        let spawned = std::thread::Builder::new()
+            .name("vartacopy-explorer".into())
+            .spawn(move || {
+                let result = std::env::current_exe().and_then(|gui| {
+                    if install {
+                        vartacopy_shell_windows::registration::install(&gui)?;
+                    } else {
+                        vartacopy_shell_windows::registration::remove(&gui)?;
+                    }
+                    Ok(if install {
+                        "Меню Провідника додано. Windows 11: «Показати додаткові параметри»."
+                    } else {
+                        "Меню VartaCopy прибрано."
+                    }
+                    .to_string())
+                });
+                if let Err(error) = tx.send(result) {
+                    eprintln!("VartaCopy: Explorer registration result undelivered: {error}");
+                }
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.shell_action = Some(rx),
+            Err(error) => self.banner = Some(error.to_string()),
         }
     }
     fn pick(&mut self, kind: Picker) {
@@ -316,6 +364,38 @@ impl App {
 }
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(inbox) = &self.shell {
+            match inbox.try_recv() {
+                Ok(paths) => {
+                    if !paths.is_empty()
+                        && let Err(error) = self.add_sources(paths)
+                    {
+                        self.banner = Some(error.to_string());
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint(); // Drain the bounded inbox, then return to event-driven idle.
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.shell = None;
+                    self.banner = Some("Канал Провідника закрито".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(action) = &self.shell_action {
+            match action.try_recv() {
+                Ok(result) => {
+                    self.banner =
+                        Some(result.unwrap_or_else(|e| format!("Інтеграція Провідника: {e}")));
+                    self.shell_action = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.banner = Some("Встановлення меню завершилось без відповіді".into());
+                    self.shell_action = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if self
             .settings_watch
             .as_ref()

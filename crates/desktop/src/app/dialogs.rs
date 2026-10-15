@@ -348,6 +348,11 @@ impl App {
                 ));
                 ui.separator();
                 ui.label(format!("Журнал: {}", self.journal.display()));
+                ui.label("Меню Провідника для поточного користувача. Після перенесення програми додайте меню з нового розташування.");
+                ui.add_enabled_ui(self.shell_action.is_none(),|ui| {ui.horizontal_wrapped(|ui| {
+                    if ui.button("Додати меню Провідника").clicked() {self.shell_registration(true);}
+                    if ui.button("Прибрати меню VartaCopy").clicked() {self.shell_registration(false);}
+                });});
                 ui.label(concat!(
                     "Після збою виберіть операцію в історії та натисніть «Відновити». ",
                     "Записані блоки перевіряються повторно.",

@@ -175,6 +175,7 @@ def build() -> dict:
     for name in ("vartacopy.exe", "vartacopy-gui.exe"):
         imports[name] = portable_imports(binary_root / name)
         shutil.copyfile(binary_root / name, output / name)
+    shutil.copyfile(ROOT / "LICENSE.txt", output / "LICENSE.txt")
     notices = dependencies(output)
     (output / "README.txt").write_text(f"""VartaCopy {version} — Windows x64, попередня версія
 
@@ -190,6 +191,14 @@ Rust, Python і права адміністратора для запуску н
    перемикає тему й масштаб. Контрастна тема Windows застосовується автоматично.
 7. F6 / Shift+F6 — між командами, чергою та файлами; стрілки, Home/End і
    Page Up/Down — вибір у списках; Enter — подробиці файла, Esc — закрити.
+
+Меню Провідника: «Меню» → «Вигляд і правила…» → «Додати меню Провідника».
+Виберіть файл або кілька файлів правою кнопкою → «Копіювати через VartaCopy…».
+Windows 11: «Показати додаткові параметри». Потрібно вибрати призначення та
+підтвердити копіювання у формі. Реєстрація лише для поточного користувача.
+Щоб прибрати: «Прибрати меню VartaCopy»; зробіть це перед видаленням portable.
+CLI: vartacopy.exe explorer install / status / remove.
+Стандартні Ctrl+C/Ctrl+V не змінюються. Повторний запуск відкриває спільне вікно.
 
 Журнал: %LOCALAPPDATA%\\VartaCopy\\jobs.sqlite3, на локальному фіксованому диску.
 Інший журнал: vartacopy-gui.exe --journal D:\\VartaCopy\\jobs.sqlite3
@@ -214,7 +223,7 @@ CLI, приклади:
 Hardlinks копіюються як незалежні файли. ADS каталогів блокують операцію.
 ACL та власник успадковуються від призначення; повна тотожність метаданих
 не заявляється. Основні перевірки виконано на локальній NTFS, Windows x64.
-Move, overwrite, повні ACL/owner/audit, Explorer integration, filters та
+Move, overwrite, повні ACL/owner/audit, сучасне меню Windows 11, filters та
 повна матриця USB/SMB/DPI ще розробляються. Це не реліз1.0.
 
 manifest.json містить SHA-256 кожного файла пакета та revision вихідного коду.

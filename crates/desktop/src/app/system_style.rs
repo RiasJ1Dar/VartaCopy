@@ -124,12 +124,14 @@ struct Data {
     ctx: egui::Context,
     changed: AtomicBool,
     destroyed: AtomicBool,
+    inbox: Option<mpsc::SyncSender<Vec<PathBuf>>>,
 }
 /// Callback registration and destruction are restricted to the owning UI thread.
 pub(super) struct Watch {
     window: HWND,
     data: Option<Box<Data>>,
     _thread: PhantomData<Rc<()>>,
+    endpoint: Option<vartacopy_shell_windows::instance::Endpoint>,
 }
 impl Watch {
     pub fn attach(window: HWND, ctx: egui::Context) -> io::Result<Self> {
@@ -137,6 +139,7 @@ impl Watch {
             ctx,
             changed: AtomicBool::new(true),
             destroyed: AtomicBool::new(false),
+            inbox: None,
         });
         let ptr = (&*data as *const Data) as usize;
         // SAFETY: Called on the HWND's UI thread. Box allocation remains stable until callback removal.
@@ -149,7 +152,21 @@ impl Watch {
             window,
             data: Some(data),
             _thread: PhantomData,
+            endpoint: None,
         })
+    }
+    pub fn shell(&mut self, marker: &[u16]) -> io::Result<mpsc::Receiver<Vec<PathBuf>>> {
+        let (tx, rx) = mpsc::sync_channel(32);
+        let data = self
+            .data
+            .as_mut()
+            .ok_or_else(|| io::Error::other("window callback is unavailable"))?;
+        data.inbox = Some(tx);
+        // SAFETY: Watch is bound to the calling UI thread and removed before the HWND is destroyed.
+        self.endpoint = Some(unsafe {
+            vartacopy_shell_windows::instance::Endpoint::attach(self.window, marker)
+        }?);
+        Ok(rx)
     }
     pub fn take_changed(&self) -> bool {
         self.data
@@ -159,6 +176,7 @@ impl Watch {
 }
 impl Drop for Watch {
     fn drop(&mut self) {
+        self.endpoint.take();
         if let Some(data) = self.data.take() {
             let ptr = (&*data as *const Data) as usize;
             if !data.destroyed.load(Ordering::Acquire)
@@ -184,6 +202,50 @@ unsafe extern "system" fn changed(
 ) -> LRESULT {
     // SAFETY: Registration owns this allocation until removal or WM_NCDESTROY on this same UI thread.
     let data = unsafe { &*(data as *const Data) };
+    if message == WM_COPYDATA {
+        let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            use vartacopy_shell_windows::{COPYDATA_MAGIC, MAX_REQUEST_BYTES, decode};
+            use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
+            if lparam == 0 {
+                return false;
+            }
+            // SAFETY: WM_COPYDATA supplies a Windows-marshaled COPYDATASTRUCT for the duration of this call.
+            let request = unsafe { &*(lparam as *const COPYDATASTRUCT) };
+            if request.dwData != COPYDATA_MAGIC
+                || request.cbData as usize > MAX_REQUEST_BYTES
+                || request.lpData.is_null()
+            {
+                return false;
+            }
+            // SAFETY: The OS copies exactly cbData bytes and keeps that buffer valid during this message.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(request.lpData as *const u8, request.cbData as usize)
+            };
+            match decode(bytes) {
+                Ok(paths) => {
+                    if let Some(inbox) = &data.inbox {
+                        if inbox.try_send(paths).is_ok() {
+                            data.ctx.request_repaint();
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                Err(error) => {
+                    eprintln!("VartaCopy: rejected shell request: {error}");
+                    false
+                }
+            }
+        }))
+        .unwrap_or_else(|_| {
+            eprintln!("VartaCopy: shell request handler panicked");
+            false
+        });
+        return isize::from(accepted);
+    }
     if matches!(
         message,
         WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED
@@ -286,5 +348,89 @@ mod tests {
         // SAFETY: Destroy only the test HWND after its callback has been removed.
         assert_ne!(unsafe { DestroyWindow(window) }, 0);
         assert!(Palette::read().is_ok());
+    }
+    #[test]
+    fn secondary_launch_delivers_native_paths_to_one_bounded_inbox() {
+        use vartacopy_shell_windows::instance::Instance;
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path().join("ipc.sqlite");
+        let primary = Instance::enter(&journal, &[]).unwrap().unwrap();
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        // SAFETY: Hidden predefined class, owned test HWND on this thread, no borrowed creation data.
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                20,
+                20,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!window.is_null());
+        let mut watch = Watch::attach(window, egui::Context::default()).unwrap();
+        let inbox = watch.shell(primary.marker()).unwrap();
+        let selected = vec![
+            root.path().join("дані з пробілом"),
+            root.path().join("second"),
+        ];
+        use std::os::windows::process::CommandExt;
+        let mut client = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "app::system_style::tests::shell_client_probe",
+            ])
+            .env("VARTACOPY_TEST_JOURNAL", &journal)
+            .env("VARTACOPY_TEST_SOURCE", &selected[0])
+            .env("VARTACOPY_TEST_SECOND", &selected[1])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while client.try_wait().unwrap().is_none() {
+            let mut msg = MSG::default();
+            // SAFETY: Pump only the hidden test window, including synchronous WM_COPYDATA sent by the client thread.
+            unsafe {
+                while PeekMessageW(&mut msg, window, 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "IPC client timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let result = client.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(inbox.try_recv().unwrap(), selected);
+        assert!(inbox.try_recv().is_err());
+        drop(watch);
+        // SAFETY: Destroy our hidden test window after removing its endpoint and callback.
+        assert_ne!(unsafe { DestroyWindow(window) }, 0);
+        drop(primary);
+    }
+    #[test]
+    #[ignore = "subprocess probe, executed by secondary_launch test"]
+    fn shell_client_probe() {
+        use vartacopy_shell_windows::instance::Instance;
+        let journal =
+            PathBuf::from(std::env::var_os("VARTACOPY_TEST_JOURNAL").expect("probe journal"));
+        let paths = vec![
+            PathBuf::from(std::env::var_os("VARTACOPY_TEST_SOURCE").expect("probe source")),
+            PathBuf::from(std::env::var_os("VARTACOPY_TEST_SECOND").expect("probe second source")),
+        ];
+        assert!(Instance::enter(&journal, &paths).unwrap().is_none());
     }
 }

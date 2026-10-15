@@ -2,17 +2,30 @@
 use std::path::PathBuf;
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
-    let path = match args.next() {
-        Some(flag) if flag == "--journal" => args
-            .next()
-            .map(PathBuf::from)
-            .ok_or("--journal requires a path")?,
-        Some(_) => return Err("Usage: VartaCopy [--journal PATH]".into()),
+    let mut path = None;
+    let mut sources = Vec::new();
+    while let Some(flag) = args.next() {
+        if flag == "--journal" && path.is_none() {
+            path = Some(PathBuf::from(
+                args.next().ok_or("--journal requires a path")?,
+            ));
+        } else if flag == "--source" {
+            sources.push(PathBuf::from(
+                args.next().ok_or("--source requires a path")?,
+            ));
+        } else {
+            return Err("Usage: vartacopy-gui [--journal PATH] [--source ABSOLUTE_PATH]...".into());
+        }
+    }
+    let path = match path {
+        Some(path) => path,
         None => vartacopy_core::journal::default_path()?,
     };
-    if args.next().is_some() {
-        return Err("Unexpected argument".into());
-    }
+    let Some(instance) = vartacopy_shell_windows::instance::Instance::enter(&path, &sources)?
+    else {
+        return Ok(());
+    };
+    let marker = instance.marker().to_vec();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([860.0, 520.0])
@@ -23,7 +36,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "VartaCopy",
         options,
-        Box::new(move |cc| Ok(Box::new(vartacopy_desktop::app::App::new(cc, path)?))),
+        Box::new(move |cc| {
+            let mut app = vartacopy_desktop::app::App::new(cc, path)?;
+            app.attach_shell(&marker, sources)?;
+            Ok(Box::new(app))
+        }),
     )?;
     Ok(())
 }
