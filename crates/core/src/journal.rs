@@ -15,7 +15,7 @@ use std::time::Duration;
 use vartacopy_platform_windows as platform;
 
 const APPLICATION_ID: i32 = 0x56415254;
-const VERSION: i32 = 1;
+const VERSION: i32 = 2;
 pub fn default_path() -> Result<PathBuf> {
     let root = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| Error::Journal("LOCALAPPDATA is not configured".into()))?;
@@ -36,6 +36,7 @@ CREATE TABLE jobs(
  destination BLOB NOT NULL CHECK(length(destination)<=65534),
  parent_identity BLOB NOT NULL,
  conflict TEXT NOT NULL,
+ queue_position INTEGER NOT NULL DEFAULT 0,
  entry_count INTEGER NOT NULL CHECK(entry_count BETWEEN 1 AND 100000),
  status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','paused','interrupted','completed','partial','cancelled')),
  output_root BLOB, output_identity BLOB, last_error TEXT,
@@ -268,7 +269,7 @@ impl Journal {
         )?;
         let application: i32 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let version: i32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if application != APPLICATION_ID || version != VERSION {
+        if application != APPLICATION_ID || !(1..=VERSION).contains(&version) {
             return Err(Error::Journal(format!(
                 "unrecognized application/schema ({application}/{version}); database unchanged"
             )));
@@ -278,6 +279,16 @@ impl Journal {
             return Err(Error::Journal(format!("integrity check failed: {check}")));
         }
         db.busy_timeout(Duration::from_secs(3))?;
+        if version == 1 {
+            // Atomic migration: old jobs retain their original FIFO order.
+            db.execute_batch(
+                "BEGIN IMMEDIATE;
+                ALTER TABLE jobs ADD COLUMN queue_position INTEGER NOT NULL DEFAULT 0;
+                UPDATE jobs SET queue_position=id;
+                PRAGMA user_version=2;
+                COMMIT;",
+            )?;
+        }
         let mode: String = db.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "foreign_keys", true)?;
@@ -303,13 +314,114 @@ impl Journal {
         &self.path
     }
 
+    /// An in-process connection sharing this owner's exclusive process lease.
+    /// Dropping the owner does not release the lease while any peer is alive.
+    pub fn peer(&self) -> Result<Self> {
+        let db = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        db.busy_timeout(Duration::from_secs(3))?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        db.pragma_update(None, "cache_size", -8192)?;
+        db.pragma_update(None, "mmap_size", 0)?;
+        let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+        if mode != "wal" {
+            return Err(Error::Journal("peer requires WAL".into()));
+        }
+        Ok(Self {
+            db,
+            _file: self._file.try_clone()?,
+            _writer: self._writer.try_clone()?,
+            _parents: self
+                ._parents
+                .iter()
+                .map(File::try_clone)
+                .collect::<io::Result<_>>()?,
+            path: self.path.clone(),
+        })
+    }
+
+    /// Called once by the process owner before starting workers.
+    pub fn recover_running_jobs(&mut self) -> Result<usize> {
+        let tx = self.db.transaction()?;
+        tx.execute("INSERT INTO events(job_id,state) SELECT id,'interrupted' FROM jobs WHERE status='running'", [])?;
+        let count = tx.execute("UPDATE jobs SET status='interrupted',last_error='Previous process ended during transfer; resume verifies recorded data' WHERE status='running'", [])?;
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Waiting jobs in persisted order, independently of history pagination.
+    pub fn queue(&self, limit: usize, offset: usize) -> Result<Vec<Job>> {
+        if limit > 256 {
+            return Err(Error::Journal("queue page limit exceeds 256".into()));
+        }
+        let mut statement = self.db.prepare("SELECT id FROM jobs WHERE status='queued' ORDER BY queue_position,id LIMIT ?1 OFFSET ?2")?;
+        let ids = statement
+            .query_map(params![sql_num(limit)?, sql_num(offset)?], |r| {
+                r.get::<_, i64>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter().map(|id| self.job(id)).collect()
+    }
+
+    /// A waiting/paused/interrupted/cancelled job can be scheduled without changing its plan.
+    pub fn schedule(&mut self, id: i64) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let changed = tx.execute("UPDATE jobs SET status='queued',last_error=NULL WHERE id=?1 AND status IN ('queued','paused','interrupted','cancelled')", [id])?;
+        if changed != 1 {
+            return Err(Error::Journal(
+                "only unfinished inactive jobs can be scheduled".into(),
+            ));
+        }
+        tx.execute("INSERT INTO events(job_id,state) VALUES(?1,'queued')", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Change waiting order by one place. No live job or transfer data is modified.
+    pub fn move_queued(&mut self, id: i64, earlier: bool) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let position: i64 = tx.query_row(
+            "SELECT queue_position FROM jobs WHERE id=?1 AND status='queued'",
+            [id],
+            |r| r.get(0),
+        )?;
+        let sql = if earlier {
+            "SELECT id,queue_position FROM jobs WHERE status='queued' AND queue_position<?1 ORDER BY queue_position DESC LIMIT 1"
+        } else {
+            "SELECT id,queue_position FROM jobs WHERE status='queued' AND queue_position>?1 ORDER BY queue_position LIMIT 1"
+        };
+        use rusqlite::OptionalExtension;
+        let other: Option<(i64, i64)> = tx
+            .query_row(sql, [position], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if let Some((other_id, other_position)) = other {
+            tx.execute(
+                "UPDATE jobs SET queue_position=?2 WHERE id=?1",
+                params![id, other_position],
+            )?;
+            tx.execute(
+                "UPDATE jobs SET queue_position=?2 WHERE id=?1",
+                params![other_id, position],
+            )?;
+            tx.execute(
+                "INSERT INTO events(job_id,state) VALUES(?1,'queue_reordered')",
+                [id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn enqueue(&mut self, plan: &OperationPlan, conflict: Conflict) -> Result<i64> {
         if !plan.is_ready() {
             return Err(Error::Journal("blocked plan cannot be enqueued".into()));
         }
         // Persist all entries atomically: a partially saved plan is never runnable.
         let tx = self.db.transaction()?;
-        tx.execute("INSERT INTO jobs(source,destination,parent_identity,conflict,entry_count) VALUES(?1,?2,?3,?4,?5)",
+        tx.execute("INSERT INTO jobs(source,destination,parent_identity,conflict,entry_count,queue_position) VALUES(?1,?2,?3,?4,?5,(SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs))",
             params![encode_path(&plan.source),encode_path(&plan.destination),
                 serde_json::to_vec(&plan.destination_parent_identity)?,serde_json::to_string(&conflict)?,sql_num(plan.entries.len())?])?;
         let id = tx.last_insert_rowid();

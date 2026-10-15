@@ -221,3 +221,84 @@ fn partial_plan_insert_rolls_back() {
     assert!(journal.enqueue(&plan, Conflict::Error).is_err());
     assert!(journal.jobs(256, 0).unwrap().is_empty());
 }
+
+#[test]
+fn peer_retains_exclusive_process_lease_and_queue_writes_while_copy_waits() {
+    let (root, plan) = fixture();
+    let path = root.path().join("jobs.sqlite");
+    let mut journal = Journal::open(&path).unwrap();
+    let first = journal.enqueue(&plan, Conflict::KeepBoth).unwrap();
+    let mut peer = journal.peer().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut stopped = false;
+        crate::recovery::run(
+            &mut peer,
+            first,
+            &crate::control::Control::default(),
+            &mut |event| {
+                if !stopped && event.phase == crate::recovery::Phase::StageRecorded {
+                    stopped = true;
+                    ready_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap()
+    });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let second = journal.enqueue(&plan, Conflict::KeepBoth).unwrap();
+    let third = journal.enqueue(&plan, Conflict::KeepBoth).unwrap();
+    journal.move_queued(third, true).unwrap();
+    assert_eq!(
+        journal
+            .queue(256, 0)
+            .unwrap()
+            .iter()
+            .map(|j| j.id)
+            .collect::<Vec<_>>(),
+        vec![third, second]
+    );
+    assert!(journal.schedule(first).is_err());
+    drop(journal);
+    assert!(Journal::open(&path).is_err(), "peer still owns the lease");
+    go_tx.send(()).unwrap();
+    assert_eq!(worker.join().unwrap().status, "completed");
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.queue(256, 0).unwrap()[0].id, third);
+}
+
+#[test]
+fn migrates_version_one_atomically_and_recovers_running_jobs() {
+    let (root, plan) = fixture();
+    let path = root.path().join("jobs.sqlite");
+    let id;
+    {
+        let mut journal = Journal::open(&path).unwrap();
+        id = journal.enqueue(&plan, Conflict::Error).unwrap();
+        journal.set_job_status(id, "running", None).unwrap();
+        journal
+            .db
+            .execute_batch("ALTER TABLE jobs DROP COLUMN queue_position; PRAGMA user_version=1;")
+            .unwrap();
+        journal.flush().unwrap();
+    }
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(
+        journal
+            .db
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))
+            .unwrap(),
+        VERSION
+    );
+    assert_eq!(journal.recover_running_jobs().unwrap(), 1);
+    assert_eq!(journal.job(id).unwrap().status, "interrupted");
+    journal.schedule(id).unwrap();
+    let second = journal.enqueue(&plan, Conflict::KeepBoth).unwrap();
+    assert_eq!(journal.queue(1, 0).unwrap()[0].id, id);
+    journal.move_queued(id, false).unwrap();
+    assert_eq!(journal.queue(1, 0).unwrap()[0].id, second);
+    assert!(journal.queue(257, 0).is_err());
+}
