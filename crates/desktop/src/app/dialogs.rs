@@ -20,6 +20,33 @@ impl App {
                     let label = ui.label("Джерело — файл або каталог");
                     let focus = std::mem::take(&mut self.form_focus);
                     self.source.show(ui, "source", label.id, focus);
+                    if !self.additional_sources.is_empty() {
+                        egui::CollapsingHeader::new(format!(
+                            "Ще {} джерел",
+                            self.additional_sources.len()
+                        ))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(100.0).show_rows(
+                                ui,
+                                20.0,
+                                self.additional_sources.len(),
+                                |ui, range| {
+                                    for i in range {
+                                        ui.add(
+                                            egui::Label::new(
+                                                self.additional_sources[i].display().to_string(),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                },
+                            );
+                            if ui.button("Прибрати додаткові джерела").clicked()
+                            {
+                                self.additional_sources.clear();
+                            }
+                        });
+                    }
                     ui.horizontal(|ui| {
                         ui.add_enabled_ui(self.picker.is_none(), |ui| {
                             if ui.button("Обрати файл…").clicked() {

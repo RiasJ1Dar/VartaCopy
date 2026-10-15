@@ -223,6 +223,29 @@ fn partial_plan_insert_rolls_back() {
 }
 
 #[test]
+fn selected_roots_are_enqueued_atomically_and_rollback_as_a_batch() {
+    let (root, first) = fixture();
+    let (_other, mut second) = fixture();
+    let mut journal = Journal::open(&root.path().join("batch.sqlite")).unwrap();
+    second.entries[0].relative = PathBuf::from("x".repeat(40_000));
+    let mut plans = vec![first, second];
+    assert!(journal.enqueue_many(&plans, Conflict::Error).is_err());
+    assert!(journal.jobs(256, 0).unwrap().is_empty());
+    plans[1].entries[0].relative = PathBuf::new();
+    let ids = journal.enqueue_many(&plans, Conflict::Error).unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        journal
+            .queue(256, 0)
+            .unwrap()
+            .iter()
+            .map(|j| j.id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+}
+
+#[test]
 fn peer_retains_exclusive_process_lease_and_queue_writes_while_copy_waits() {
     let (root, plan) = fixture();
     let path = root.path().join("jobs.sqlite");

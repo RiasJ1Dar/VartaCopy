@@ -62,6 +62,7 @@ pub struct App {
     client: Client,
     state: State,
     source: PathInput,
+    additional_sources: Vec<PathBuf>,
     destination: PathInput,
     conflict: usize,
     skip_links: bool,
@@ -176,6 +177,7 @@ impl App {
             })?,
             state: State::default(),
             source: PathInput::default(),
+            additional_sources: Vec::new(),
             destination: PathInput::default(),
             conflict: 0,
             skip_links: false,
@@ -287,8 +289,10 @@ impl App {
             })
     }
     fn submit(&mut self, start: bool) {
-        let accepted = self.command(Command::Submit {
-            source: self.source.path(),
+        let mut sources = vec![self.source.path()];
+        sources.extend(self.additional_sources.iter().cloned());
+        let accepted = self.command(Command::SubmitMany {
+            sources,
             destination: self.destination.path(),
             conflict: match self.conflict {
                 1 => Conflict::KeepBoth,
@@ -389,11 +393,17 @@ impl eframe::App for App {
         {
             self.open_form();
         }
-        if let Some(path) =
-            ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
+        let dropped = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        if !dropped.is_empty()
+            && let Err(e) = self.add_sources(dropped)
         {
-            self.source.set(path);
-            self.open_form();
+            self.banner = Some(e.to_string());
         }
         self.shortcuts(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {

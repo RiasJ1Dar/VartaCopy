@@ -455,41 +455,67 @@ impl Journal {
     }
 
     pub fn enqueue(&mut self, plan: &OperationPlan, conflict: Conflict) -> Result<i64> {
-        if !plan.is_ready() {
-            return Err(Error::Journal("blocked plan cannot be enqueued".into()));
+        self.enqueue_many(std::slice::from_ref(plan), conflict)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Journal("no job saved".into()))
+    }
+
+    /// All selected roots become runnable together, or none do.
+    pub fn enqueue_many(
+        &mut self,
+        plans: &[OperationPlan],
+        conflict: Conflict,
+    ) -> Result<Vec<i64>> {
+        let entries = plans
+            .iter()
+            .try_fold(0usize, |n, p| n.checked_add(p.entries.len()));
+        let memory = plans
+            .iter()
+            .try_fold(0usize, |n, p| n.checked_add(p.accounted_plan_bytes));
+        if entries.is_none_or(|n| n > crate::planner::MAX_ENTRIES)
+            || memory.is_none_or(|n| n > crate::planner::MAX_PLAN_BYTES)
+        {
+            return Err(Error::Journal("batch exceeds scan limits".into()));
         }
-        // Persist all entries atomically: a partially saved plan is never runnable.
+        if plans.is_empty() || plans.len() > 512 || plans.iter().any(|p| !p.is_ready()) {
+            return Err(Error::Journal("batch requires 1..512 ready plans".into()));
+        }
         let tx = self.db.transaction()?;
-        tx.execute("INSERT INTO jobs(source,destination,parent_identity,conflict,entry_count,queue_position) VALUES(?1,?2,?3,?4,?5,(SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs))",
+        let mut ids = Vec::with_capacity(plans.len());
+        for plan in plans {
+            tx.execute("INSERT INTO jobs(source,destination,parent_identity,conflict,entry_count,queue_position) VALUES(?1,?2,?3,?4,?5,(SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs))",
             params![encode_path(&plan.source),encode_path(&plan.destination),
                 serde_json::to_vec(&plan.destination_parent_identity)?,serde_json::to_string(&conflict)?,sql_num(plan.entries.len())?])?;
-        let id = tx.last_insert_rowid();
-        {
-            let mut insert=tx.prepare("INSERT INTO entries(job_id,ordinal,relative,kind,snapshot,state) VALUES(?1,?2,?3,?4,?5,?6)")?;
-            for (ordinal, entry) in plan.entries.iter().enumerate() {
-                let snapshot = entry
-                    .snapshot
-                    .as_ref()
-                    .map(serde_json::to_vec)
-                    .transpose()?;
-                let state = if entry.kind == EntryKind::Reparse {
-                    "skipped"
-                } else {
-                    "planned"
-                };
-                insert.execute(params![
-                    id,
-                    sql_num(ordinal)?,
-                    encode_path(&entry.relative),
-                    kind_name(entry.kind),
-                    snapshot,
-                    state
-                ])?;
+            let id = tx.last_insert_rowid();
+            {
+                let mut insert=tx.prepare("INSERT INTO entries(job_id,ordinal,relative,kind,snapshot,state) VALUES(?1,?2,?3,?4,?5,?6)")?;
+                for (ordinal, entry) in plan.entries.iter().enumerate() {
+                    let snapshot = entry
+                        .snapshot
+                        .as_ref()
+                        .map(serde_json::to_vec)
+                        .transpose()?;
+                    let state = if entry.kind == EntryKind::Reparse {
+                        "skipped"
+                    } else {
+                        "planned"
+                    };
+                    insert.execute(params![
+                        id,
+                        sql_num(ordinal)?,
+                        encode_path(&entry.relative),
+                        kind_name(entry.kind),
+                        snapshot,
+                        state
+                    ])?;
+                }
             }
+            tx.execute("INSERT INTO events(job_id,state) VALUES(?1,'queued')", [id])?;
+            ids.push(id);
         }
-        tx.execute("INSERT INTO events(job_id,state) VALUES(?1,'queued')", [id])?;
         tx.commit()?;
-        Ok(id)
+        Ok(ids)
     }
 
     pub fn job(&self, id: i64) -> Result<Job> {

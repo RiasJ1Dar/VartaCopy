@@ -50,6 +50,13 @@ pub enum Command {
         reparse: ReparsePolicy,
         start: bool,
     },
+    SubmitMany {
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        conflict: Conflict,
+        reparse: ReparsePolicy,
+        start: bool,
+    },
     RunQueue(bool),
     Resume(i64),
     Pause(i64),
@@ -78,7 +85,7 @@ enum Message {
     Wake,
     ViewTick,
     Command(Command),
-    Planned(Result<OperationPlan>, Conflict, bool),
+    Planned(Result<Vec<OperationPlan>>, Conflict, bool),
     Finished(i64, Result<RunReport>),
 }
 
@@ -227,6 +234,75 @@ impl Drop for Client {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn scan_request(
+    sources: Vec<PathBuf>,
+    destination: PathBuf,
+    conflict: Conflict,
+    reparse: ReparsePolicy,
+    start: bool,
+    planning: &mut Option<thread::JoinHandle<()>>,
+    scan_cancel: &Arc<AtomicBool>,
+    shutdown: &AtomicBool,
+    state: &Shared,
+    sender: &SyncSender<Message>,
+) -> Result<()> {
+    if planning.is_some() || shutdown.load(Ordering::Acquire) {
+        return Err(Error::Journal(
+            "another scan is active or the application is closing".into(),
+        ));
+    }
+    if sources.is_empty() || sources.len() > 512 {
+        return Err(Error::Journal(
+            "select between 1 and 512 source roots".into(),
+        ));
+    }
+    scan_cancel.store(false, Ordering::Relaxed);
+    edit(state, |s| s.planning = true)?;
+    let tx = sender.clone();
+    let cancel = scan_cancel.clone();
+    let handle = thread::Builder::new()
+        .name("vartacopy-scan".into())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(|| {
+                let mut plans = Vec::with_capacity(sources.len());
+                let mut remaining = planner::ScanLimits::default();
+                for source in sources {
+                    let plan = planner::scan(
+                        &source,
+                        &destination,
+                        ScanOptions {
+                            reparse,
+                            limits: remaining,
+                        },
+                        &cancel,
+                    )?;
+                    remaining.max_entries =
+                        remaining.max_entries.saturating_sub(plan.entries().len());
+                    remaining.max_plan_bytes = remaining
+                        .max_plan_bytes
+                        .saturating_sub(plan.accounted_plan_bytes);
+                    plans.push(plan);
+                }
+                Ok(plans)
+            });
+            let result = outcome.unwrap_or_else(|_| Err(Error::Journal("scanner panicked".into())));
+            if let Err(e) = tx.send(Message::Planned(result, conflict, start)) {
+                eprintln!("VartaCopy: scan result undelivered: {e}");
+            }
+        });
+    match handle {
+        Ok(handle) => {
+            *planning = Some(handle);
+            Ok(())
+        }
+        Err(e) => {
+            edit(state, |s| s.planning = false)?;
+            Err(e.into())
+        }
+    }
+}
+
 fn refresh(journal: &Journal, state: &Shared) -> Result<()> {
     let offset = quiet(state, |s| s.offset)?;
     let queue = journal.queue(32, 0)?;
@@ -297,39 +373,38 @@ fn actor(
                         reparse,
                         start,
                     }) => {
-                        if planning.is_some() || shutdown.load(Ordering::Acquire) {
-                            return Err(Error::Journal(
-                                "another scan is active or the application is closing".into(),
-                            ));
-                        }
-                        scan_cancel.store(false, Ordering::Relaxed);
-                        edit(state, |s| s.planning = true)?;
-                        let tx = sender.clone();
-                        let cancel = scan_cancel.clone();
-                        planning =
-                            Some(thread::Builder::new().name("vartacopy-scan".into()).spawn(
-                                move || {
-                                    let outcome = std::panic::catch_unwind(|| {
-                                        planner::scan(
-                                            &source,
-                                            &destination,
-                                            ScanOptions {
-                                                reparse,
-                                                ..ScanOptions::default()
-                                            },
-                                            &cancel,
-                                        )
-                                    });
-                                    let result = outcome.unwrap_or_else(|_| {
-                                        Err(Error::Journal("scanner panicked".into()))
-                                    });
-                                    if let Err(e) =
-                                        tx.send(Message::Planned(result, conflict, start))
-                                    {
-                                        eprintln!("VartaCopy: scan result undelivered: {e}");
-                                    }
-                                },
-                            )?);
+                        scan_request(
+                            vec![source],
+                            destination,
+                            conflict,
+                            reparse,
+                            start,
+                            &mut planning,
+                            scan_cancel,
+                            shutdown,
+                            state,
+                            &sender,
+                        )?;
+                    }
+                    Message::Command(Command::SubmitMany {
+                        sources,
+                        destination,
+                        conflict,
+                        reparse,
+                        start,
+                    }) => {
+                        scan_request(
+                            sources,
+                            destination,
+                            conflict,
+                            reparse,
+                            start,
+                            &mut planning,
+                            scan_cancel,
+                            shutdown,
+                            state,
+                            &sender,
+                        )?;
                     }
                     Message::Planned(result, conflict, start) => {
                         if let Some(handle) = planning.take() {
@@ -338,23 +413,30 @@ fn actor(
                                 .map_err(|_| Error::Journal("scanner thread panicked".into()))?;
                         }
                         edit(state, |s| s.planning = false)?;
-                        let plan = result?;
-                        if !plan.is_ready() {
-                            let problems = plan
-                                .entries()
-                                .iter()
-                                .filter_map(|entry| {
-                                    entry.problem().map(|problem| {
-                                        format!("{}: {problem}", entry.relative_path().display())
+                        let plans = result?;
+                        for plan in &plans {
+                            if !plan.is_ready() {
+                                let problems = plan
+                                    .entries()
+                                    .iter()
+                                    .filter_map(|entry| {
+                                        entry.problem().map(|problem| {
+                                            format!(
+                                                "{}: {problem}",
+                                                entry.relative_path().display()
+                                            )
+                                        })
                                     })
-                                })
-                                .take(8)
-                                .collect::<Vec<_>>()
-                                .join("; ");
-                            return Err(Error::Journal(format!("Preflight blocked: {problems}")));
+                                    .take(8)
+                                    .collect::<Vec<_>>()
+                                    .join("; ");
+                                return Err(Error::Journal(format!(
+                                    "Preflight blocked: {problems}"
+                                )));
+                            }
                         }
                         // A queued acknowledgement is visible only after this durable transaction.
-                        journal.enqueue(&plan, conflict)?;
+                        journal.enqueue_many(&plans, conflict)?;
                         automatic |= start;
                         refresh(&journal, state)?;
                     }
@@ -869,6 +951,51 @@ mod tests {
                 .is_some_and(|r| r.job_id == id && !Arc::ptr_eq(r, &old_report))
                 && !s.automatic
         });
+        client.shutdown();
+        wait(&client, |s| s.closed);
+    }
+    #[test]
+    fn multiple_roots_copy_together_and_a_missing_root_saves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("a");
+        let second = root.path().join("b");
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        fs::write(&source, b"one").unwrap();
+        fs::write(&second, b"two").unwrap();
+        let client = Client::start(root.path().join("jobs.sqlite")).unwrap();
+        wait(&client, |s| s.ready);
+        client
+            .send(Command::SubmitMany {
+                sources: vec![source.clone(), root.path().join("missing")],
+                destination: dest.clone(),
+                conflict: Conflict::Error,
+                reparse: ReparsePolicy::Reject,
+                start: true,
+            })
+            .unwrap();
+        let failed = wait(&client, |s| !s.errors.is_empty() && !s.planning);
+        assert!(failed.history.is_empty());
+        assert!(failed.queue.is_empty());
+        assert!(fs::read_dir(&dest).unwrap().next().is_none());
+        client.send(Command::ClearErrors).unwrap();
+        client
+            .send(Command::SubmitMany {
+                sources: vec![source, second],
+                destination: dest.clone(),
+                conflict: Conflict::Error,
+                reparse: ReparsePolicy::Reject,
+                start: true,
+            })
+            .unwrap();
+        let done = wait(&client, |s| {
+            s.history.len() == 2
+                && s.history.iter().all(|j| j.status == "completed")
+                && s.active.is_none()
+        });
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(fs::read(dest.join("a")).unwrap(), b"one");
+        assert_eq!(fs::read(dest.join("b")).unwrap(), b"two");
         client.shutdown();
         wait(&client, |s| s.closed);
     }

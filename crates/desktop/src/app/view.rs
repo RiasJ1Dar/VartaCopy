@@ -79,6 +79,9 @@ impl App {
             jobs.insert(0, active.job.clone());
         }
         let id = self.jobs_id();
+        if !self.history && jobs.len() >= 32 {
+            ui.label(RichText::new("Перші 32 завдання; усі — в історії").small());
+        }
         if ui.memory(|m| m.has_focus(id)) && self.main_keys() {
             self.pane = Pane::Jobs;
             lock_arrows(ui.ctx(), id);

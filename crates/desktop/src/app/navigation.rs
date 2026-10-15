@@ -7,6 +7,33 @@ pub(super) enum Pane {
     Files,
 }
 impl App {
+    /// Shell requests only prepare a visible draft; they never start transfers.
+    pub fn add_sources(&mut self, paths: Vec<PathBuf>) -> std::io::Result<()> {
+        if paths.is_empty() || paths.len() > 512 || paths.iter().any(|p| !p.is_absolute()) {
+            return Err(std::io::Error::other(
+                "expected 1..512 absolute source paths",
+            ));
+        }
+        let mut sources = if self.new_operation && !self.source.text.is_empty() {
+            std::iter::once(self.source.path())
+                .chain(self.additional_sources.iter().cloned())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for path in paths {
+            if !sources.contains(&path) {
+                sources.push(path);
+            }
+        }
+        if sources.len() > 512 {
+            return Err(std::io::Error::other("draft already contains 512 sources"));
+        }
+        self.source.set(sources.remove(0));
+        self.additional_sources = sources;
+        self.open_form();
+        Ok(())
+    }
     pub(super) fn open_form(&mut self) {
         self.pending_focus = None;
         if !self.new_operation {
