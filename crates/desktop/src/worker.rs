@@ -13,7 +13,7 @@ use std::{
 use vartacopy_core::{
     Conflict, Error, Result,
     control::Control,
-    journal::{Job, JobDetails, Journal},
+    journal::{EntryPage, Job, JobDetails, Journal},
     planner::{self, OperationPlan, ReparsePolicy, ScanOptions},
     recovery::{self, Progress, RunReport},
 };
@@ -31,11 +31,13 @@ pub struct State {
     pub errors: VecDeque<String>,
     pub last_report: Option<Arc<RunReport>>,
     pub details: Option<Arc<JobDetails>>,
+    pub files: Option<Arc<EntryPage>>,
     pub notice: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct Active {
     pub id: i64,
+    pub job: Job,
     pub entry_count: usize,
     pub progress: Option<Progress>,
     pub request: &'static str,
@@ -46,6 +48,7 @@ pub enum Command {
         destination: PathBuf,
         conflict: Conflict,
         reparse: ReparsePolicy,
+        start: bool,
     },
     RunQueue(bool),
     Resume(i64),
@@ -60,6 +63,10 @@ pub enum Command {
         id: i64,
         offset: usize,
     },
+    Files {
+        id: i64,
+        offset: usize,
+    },
     Export {
         id: i64,
         path: PathBuf,
@@ -69,8 +76,9 @@ pub enum Command {
 }
 enum Message {
     Wake,
+    ViewTick,
     Command(Command),
-    Planned(Result<OperationPlan>, Conflict),
+    Planned(Result<OperationPlan>, Conflict, bool),
     Finished(i64, Result<RunReport>),
 }
 
@@ -229,10 +237,15 @@ fn refresh(journal: &Journal, state: &Shared) -> Result<()> {
     let details = selected
         .map(|(id, offset)| journal.details(id, 32, offset).map(Arc::new))
         .transpose()?;
+    let selected_files = quiet(state, |s| s.files.as_ref().map(|p| (p.job_id, p.offset)))?;
+    let files = selected_files
+        .map(|(id, offset)| journal.entry_page(id, 128, offset).map(Arc::new))
+        .transpose()?;
     edit(state, |s| {
         s.queue = queue;
         s.history = history;
         s.details = details;
+        s.files = files;
     })
 }
 #[expect(
@@ -282,6 +295,7 @@ fn actor(
                         destination,
                         conflict,
                         reparse,
+                        start,
                     }) => {
                         if planning.is_some() || shutdown.load(Ordering::Acquire) {
                             return Err(Error::Journal(
@@ -309,13 +323,15 @@ fn actor(
                                     let result = outcome.unwrap_or_else(|_| {
                                         Err(Error::Journal("scanner panicked".into()))
                                     });
-                                    if let Err(e) = tx.send(Message::Planned(result, conflict)) {
+                                    if let Err(e) =
+                                        tx.send(Message::Planned(result, conflict, start))
+                                    {
                                         eprintln!("VartaCopy: scan result undelivered: {e}");
                                     }
                                 },
                             )?);
                     }
-                    Message::Planned(result, conflict) => {
+                    Message::Planned(result, conflict, start) => {
                         if let Some(handle) = planning.take() {
                             handle
                                 .join()
@@ -339,12 +355,18 @@ fn actor(
                         }
                         // A queued acknowledgement is visible only after this durable transaction.
                         journal.enqueue(&plan, conflict)?;
+                        automatic |= start;
                         refresh(&journal, state)?;
                     }
                     Message::Command(Command::Inspect { id, offset }) => {
                         let details = journal.details(id, 32, offset)?;
                         edit(state, |s| s.details = Some(Arc::new(details)))?;
                     }
+                    Message::Command(Command::Files { id, offset }) => {
+                        let files = journal.entry_page(id, 128, offset)?;
+                        edit(state, |s| s.files = Some(Arc::new(files)))?;
+                    }
+                    Message::ViewTick => refresh(&journal, state)?,
                     Message::Command(Command::Export { id, path }) => {
                         if active_id == Some(id) {
                             return Err(Error::Journal(
@@ -478,6 +500,10 @@ fn actor(
                 edit(state, |s| {
                     s.active = Some(Active {
                         id,
+                        job: Job {
+                            status: "running".into(),
+                            ..job.clone()
+                        },
                         entry_count: job.entry_count,
                         progress: None,
                         request: "",
@@ -488,6 +514,7 @@ fn actor(
                         .name("vartacopy-transfer".into())
                         .spawn(move || {
                             let mut last_progress = Instant::now();
+                            let mut last_view = Instant::now();
                             let outcome =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     recovery::run(&mut peer, id, &control, &mut |event| {
@@ -502,6 +529,19 @@ fn actor(
                                         if last_progress.elapsed() >= Duration::from_millis(100) {
                                             (shared.wake)();
                                             last_progress = Instant::now();
+                                        }
+                                        if last_view.elapsed() >= Duration::from_millis(500) {
+                                            // Only transfer events refresh the table. Full means a refresh can
+                                            // coalesce with queued commands; no idle timer or UI database work.
+                                            match tx.try_send(Message::ViewTick) {
+                                                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                                                Err(mpsc::TrySendError::Disconnected(_)) => {
+                                                    return Err(Error::Journal(
+                                                        "file table receiver disconnected".into(),
+                                                    ));
+                                                }
+                                            }
+                                            last_view = Instant::now();
                                         }
                                         Ok(())
                                     })
@@ -555,6 +595,7 @@ mod tests {
                 destination,
                 conflict: Conflict::Error,
                 reparse: ReparsePolicy::Reject,
+                start: false,
             })
             .unwrap();
     }
@@ -780,5 +821,55 @@ mod tests {
         client.shutdown();
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(wait(&client, |s| s.closed).closed);
+    }
+
+    #[test]
+    fn submit_and_run_waits_for_durable_plan_and_refreshes_the_selected_file_window() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("tree");
+        let dest = root.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        for i in 0..140 {
+            fs::write(source.join(format!("file-{i:03}")), b"data").unwrap();
+        }
+        let client = Client::start(root.path().join("jobs.sqlite")).unwrap();
+        wait(&client, |s| s.ready);
+        client
+            .send(Command::Submit {
+                source,
+                destination: dest,
+                conflict: Conflict::Error,
+                reparse: ReparsePolicy::Reject,
+                start: true,
+            })
+            .unwrap();
+        let done = wait(&client, |s| {
+            s.history.first().is_some_and(|j| j.status == "completed") && s.active.is_none()
+        });
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        let id = done.history[0].id;
+        client.send(Command::Files { id, offset: 128 }).unwrap();
+        let page = wait(&client, |s| {
+            s.files.as_ref().is_some_and(|p| p.offset == 128)
+        });
+        let page = page.files.unwrap();
+        assert_eq!(page.total, 141);
+        assert_eq!(page.entries.len(), 13);
+        assert!(
+            page.entries
+                .iter()
+                .all(|e| e.state == vartacopy_core::journal::EntryState::Committed)
+        );
+        let old_report = done.last_report.unwrap();
+        client.send(Command::Recheck(id)).unwrap();
+        wait(&client, |s| {
+            s.last_report
+                .as_ref()
+                .is_some_and(|r| r.job_id == id && !Arc::ptr_eq(r, &old_report))
+                && !s.automatic
+        });
+        client.shutdown();
+        wait(&client, |s| s.closed);
     }
 }

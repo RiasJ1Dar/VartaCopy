@@ -1,14 +1,17 @@
+mod dialogs;
+mod view;
 use crate::worker::{Client, Command, State};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, mpsc},
 };
-use vartacopy_core::{Conflict, journal::Job, planner::ReparsePolicy, recovery::Phase};
-const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
-const INK: Color32 = Color32::from_rgb(15, 23, 42);
-const MUTED: Color32 = Color32::from_rgb(71, 85, 105);
-const ERROR: Color32 = Color32::from_rgb(185, 28, 28);
+use vartacopy_core::{
+    Conflict,
+    journal::{EntryState, Job},
+    planner::{EntryKind, ReparsePolicy},
+    recovery::Phase,
+};
 
 #[derive(Default)]
 struct PathInput {
@@ -25,20 +28,21 @@ impl PathInput {
             .clone()
             .unwrap_or_else(|| PathBuf::from(&self.text))
     }
-    fn show(&mut self, ui: &mut egui::Ui, id: &str, label: egui::Id) {
+    fn show(&mut self, ui: &mut egui::Ui, id: &str, label: egui::Id, focus: bool) {
         let response = ui
             .add_sized(
-                [ui.available_width().max(120.0), 34.0],
+                [ui.available_width().max(120.0), 32.0],
                 egui::TextEdit::singleline(&mut self.text)
                     .id_salt(id)
                     .hint_text("Повний шлях…")
-                    .background_color(Color32::from_rgb(241, 245, 249))
-                    .margin(egui::Margin::symmetric(10, 6))
                     .desired_width(ui.available_width()),
             )
             .labelled_by(label);
         if response.changed() {
             self.native = None;
+        }
+        if focus {
+            response.request_focus();
         }
     }
 }
@@ -58,6 +62,17 @@ pub struct App {
     skip_links: bool,
     history: bool,
     selected: Option<i64>,
+    last_active: Option<i64>,
+    newest: Option<i64>,
+    new_operation: bool,
+    form_focus: bool,
+    details_open: bool,
+    messages_open: bool,
+    settings_open: bool,
+    file_selected: Option<usize>,
+    file_open: bool,
+    files_pending: Option<(i64, usize)>,
+    theme: egui::ThemePreference,
     banner: Option<String>,
     picker: Option<mpsc::Receiver<(Picker, Option<PathBuf>)>>,
     closing: bool,
@@ -68,7 +83,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf) -> std::io::Result<Self> {
         let ctx = &cc.egui_ctx;
         ctx.enable_accesskit();
-        ctx.set_theme(egui::Theme::Light);
+        ctx.set_theme(egui::ThemePreference::System);
         // Prefer the installed Windows UI font; bundled egui fonts remain a fallback.
         if let Some(windows) = std::env::var_os("WINDIR") {
             match std::fs::read(PathBuf::from(windows).join("Fonts/segoeui.ttf")) {
@@ -90,20 +105,30 @@ impl App {
                 ),
             }
         }
-        let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
-        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(14.0, 8.0);
-        style.spacing.interact_size.y = 34.0;
-        for id in [egui::TextStyle::Body, egui::TextStyle::Button] {
+
+        ctx.all_styles_mut(|style| {
+            style.visuals.override_text_color = Some(if style.visuals.dark_mode {
+                egui::Color32::from_rgb(232, 232, 232)
+            } else {
+                egui::Color32::from_rgb(28, 28, 28)
+            });
+            style.visuals.weak_text_color = Some(if style.visuals.dark_mode {
+                egui::Color32::from_rgb(176, 176, 176)
+            } else {
+                egui::Color32::from_rgb(85, 85, 85)
+            });
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+            style.spacing.button_padding = egui::vec2(10.0, 5.0);
+            style.spacing.interact_size.y = 28.0;
+            for id in [egui::TextStyle::Body, egui::TextStyle::Button] {
+                style
+                    .text_styles
+                    .insert(id, egui::FontId::proportional(14.0));
+            }
             style
                 .text_styles
-                .insert(id, egui::FontId::proportional(16.0));
-        }
-        style.visuals.override_text_color = Some(INK);
-        style.visuals.panel_fill = Color32::from_rgb(248, 250, 252);
-        style.visuals.selection.bg_fill = BLUE;
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
-        ctx.set_global_style(style);
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+        });
         Ok(Self {
             client: Client::start_with_notify(path.clone(), {
                 let ctx = ctx.clone();
@@ -116,6 +141,17 @@ impl App {
             skip_links: false,
             history: false,
             selected: None,
+            last_active: None,
+            newest: None,
+            new_operation: false,
+            form_focus: false,
+            details_open: false,
+            messages_open: false,
+            settings_open: false,
+            file_selected: None,
+            file_open: false,
+            files_pending: None,
+            theme: egui::ThemePreference::System,
             banner: None,
             picker: None,
             closing: false,
@@ -123,9 +159,13 @@ impl App {
             context: ctx.clone(),
         })
     }
-    fn command(&mut self, command: Command) {
-        if let Err(e) = self.client.send(command) {
-            self.banner = Some(e);
+    fn command(&mut self, command: Command) -> bool {
+        match self.client.send(command) {
+            Ok(()) => true,
+            Err(e) => {
+                self.banner = Some(e);
+                false
+            }
         }
     }
     fn pick(&mut self, kind: Picker) {
@@ -160,315 +200,56 @@ impl App {
             Err(e) => self.banner = Some(format!("Не вдалося відкрити діалог: {e}")),
         }
     }
-    fn form(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style())
-            .fill(Color32::WHITE)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.label(RichText::new("Нова операція").size(19.0).strong());
-                let source_label = ui.label("Джерело — файл або каталог");
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(self.picker.is_none(), |ui| {
-                        if ui.button("Файл…").clicked() {
-                            self.pick(Picker::File);
-                        }
-                        if ui.button("Каталог…").clicked() {
-                            self.pick(Picker::Folder);
-                        }
-                    });
-                    self.source.show(ui, "source", source_label.id);
-                });
-                let destination_label = ui
-                    .label("Призначення — наявний каталог; усередині буде створено копію джерела");
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(self.picker.is_none(), egui::Button::new("Обрати…"))
-                        .clicked()
-                    {
-                        self.pick(Picker::Destination);
-                    }
-                    self.destination
-                        .show(ui, "destination", destination_label.id);
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Якщо назва зайнята:");
-                    egui::ComboBox::from_id_salt("conflict")
-                        .selected_text(
-                            ["Показати помилку", "Зберегти обидва", "Пропустити"][self.conflict],
-                        )
-                        .show_ui(ui, |ui| {
-                            for (index, label) in
-                                ["Показати помилку", "Зберегти обидва", "Пропустити"]
-                                    .into_iter()
-                                    .enumerate()
-                            {
-                                ui.selectable_value(&mut self.conflict, index, label);
-                            }
-                        });
-                    ui.checkbox(
-                        &mut self.skip_links,
-                        "Пропускати посилання (частковий результат)",
-                    );
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let enabled = self.state.ready
-                        && !self.state.planning
-                        && !self.closing
-                        && !self.source.text.trim().is_empty()
-                        && !self.destination.text.trim().is_empty();
-                    if ui
-                        .add_enabled(
-                            enabled,
-                            egui::Button::new(
-                                RichText::new("Додати до черги").color(Color32::WHITE),
-                            )
-                            .fill(BLUE),
-                        )
-                        .clicked()
-                    {
-                        self.banner = None;
-                        self.command(Command::Submit {
-                            source: self.source.path(),
-                            destination: self.destination.path(),
-                            conflict: match self.conflict {
-                                1 => Conflict::KeepBoth,
-                                2 => Conflict::Skip,
-                                _ => Conflict::Error,
-                            },
-                            reparse: if self.skip_links {
-                                ReparsePolicy::Skip
-                            } else {
-                                ReparsePolicy::Reject
-                            },
-                        });
-                    }
-                    if self.state.planning {
-                        ui.spinner();
-                        ui.label("Сканування… Завдання ще не збережено.");
-                    } else {
-                        ui.label(
-                            RichText::new("Кожна копія проходить перевірку BLAKE3.").color(MUTED),
-                        );
-                    }
-                });
-            });
+
+    fn select(&mut self, id: i64) {
+        self.selected = Some(id);
+        self.file_selected = None;
+        self.file_open = false;
+        self.command(Command::Inspect { id, offset: 0 });
+        self.load_files(id, 0);
     }
-    fn active(&mut self, ui: &mut egui::Ui) {
-        if let Some(active) = self.state.active.clone() {
-            egui::Frame::group(ui.style())
-                .fill(Color32::WHITE)
-                .inner_margin(16.0)
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!("Операція #{}", active.id))
-                                .strong()
-                                .size(19.0),
-                        );
-                        if ui
-                            .add_enabled(active.request.is_empty(), egui::Button::new("Пауза"))
-                            .clicked()
-                        {
-                            self.command(Command::Pause(active.id));
-                        }
-                        if ui
-                            .add_enabled(active.request.is_empty(), egui::Button::new("Зупинити"))
-                            .clicked()
-                        {
-                            self.command(Command::Cancel(active.id));
-                        }
-                    });
-                    if !active.request.is_empty() {
-                        ui.label(
-                            "Зупинка після поточного кроку I/O… Дані для відновлення зберігаються.",
-                        );
-                    }
-                    if let Some(progress) = active.progress {
-                        ui.label(format!(
-                            "{} · елемент {} із {}",
-                            phase(progress.phase),
-                            progress.entry + 1,
-                            active.entry_count
-                        ));
-                        if progress.total > 0 {
-                            let fraction = (progress.bytes as f64 / progress.total as f64)
-                                .clamp(0.0, 1.0) as f32;
-                            ui.add(
-                                egui::ProgressBar::new(fraction)
-                                    .desired_width(f32::INFINITY)
-                                    .text(format!(
-                                        "Поточний потік: {} / {}",
-                                        bytes(progress.bytes),
-                                        bytes(progress.total)
-                                    )),
-                            );
-                        } else {
-                            ui.spinner();
-                        }
-                    } else {
-                        ui.spinner();
-                        ui.label("Підготовка відновлення…");
-                    }
-                });
+    fn load_files(&mut self, id: i64, offset: usize) {
+        if self.command(Command::Files { id, offset }) {
+            self.files_pending = Some((id, offset));
         }
     }
-    fn job_row(&mut self, ui: &mut egui::Ui, job: &Job) {
-        let active = self.state.active.as_ref().is_some_and(|a| a.id == job.id);
-        egui::Frame::group(ui.style())
-            .fill(Color32::WHITE)
-            .inner_margin(12.0)
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .selectable_label(
-                            self.selected == Some(job.id),
-                            RichText::new(format!(
-                                "#{}  {}",
-                                job.id,
-                                job.source
-                                    .file_name()
-                                    .unwrap_or(job.source.as_os_str())
-                                    .to_string_lossy()
-                            ))
-                            .strong(),
-                        )
-                        .clicked()
-                    {
-                        self.selected = Some(job.id);
-                        self.command(Command::Inspect {
-                            id: job.id,
-                            offset: 0,
-                        });
-                    }
-                    ui.label(status(if active { "running" } else { &job.status }));
-                    if job.status == "queued" && !active {
-                        if ui.small_button("Вище").clicked() {
-                            self.command(Command::Move {
-                                id: job.id,
-                                earlier: true,
-                            });
-                        }
-                        if ui.small_button("Нижче").clicked() {
-                            self.command(Command::Move {
-                                id: job.id,
-                                earlier: false,
-                            });
-                        }
-                        if ui.small_button("Пауза").clicked() {
-                            self.command(Command::Pause(job.id));
-                        }
-                    }
-                    if matches!(job.status.as_str(), "paused" | "interrupted" | "cancelled")
-                        && !active
-                        && ui.small_button("Відновити").clicked()
-                    {
-                        self.command(Command::Resume(job.id));
-                    }
-                    if matches!(job.status.as_str(), "queued" | "paused" | "interrupted")
-                        && !active
-                        && ui.small_button("Зупинити").clicked()
-                    {
-                        self.command(Command::Cancel(job.id));
-                    }
-                });
-                ui.add(
-                    egui::Label::new(RichText::new(job.source.to_string_lossy()).color(MUTED))
-                        .wrap(),
-                );
-                ui.add(
-                    egui::Label::new(format!(
-                        "До: {}",
-                        job.output_root
-                            .as_ref()
-                            .unwrap_or(&job.destination)
-                            .display()
-                    ))
-                    .wrap(),
-                );
-                if let Some(e) = &job.last_error {
-                    ui.colored_label(ERROR, e);
-                }
-                if self.selected == Some(job.id) {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_enabled(
-                                !active && self.picker.is_none(),
-                                egui::Button::new("Експорт JSON…"),
-                            )
-                            .clicked()
-                        {
-                            self.pick(Picker::Report(job.id));
-                        }
-                        if matches!(job.status.as_str(), "completed" | "partial")
-                            && !active
-                            && ui.button("Перевірити копію").clicked()
-                        {
-                            self.command(Command::Recheck(job.id));
-                        }
-                        if ui.button("Оновити деталі").clicked() {
-                            self.command(Command::Inspect {
-                                id: job.id,
-                                offset: 0,
-                            });
-                        }
-                    });
-                    if let Some(details) = self.state.details.clone().filter(|d| d.job.id == job.id)
-                    {
-                        ui.label(format!(
-                            "У журналі: завершено {} · пропущено {} · залишилося {}",
-                            details.entries_committed,
-                            details.entries_skipped,
-                            details.entries_pending
-                        ));
-                        for issue in &details.issues {
-                            ui.colored_label(
-                                ERROR,
-                                format!("{}: {}", issue.relative.display(), issue.message),
-                            );
-                        }
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    details.issues_offset > 0,
-                                    egui::Button::new("Попередні помилки"),
-                                )
-                                .clicked()
-                            {
-                                self.command(Command::Inspect {
-                                    id: job.id,
-                                    offset: details.issues_offset.saturating_sub(32),
-                                });
-                            }
-                            if ui
-                                .add_enabled(
-                                    details.has_more,
-                                    egui::Button::new("Наступні помилки"),
-                                )
-                                .clicked()
-                            {
-                                self.command(Command::Inspect {
-                                    id: job.id,
-                                    offset: details.issues_offset + 32,
-                                });
-                            }
-                        });
-                    }
-                    ui.label(format!(
-                        "Елементів у плані: {}. Конфлікти: {:?}.",
-                        job.entry_count, job.conflict
-                    ));
-                    if ui.button("Відкрити каталог призначення").clicked()
-                    {
-                        let path = job.destination.parent().unwrap_or(&job.destination);
-                        match std::process::Command::new("explorer.exe").arg(path).spawn() {
-                            Ok(_) => {}
-                            Err(e) => {
-                                self.banner = Some(format!("Не вдалося відкрити каталог: {e}"))
-                            }
-                        }
-                    }
-                }
-            });
+    fn selected_job(&self) -> Option<Job> {
+        let id = self.selected?;
+        self.state
+            .details
+            .as_ref()
+            .filter(|d| d.job.id == id)
+            .map(|d| d.job.clone())
+            .or_else(|| {
+                self.state
+                    .history
+                    .iter()
+                    .chain(&self.state.queue)
+                    .find(|j| j.id == id)
+                    .cloned()
+            })
+    }
+    fn submit(&mut self, start: bool) {
+        let accepted = self.command(Command::Submit {
+            source: self.source.path(),
+            destination: self.destination.path(),
+            conflict: match self.conflict {
+                1 => Conflict::KeepBoth,
+                2 => Conflict::Skip,
+                _ => Conflict::Error,
+            },
+            reparse: if self.skip_links {
+                ReparsePolicy::Skip
+            } else {
+                ReparsePolicy::Reject
+            },
+            start,
+        });
+        if accepted {
+            self.new_operation = false;
+            self.banner = None;
+            self.history = false;
+        }
     }
 }
 impl eframe::App for App {
@@ -483,7 +264,9 @@ impl eframe::App for App {
                     match kind {
                         Picker::File | Picker::Folder => self.source.set(path),
                         Picker::Destination => self.destination.set(path),
-                        Picker::Report(id) => self.command(Command::Export { id, path }),
+                        Picker::Report(id) => {
+                            self.command(Command::Export { id, path });
+                        }
                     }
                     self.picker = None;
                 }
@@ -495,6 +278,47 @@ impl eframe::App for App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some((id, offset)) = self.files_pending
+            && self
+                .state
+                .files
+                .as_ref()
+                .is_some_and(|p| p.job_id == id && p.offset == offset)
+        {
+            self.files_pending = None;
+        }
+        let newest = self.state.history.first().map(|j| j.id);
+        if newest != self.newest {
+            let initial = self.newest.is_none();
+            self.newest = newest;
+            if let Some(id) = newest {
+                self.select(id);
+                if initial && self.state.queue.is_empty() {
+                    self.history = true;
+                }
+            }
+        }
+        let active = self.state.active.as_ref().map(|a| a.id);
+        if active != self.last_active {
+            self.last_active = active;
+            if let Some(id) = active {
+                self.select(id);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N))
+            && self.state.ready
+            && !self.closing
+        {
+            self.new_operation = true;
+            self.form_focus = true;
+        }
+        if let Some(path) =
+            ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
+        {
+            self.source.set(path);
+            self.new_operation = true;
+            self.form_focus = true;
+        }
         if ctx.input(|i| i.viewport().close_requested()) {
             self.closing = true;
             self.client.shutdown();
@@ -505,68 +329,129 @@ impl eframe::App for App {
         if self.closing && self.state.closed {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if let Some(path) =
-            ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
-        {
-            self.source.set(path);
-        }
-        // Worker and dialog completions wake the UI; an idle window needs no timer.
     }
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(root,|ui|{
-            ui.horizontal(|ui|{
-                ui.heading(RichText::new("VartaCopy").size(28.0).strong().color(BLUE));
-                ui.label("Копіювання з перевіркою та відновленням");
-            });
-            ui.label(RichText::new("Файли й каталоги · локальний журнал · джерело зберігається").color(MUTED));
-            ui.add_space(8.0);
-            egui::ScrollArea::vertical().id_salt("main").show(ui,|ui|{
-                ui.set_min_width(ui.available_width());
-                ui.add_enabled_ui(!self.closing,|ui|self.form(ui));
-                ui.add_space(8.0);
-                self.active(ui);
-                if self.closing {ui.label("Завершую поточний крок і зберігаю стан…");}
-                if let Some(message)=&self.banner {ui.colored_label(ERROR,message);}
-                if let Some(error)=self.state.errors.back(){ui.colored_label(ERROR,error);}
-                if let Some(notice)=self.state.notice.as_ref(){ui.label(notice);}
-                if (self.banner.is_some()||!self.state.errors.is_empty()||self.state.notice.is_some()) && ui.button("Закрити повідомлення").clicked(){self.banner=None;self.command(Command::ClearErrors);}
-                if !self.state.ready&&!self.state.closed {ui.horizontal(|ui|{ui.spinner();ui.label("Відкриваю журнал…");});}
-                ui.horizontal_wrapped(|ui|{
-                    if ui.add_enabled(self.state.ready&&!self.closing&&(!self.state.queue.is_empty()||self.state.active.is_some()||self.state.automatic),egui::Button::new(if self.state.automatic{"Зупинити запуск наступних"}else{"Запустити чергу"})).clicked(){self.command(Command::RunQueue(!self.state.automatic));}
-                    ui.selectable_value(&mut self.history,false,"Черга");
-                    ui.selectable_value(&mut self.history,true,"Історія та відновлення");
+        egui::Panel::top("toolbar").show(root, |ui| self.toolbar(ui));
+        egui::Panel::bottom("status").show(root, |ui| self.footer(ui));
+        egui::Panel::left("jobs")
+            .default_size(216.0)
+            .size_range(180.0..=320.0)
+            .show(root, |ui| self.sidebar(ui));
+        egui::CentralPanel::default().show(root, |ui| {
+            if let Some(job) = self.selected_job() {
+                self.operation(ui, &job);
+                self.table(ui, &job);
+            } else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(80.0);
+                    ui.heading("Додайте файли для копіювання");
+                    ui.label("Файл або дерево каталогів із перевіркою та відновленням.");
+                    if ui
+                        .add_enabled(self.state.ready, egui::Button::new("Нова операція…"))
+                        .clicked()
+                    {
+                        self.new_operation = true;
+                        self.form_focus = true;
+                    }
                 });
-                if self.history{
-                    ui.horizontal(|ui|{
-                        if ui.add_enabled(self.state.offset>0,egui::Button::new("Попередні")).clicked(){self.command(Command::Page(self.state.offset.saturating_sub(32)));}
-                        ui.label(format!("Сторінка {}",self.state.offset/32+1));
-                        if ui.add_enabled(self.state.history.len()==32,egui::Button::new("Наступні")).clicked(){self.command(Command::Page(self.state.offset+32));}
-                    });
-                }
-                let jobs=if self.history{self.state.history.clone()}else{self.state.queue.clone()};
-                if jobs.is_empty(){
-                    ui.add_space(16.0);
-                    ui.label(if self.history{"Збережених операцій на цій сторінці немає."}else{"Черга порожня. Оберіть джерело й призначення та додайте операцію."});
-                }else{
-                    if !self.history {ui.label("Перші 32 очікувані операції, у порядку виконання.");}
-                    for job in &jobs{self.job_row(ui,job);}
-                }
-                if let Some(report)=self.state.last_report.clone(){
-                    ui.separator();
-                    ui.label(RichText::new(format!("Результат #{}: {}",report.job_id,status(&report.status))).strong());
-                    ui.label(format!("Завершено: {} · пропущено: {} · залишилося: {} · помилки: {}",report.entries_committed,report.entries_skipped,report.entries_pending,report.entries_failed));
-                    ui.label(format!("Перевірено потоків даних: {}",bytes(report.verified_bytes)));
-                    if let Some(e)=&report.error{ui.colored_label(ERROR,e);}
-                    if !report.issues.is_empty(){egui::CollapsingHeader::new("Помилки окремих елементів").show(ui,|ui|{for issue in &report.issues{ui.colored_label(ERROR,format!("{}: {}",issue.path.display,issue.message));}if report.issues_omitted>0{ui.label(format!("Ще {} повідомлень не показано",report.issues_omitted));}});}
-                }
-                ui.add_space(12.0);
-                egui::CollapsingHeader::new("Журнал і правила копіювання").show(ui,|ui|{
-                    ui.label(self.journal.to_string_lossy());
-                    ui.label("Журнал зберігається на локальному фіксованому диску. Після збою відкрийте історію та натисніть «Відновити». Пауза зберігає прогрес; відновлення повторно перевіряє записані блоки.");
-                    ui.label("Зайняті каталоги не об’єднуються. Пропущені елементи дають частковий результат. ACL та власник успадковуються від призначення; ADS каталогів і reparse points за замовчуванням блокують операцію.");
-                });
-            });
+            }
         });
+        self.dialogs();
+    }
+}
+fn name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+// Explorer uses shell paths. Strip only the verbatim DOS/UNC prefix, preserving native names.
+fn explorer_path(path: &Path) -> PathBuf {
+    use std::{
+        ffi::OsString,
+        path::{Component, Prefix},
+    };
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let mut output = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut value = OsString::from("\\\\");
+            value.push(server);
+            value.push("\\");
+            value.push(share);
+            value.push("\\");
+            PathBuf::from(value)
+        }
+        _ => return path.to_path_buf(),
+    };
+    for component in components {
+        if component != Component::RootDir {
+            output.push(component.as_os_str());
+        }
+    }
+    output
+}
+
+fn path_line(ui: &mut egui::Ui, label: &str, path: &Path) {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = 18.0;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).weak());
+            let response = ui.add(egui::Label::new(path.display().to_string()).truncate());
+            response.context_menu(|ui| {
+                if ui.button("Копіювати шлях").clicked() {
+                    ui.ctx().copy_text(path.to_string_lossy().into_owned());
+                    ui.close();
+                }
+            });
+            response.on_hover_text(path.display().to_string());
+        });
+    });
+}
+fn table_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    state: &str,
+    size: &str,
+    selected: bool,
+) -> egui::Response {
+    let width = ui.available_width();
+    let inner = ui.horizontal(|ui| {
+        let r = ui.add_sized(
+            [(width - 218.0).max(90.0), 28.0],
+            egui::Button::new("")
+                .left_text(name)
+                .selected(selected)
+                .frame(selected)
+                .wrap_mode(egui::TextWrapMode::Truncate),
+        );
+        ui.add_sized([124.0, 28.0], egui::Label::new(state).truncate());
+        ui.add_sized([78.0, 28.0], egui::Label::new(size).truncate());
+        r
+    });
+    inner.inner
+}
+fn entry_status(state: EntryState) -> &'static str {
+    match state {
+        EntryState::Planned => "Очікує",
+        EntryState::Copying => "Копіювання",
+        EntryState::Verified => "Перевірено",
+        EntryState::Publishing => "Публікація",
+        EntryState::Committed => "Готово",
+        EntryState::Skipped => "Пропущено",
+        EntryState::DirIntent => "Створення",
+        EntryState::DirectoryReady => "Каталог створено",
+    }
+}
+fn short_status(value: &str) -> &str {
+    match value {
+        "completed" => "Завершено",
+        "partial" => "Частково",
+        "interrupted" => "Перервано",
+        _ => status(value),
     }
 }
 pub fn bytes(value: u64) -> String {
@@ -600,10 +485,46 @@ fn phase(value: Phase) -> &'static str {
         Phase::StageRecorded => "Підготовка файлу",
         Phase::BlockWritten | Phase::BlockFlushed | Phase::CheckpointCommitted => "Копіювання",
         Phase::Checking | Phase::Verified => "Перевірка даних",
-        Phase::PublishIntent | Phase::Published | Phase::Committed => "Публікація файлу",
+        Phase::PublishIntent => "Публікація файла",
+        Phase::Published => "Файл опубліковано",
+        Phase::Committed => "Файл завершено",
         Phase::DirectoryIntent | Phase::DirectoryPublished | Phase::DirectoryReady => {
             "Створення каталогу"
         }
         Phase::DirectoryCommitted => "Збереження метаданих каталогу",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
+    #[test]
+    fn explorer_dos_and_unc_paths_preserve_unpaired_utf16() {
+        let mut native: Vec<u16> = r"\\?\D:\copy\".encode_utf16().collect();
+        native.extend([0xD800, b'x' as u16]);
+        let native = PathBuf::from(OsString::from_wide(&native));
+        let expected: Vec<u16> = r"D:\copy\"
+            .encode_utf16()
+            .chain([0xD800, b'x' as u16])
+            .collect();
+        assert_eq!(
+            explorer_path(&native)
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            explorer_path(Path::new(r"\\?\UNC\server\share\copy")),
+            PathBuf::from(r"\\server\share\copy")
+        );
+        assert_eq!(
+            explorer_path(Path::new(r"D:\copy")),
+            PathBuf::from(r"D:\copy")
+        );
     }
 }

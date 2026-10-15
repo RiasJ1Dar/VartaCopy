@@ -15,8 +15,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 820.0])
-            .with_min_inner_size([760.0, 600.0]),
+            .with_inner_size([980.0, 640.0])
+            .with_min_inner_size([760.0, 480.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
