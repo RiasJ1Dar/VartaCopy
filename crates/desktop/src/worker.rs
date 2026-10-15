@@ -13,7 +13,7 @@ use std::{
 use vartacopy_core::{
     Conflict, Error, Result,
     control::Control,
-    journal::{Job, Journal},
+    journal::{Job, JobDetails, Journal},
     planner::{self, OperationPlan, ReparsePolicy, ScanOptions},
     recovery::{self, Progress, RunReport},
 };
@@ -30,6 +30,8 @@ pub struct State {
     pub offset: usize,
     pub errors: VecDeque<String>,
     pub last_report: Option<Arc<RunReport>>,
+    pub details: Option<Arc<JobDetails>>,
+    pub notice: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct Active {
@@ -54,6 +56,16 @@ pub enum Command {
         earlier: bool,
     },
     Page(usize),
+    Inspect {
+        id: i64,
+        offset: usize,
+    },
+    Export {
+        id: i64,
+        path: PathBuf,
+    },
+    Recheck(i64),
+    ClearErrors,
 }
 enum Message {
     Command(Command),
@@ -177,9 +189,16 @@ fn refresh(journal: &Journal, state: &Mutex<State>) -> Result<()> {
     let offset = edit(state, |s| s.offset)?;
     let queue = journal.queue(32, 0)?;
     let history = journal.jobs(32, offset)?;
+    let selected = edit(state, |s| {
+        s.details.as_ref().map(|d| (d.job.id, d.issues_offset))
+    })?;
+    let details = selected
+        .map(|(id, offset)| journal.details(id, 32, offset).map(Arc::new))
+        .transpose()?;
     edit(state, |s| {
         s.queue = queue;
         s.history = history;
+        s.details = details;
     })
 }
 #[expect(
@@ -287,6 +306,32 @@ fn actor(
                         journal.enqueue(&plan, conflict)?;
                         refresh(&journal, state)?;
                     }
+                    Message::Command(Command::Inspect { id, offset }) => {
+                        let details = journal.details(id, 32, offset)?;
+                        edit(state, |s| s.details = Some(Arc::new(details)))?;
+                    }
+                    Message::Command(Command::Export { id, path }) => {
+                        if active_id == Some(id) {
+                            return Err(Error::Journal(
+                                "Pause this job before exporting a final report".into(),
+                            ));
+                        }
+                        journal.export_report(id, &path)?;
+                        edit(state, |s| {
+                            s.notice = Some(format!("Звіт збережено: {}", path.display()))
+                        })?;
+                    }
+                    Message::Command(Command::Recheck(id)) => {
+                        journal.recheck(id)?;
+                        automatic = true;
+                        refresh(&journal, state)?;
+                    }
+                    Message::Command(Command::ClearErrors) => {
+                        edit(state, |s| {
+                            s.errors.clear();
+                            s.notice = None;
+                        })?;
+                    }
                     Message::Command(Command::RunQueue(value)) => automatic = value,
                     Message::Command(Command::Resume(id)) => {
                         if active_id == Some(id) {
@@ -312,11 +357,8 @@ fn actor(
                                 }
                             })?;
                         } else {
-                            let job = journal.job(id)?;
-                            if job.status == "queued" {
-                                journal.set_job_status(id, "paused", None)?;
-                                refresh(&journal, state)?;
-                            }
+                            journal.hold(id, false)?;
+                            refresh(&journal, state)?;
                         }
                     }
                     Message::Command(Command::Cancel(id)) => {
@@ -335,13 +377,7 @@ fn actor(
                                 }
                             })?;
                         } else {
-                            let job = journal.job(id)?;
-                            if !matches!(job.status.as_str(), "queued" | "paused" | "interrupted") {
-                                return Err(Error::Journal(
-                                    "only unfinished jobs can be cancelled".into(),
-                                ));
-                            }
-                            journal.set_job_status(id, "cancelled", None)?;
+                            journal.hold(id, true)?;
                             refresh(&journal, state)?;
                         }
                     }
@@ -604,5 +640,68 @@ mod tests {
             fs::read(source).unwrap(),
             fs::read(dest.join("data")).unwrap()
         );
+    }
+    #[test]
+    fn inspect_export_and_recheck_commands_keep_persisted_failure_details() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("file");
+        let dest = root.path().join("dest");
+        fs::write(&source, b"good").unwrap();
+        fs::create_dir(&dest).unwrap();
+        let path = root.path().join("jobs.sqlite");
+        let id = {
+            let mut journal = Journal::open(&path).unwrap();
+            let plan = planner::scan(
+                &source,
+                &dest,
+                ScanOptions::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let id = journal.enqueue(&plan, Conflict::Error).unwrap();
+            assert_eq!(
+                recovery::run(&mut journal, id, &Control::default(), &mut |_| Ok(()))
+                    .unwrap()
+                    .status,
+                "completed"
+            );
+            id
+        };
+        fs::write(dest.join("file"), b"bad!").unwrap();
+        let client = Client::start(path).unwrap();
+        wait(&client, |s| s.ready);
+        client.send(Command::Recheck(id)).unwrap();
+        wait(&client, |s| {
+            s.history[0].status == "interrupted" && s.active.is_none()
+        });
+        client.send(Command::Inspect { id, offset: 0 }).unwrap();
+        let details = wait(&client, |s| {
+            s.details.as_ref().is_some_and(|d| d.issues.len() == 1)
+        });
+        assert_eq!(details.details.unwrap().job.id, id);
+        let output = root.path().join("report.json");
+        client
+            .send(Command::Export {
+                id,
+                path: output.clone(),
+            })
+            .unwrap();
+        wait(&client, |s| s.notice.is_some());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(output).unwrap()).unwrap()["summary"]
+                ["job"]["status"],
+            "interrupted"
+        );
+        client.send(Command::ClearErrors).unwrap();
+        wait(&client, |s| s.notice.is_none());
+        fs::write(dest.join("file"), b"good").unwrap();
+        client.send(Command::Resume(id)).unwrap();
+        wait(&client, |s| {
+            s.details
+                .as_ref()
+                .is_some_and(|d| d.job.status == "completed" && d.issues.is_empty())
+        });
+        client.shutdown();
+        wait(&client, |s| s.closed);
     }
 }

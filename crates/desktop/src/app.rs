@@ -44,6 +44,7 @@ enum Picker {
     File,
     Folder,
     Destination,
+    Report(i64),
 }
 pub struct App {
     client: Client,
@@ -131,6 +132,11 @@ impl App {
                 let value = match kind {
                     Picker::File => dialog.set_title("Джерело: файл").pick_file(),
                     Picker::Folder => dialog.set_title("Джерело: каталог").pick_folder(),
+                    Picker::Report(id) => dialog
+                        .set_title("Зберегти звіт JSON")
+                        .set_file_name(format!("VartaCopy-job-{id}.json"))
+                        .add_filter("JSON", &["json"])
+                        .save_file(),
                     Picker::Destination => dialog
                         .set_title("Наявний каталог призначення")
                         .pick_folder(),
@@ -319,6 +325,10 @@ impl App {
                         .clicked()
                     {
                         self.selected = Some(job.id);
+                        self.command(Command::Inspect {
+                            id: job.id,
+                            offset: 0,
+                        });
                     }
                     ui.label(status(if active { "running" } else { &job.status }));
                     if job.status == "queued" && !active {
@@ -369,6 +379,70 @@ impl App {
                     ui.colored_label(ERROR, e);
                 }
                 if self.selected == Some(job.id) {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(
+                                !active && self.picker.is_none(),
+                                egui::Button::new("Експорт JSON…"),
+                            )
+                            .clicked()
+                        {
+                            self.pick(Picker::Report(job.id));
+                        }
+                        if matches!(job.status.as_str(), "completed" | "partial")
+                            && !active
+                            && ui.button("Перевірити копію").clicked()
+                        {
+                            self.command(Command::Recheck(job.id));
+                        }
+                        if ui.button("Оновити деталі").clicked() {
+                            self.command(Command::Inspect {
+                                id: job.id,
+                                offset: 0,
+                            });
+                        }
+                    });
+                    if let Some(details) = self.state.details.clone().filter(|d| d.job.id == job.id)
+                    {
+                        ui.label(format!(
+                            "У журналі: завершено {} · пропущено {} · залишилося {}",
+                            details.entries_committed,
+                            details.entries_skipped,
+                            details.entries_pending
+                        ));
+                        for issue in &details.issues {
+                            ui.colored_label(
+                                ERROR,
+                                format!("{}: {}", issue.relative.display(), issue.message),
+                            );
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    details.issues_offset > 0,
+                                    egui::Button::new("Попередні помилки"),
+                                )
+                                .clicked()
+                            {
+                                self.command(Command::Inspect {
+                                    id: job.id,
+                                    offset: details.issues_offset.saturating_sub(32),
+                                });
+                            }
+                            if ui
+                                .add_enabled(
+                                    details.has_more,
+                                    egui::Button::new("Наступні помилки"),
+                                )
+                                .clicked()
+                            {
+                                self.command(Command::Inspect {
+                                    id: job.id,
+                                    offset: details.issues_offset + 32,
+                                });
+                            }
+                        });
+                    }
                     ui.label(format!(
                         "Елементів у плані: {}. Конфлікти: {:?}.",
                         job.entry_count, job.conflict
@@ -399,6 +473,7 @@ impl eframe::App for App {
                     match kind {
                         Picker::File | Picker::Folder => self.source.set(path),
                         Picker::Destination => self.destination.set(path),
+                        Picker::Report(id) => self.command(Command::Export { id, path }),
                     }
                     self.picker = None;
                 }
@@ -443,9 +518,11 @@ impl eframe::App for App {
                 if self.closing {ui.label("Завершую поточний крок і зберігаю стан…");}
                 if let Some(message)=&self.banner {ui.colored_label(ERROR,message);}
                 if let Some(error)=self.state.errors.back(){ui.colored_label(ERROR,error);}
+                if let Some(notice)=self.state.notice.as_ref(){ui.label(notice);}
+                if (self.banner.is_some()||!self.state.errors.is_empty()||self.state.notice.is_some()) && ui.button("Закрити повідомлення").clicked(){self.banner=None;self.command(Command::ClearErrors);}
                 if !self.state.ready&&!self.state.closed {ui.horizontal(|ui|{ui.spinner();ui.label("Відкриваю журнал…");});}
                 ui.horizontal_wrapped(|ui|{
-                    if ui.add_enabled(self.state.ready&&!self.closing,egui::Button::new(if self.state.automatic{"Зупинити запуск наступних"}else{"Запустити чергу"})).clicked(){self.command(Command::RunQueue(!self.state.automatic));}
+                    if ui.add_enabled(self.state.ready&&!self.closing&&(!self.state.queue.is_empty()||self.state.active.is_some()||self.state.automatic),egui::Button::new(if self.state.automatic{"Зупинити запуск наступних"}else{"Запустити чергу"})).clicked(){self.command(Command::RunQueue(!self.state.automatic));}
                     ui.selectable_value(&mut self.history,false,"Черга");
                     ui.selectable_value(&mut self.history,true,"Історія та відновлення");
                 });

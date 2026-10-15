@@ -555,14 +555,17 @@ impl Journal {
     }
 
     pub fn clear_entry_error(&mut self, job: i64, ordinal: usize) -> Result<()> {
-        if self.db.execute(
-            "UPDATE entries SET last_error=NULL WHERE job_id=?1 AND ordinal=?2",
+        let present: bool = self.db.query_row(
+            "SELECT last_error IS NOT NULL FROM entries WHERE job_id=?1 AND ordinal=?2",
             params![job, sql_num(ordinal)?],
-        )? != 1
-        {
-            return Err(Error::Journal(
-                "entry missing while clearing failure".into(),
-            ));
+            |r| r.get(0),
+        )?;
+        // Successful reconciliation normally has no error to clear: keep it read-only.
+        if present {
+            self.db.execute(
+                "UPDATE entries SET last_error=NULL WHERE job_id=?1 AND ordinal=?2",
+                params![job, sql_num(ordinal)?],
+            )?;
         }
         Ok(())
     }
@@ -612,7 +615,15 @@ impl Journal {
         stage
             .file()
             .write_all(b"{\"format\":\"vartacopy-job-report\",\"version\":1,\"summary\":")?;
-        serde_json::to_writer(stage.file(), &details)?;
+        serde_json::to_writer(
+            stage.file(),
+            &serde_json::json!({
+                "job":details.job,
+                "entries_committed":details.entries_committed,
+                "entries_skipped":details.entries_skipped,
+                "entries_pending":details.entries_pending,
+            }),
+        )?;
         stage.file().write_all(b",\"issues\":[")?;
         let mut offset = 0;
         let mut first = true;
