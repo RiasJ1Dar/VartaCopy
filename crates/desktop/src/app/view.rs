@@ -407,15 +407,12 @@ impl App {
                         .zip(widths)
                         .enumerate()
                     {
-                        let r = ui.add_sized(
-                            [width, 24.0],
-                            egui::Label::new(RichText::new(label).strong())
-                                .halign(if column == 2 {
-                                    egui::Align::Max
-                                } else {
-                                    egui::Align::Min
-                                })
-                                .truncate(),
+                        let r = table_label(
+                            ui,
+                            width,
+                            24.0,
+                            RichText::new(label).strong(),
+                            column == 2,
                         );
                         ui.ctx().accesskit_node_builder(r.id, |n| {
                             n.set_role(egui::accesskit::Role::ColumnHeader);
@@ -501,16 +498,7 @@ impl App {
                                                 .zip(column_widths(ui.available_width()))
                                                 .enumerate()
                                         {
-                                            let r = ui.add_sized(
-                                                [width, 28.0],
-                                                egui::Label::new(text)
-                                                    .halign(if column == 2 {
-                                                        egui::Align::Max
-                                                    } else {
-                                                        egui::Align::Min
-                                                    })
-                                                    .truncate(),
-                                            );
+                                            let r = table_label(ui, width, 28.0, text, column == 2);
                                             ui.ctx().accesskit_node_builder(r.id, |n| {
                                                 n.set_role(egui::accesskit::Role::Cell);
                                                 n.set_label(text);

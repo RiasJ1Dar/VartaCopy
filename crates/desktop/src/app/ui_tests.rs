@@ -88,6 +88,11 @@ fn virtual_grid_has_real_rows_cells_and_one_keyboard_focus_target() {
     let id = app.files_id();
     app.context.memory_mut(|m| m.request_focus(id));
     render(&mut app, [980.0, 640.0], None);
+    render(&mut app, [980.0, 640.0], Some(egui::Key::Enter));
+    assert!(
+        !app.file_open,
+        "no selection must not open a permanently loading dialog"
+    );
     let nodes = render(&mut app, [980.0, 640.0], Some(egui::Key::ArrowDown));
     assert_eq!(app.file_selected, Some(0));
     let grid = nodes
@@ -98,6 +103,15 @@ fn virtual_grid_has_real_rows_cells_and_one_keyboard_focus_target() {
     assert_eq!(grid.1.row_count(), Some(141));
     assert_eq!(grid.1.column_count(), Some(3));
     assert!(grid.1.active_descendant().is_some());
+    let left = grid.1.bounds().unwrap().x0;
+    for (_, n) in nodes.iter().filter(|(_, n)| {
+        matches!(n.role(), Role::Cell | Role::ColumnHeader) && n.column_index() == Some(0)
+    }) {
+        assert!(
+            (n.bounds().unwrap().x0 - left).abs() < 4.0,
+            "first column must align to the left edge"
+        );
+    }
     assert_eq!(
         nodes
             .iter()

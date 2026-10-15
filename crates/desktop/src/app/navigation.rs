@@ -108,6 +108,9 @@ impl App {
         self.focus_attempts = 0;
     }
     pub(super) fn inspect_file(&mut self) {
+        if self.file_selected.is_none() {
+            return;
+        }
         let Some(job) = self.selected_job() else {
             return;
         };

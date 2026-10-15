@@ -415,7 +415,7 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(root, |ui| self.footer(ui));
         if root.available_width() >= 680.0 {
             egui::Panel::left("jobs")
-                .default_size(216.0)
+                .default_size(190.0)
                 .size_range(180.0..=320.0)
                 .show(root, |ui| self.sidebar(ui));
         }
@@ -514,6 +514,25 @@ fn column_widths(width: f32) -> [f32; 3] {
     let status = if width < 430.0 { 100.0 } else { 124.0 };
     let size = if width < 430.0 { 64.0 } else { 78.0 };
     [(width - status - size - 16.0).max(60.0), status, size]
+}
+fn table_label(
+    ui: &mut egui::Ui,
+    width: f32,
+    height: f32,
+    text: impl Into<egui::WidgetText>,
+    right: bool,
+) -> egui::Response {
+    let size = egui::vec2(width, height);
+    let layout = if right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.allocate_ui_with_layout(size, layout, |ui| {
+        ui.set_min_size(size);
+        ui.add(egui::Label::new(text).truncate())
+    })
+    .inner
 }
 fn entry_status(state: EntryState) -> &'static str {
     match state {
