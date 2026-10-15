@@ -377,3 +377,61 @@ fn report_streams_all_issue_pages_and_never_replaces_existing_output() {
     assert_eq!(journal.job(id).unwrap().status, "cancelled");
     assert!(journal.recheck(id).is_err());
 }
+
+#[test]
+fn file_table_pages_preserve_native_names_stream_sizes_states_and_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("tree");
+    let dest = root.path().join("dest");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&dest).unwrap();
+    fs::create_dir(source.join("empty")).unwrap();
+    for i in 0..130 {
+        fs::write(source.join(format!("file-{i:03}")), b"data").unwrap();
+    }
+    fs::write(source.join("file-000:note"), b"ADS").unwrap();
+    let plan = scan(
+        &source,
+        &dest,
+        ScanOptions::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let mut journal = Journal::open(&root.path().join("jobs.sqlite")).unwrap();
+    let id = journal.enqueue(&plan, Conflict::Error).unwrap();
+    let native = PathBuf::from(OsString::from_wide(&[b'x' as u16, 0xD800]));
+    journal
+        .db
+        .execute(
+            "UPDATE entries SET relative=?1 WHERE job_id=?2 AND ordinal=131",
+            params![encode_path(&native), id],
+        )
+        .unwrap();
+    journal.entry_error(id, 131, "kept failure").unwrap();
+    let first = journal.entry_page(id, 128, 0).unwrap();
+    assert_eq!(first.total, 132);
+    assert_eq!(first.entries.len(), 128);
+    assert!(first.has_more);
+    assert_eq!(first.entries[0].kind, EntryKind::Directory);
+    assert_eq!(first.entries[0].bytes, None);
+    assert!(
+        first
+            .entries
+            .iter()
+            .any(|e| e.relative == Path::new("file-000") && e.bytes == Some(7))
+    );
+    let last = journal.entry_page(id, 128, 128).unwrap();
+    assert_eq!(last.entries.len(), 4);
+    assert!(!last.has_more);
+    assert_eq!(last.entries[3].ordinal, 131);
+    assert_eq!(last.entries[3].relative, native);
+    assert_eq!(last.entries[3].error.as_deref(), Some("kept failure"));
+    assert_eq!(last.entries[3].state, EntryState::Planned);
+    let past = journal.entry_page(id, 64, 132).unwrap();
+    assert!(past.entries.is_empty());
+    assert!(!past.has_more);
+    assert!(journal.entry_page(id, 0, 0).is_err());
+    assert!(journal.entry_page(id, 129, 0).is_err());
+    assert!(journal.entry_page(id, 64, usize::MAX).is_err());
+    assert!(journal.entry_page(id + 1, 64, 0).is_err());
+}

@@ -162,6 +162,26 @@ pub struct JobDetails {
     pub has_more: bool,
 }
 
+/// A bounded file-table projection; never exposes stage ownership or chunk hashes to the UI.
+#[derive(Debug, Clone)]
+pub struct EntrySummary {
+    pub ordinal: usize,
+    pub relative: PathBuf,
+    pub kind: EntryKind,
+    /// Total logical bytes across all file streams, including ADS; directories have no size.
+    pub bytes: Option<u64>,
+    pub state: EntryState,
+    pub error: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub struct EntryPage {
+    pub job_id: i64,
+    pub offset: usize,
+    pub total: usize,
+    pub entries: Vec<EntrySummary>,
+    pub has_more: bool,
+}
+
 #[derive(Debug)]
 pub struct Entry {
     pub ordinal: usize,
@@ -550,6 +570,61 @@ impl Journal {
             entries_pending: pending,
             issues,
             issues_offset: offset,
+            has_more,
+        })
+    }
+
+    pub fn entry_page(&self, id: i64, limit: usize, offset: usize) -> Result<EntryPage> {
+        if limit == 0 || limit > 128 {
+            return Err(Error::Journal(
+                "file page must contain 1..128 entries".into(),
+            ));
+        }
+        let total = self.job(id)?.entry_count;
+        let mut statement = self.db.prepare("SELECT ordinal,relative,kind,snapshot,state,last_error FROM entries WHERE job_id=?1 ORDER BY ordinal LIMIT ?2 OFFSET ?3")?;
+        let rows = statement.query_map(params![id, sql_num(limit)?, sql_num(offset)?], |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<Vec<u8>>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut entries = Vec::with_capacity(limit);
+        for row in rows {
+            let (ordinal, relative, kind, snapshot, state, error) = row?;
+            let kind = parse_kind(&kind)?;
+            let snapshot: Option<Snapshot> =
+                snapshot.map(|b| serde_json::from_slice(&b)).transpose()?;
+            let bytes = if kind == EntryKind::File {
+                snapshot
+                    .map(|s| {
+                        s.streams.iter().try_fold(0u64, |sum, stream| {
+                            sum.checked_add(stream.size)
+                                .ok_or_else(|| Error::Journal("file stream sizes overflow".into()))
+                        })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            entries.push(EntrySummary {
+                ordinal: ordinal as usize,
+                relative: decode_path(relative, true)?,
+                kind,
+                bytes,
+                state: EntryState::parse(&state)?,
+                error,
+            });
+        }
+        let has_more = offset.saturating_add(entries.len()) < total;
+        Ok(EntryPage {
+            job_id: id,
+            offset,
+            total,
+            entries,
             has_more,
         })
     }
