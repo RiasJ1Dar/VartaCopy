@@ -327,6 +327,7 @@ pub struct Stage {
     published: bool,
     delete_requested: bool,
     cleanup_on_drop: bool,
+    directory: bool,
 }
 
 impl Stage {
@@ -352,6 +353,7 @@ impl Stage {
             published: false,
             delete_requested: false,
             cleanup_on_drop: true,
+            directory: false,
         })
     }
 
@@ -414,6 +416,51 @@ impl Stage {
             published: false,
             delete_requested: false,
             cleanup_on_drop: false,
+            directory: false,
+        })
+    }
+
+    pub fn create_directory(parent: &Path) -> io::Result<Self> {
+        let temporary = tempfile::Builder::new()
+            .prefix(".vartacopy-")
+            .suffix(".tree")
+            .tempdir_in(parent)?;
+        let path = temporary.keep();
+        let file = Self::directory_handle(&path)?;
+        Ok(Self {
+            file,
+            path,
+            published: false,
+            delete_requested: false,
+            cleanup_on_drop: true,
+            directory: true,
+        })
+    }
+
+    fn directory_handle(path: &Path) -> io::Result<File> {
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | 0x0001_0000)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if is_reparse(&file.metadata()?) || !file.metadata()?.is_dir() {
+            return Err(io::Error::other("ordinary staging directory required"));
+        }
+        Ok(file)
+    }
+
+    pub fn reopen_directory(path: &Path, expected: &Identity) -> io::Result<Self> {
+        let file = Self::directory_handle(path)?;
+        if identity(&file)? != *expected {
+            return Err(io::Error::other("staging directory identity mismatch"));
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            published: false,
+            delete_requested: false,
+            cleanup_on_drop: false,
+            directory: true,
         })
     }
 
@@ -476,7 +523,12 @@ impl Stage {
         }
         self.path = destination.to_path_buf();
         self.published = true;
-        self.file.sync_all()
+        // Windows does not provide a portable directory-handle fsync here.
+        if self.directory {
+            Ok(())
+        } else {
+            self.file.sync_all()
+        }
     }
 
     pub fn discard(&mut self) -> io::Result<()> {

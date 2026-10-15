@@ -346,6 +346,9 @@ impl Journal {
             [id],|r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,
                 r.get::<_,String>(3)?,r.get::<_,u32>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<Vec<u8>>>(6)?,
                 r.get::<_,Option<Vec<u8>>>(7)?,r.get::<_,Option<String>>(8)?)))?;
+        if raw.4 == 0 || raw.4 as usize > crate::planner::MAX_ENTRIES {
+            return Err(Error::Journal("invalid persisted entry count".into()));
+        }
         Ok(Job {
             id,
             source: decode_path(raw.0, false)?,
@@ -462,6 +465,119 @@ impl Journal {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn record_directory(
+        &mut self,
+        job: i64,
+        ordinal: usize,
+        stage: &Path,
+        target: &Path,
+        identity: &platform::Identity,
+    ) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let bytes = serde_json::to_vec(identity)?;
+        if tx.execute("UPDATE entries SET stage=?3,stage_identity=?4,target=?5,state='dir_intent' WHERE job_id=?1 AND ordinal=?2 AND state='planned'",
+            params![job,sql_num(ordinal)?,encode_path(stage),&bytes,encode_path(target)])?!=1 {
+            return Err(Error::Journal("directory intent requires planned state".into()));
+        }
+        if ordinal==0 && tx.execute("UPDATE jobs SET output_root=?2,output_identity=?3 WHERE id=?1 AND output_root IS NULL",
+            params![job,encode_path(target),&bytes])?!=1 {return Err(Error::Journal("root binding already exists".into()));}
+        tx.execute(
+            "INSERT INTO events(job_id,ordinal,state) VALUES(?1,?2,'dir_intent')",
+            params![job, sql_num(ordinal)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn retarget_directory(&mut self, job: i64, ordinal: usize, target: &Path) -> Result<()> {
+        let tx = self.db.transaction()?;
+        if tx.execute(
+            "UPDATE entries SET target=?3 WHERE job_id=?1 AND ordinal=?2 AND state='dir_intent'",
+            params![job, sql_num(ordinal)?, encode_path(target)],
+        )? != 1
+        {
+            return Err(Error::Journal("directory is not publishing".into()));
+        }
+        if ordinal == 0 {
+            tx.execute(
+                "UPDATE jobs SET output_root=?2 WHERE id=?1",
+                params![job, encode_path(target)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn directory_ready(
+        &mut self,
+        job: i64,
+        ordinal: usize,
+        identity: &platform::Identity,
+    ) -> Result<()> {
+        let tx = self.db.transaction()?;
+        if tx.execute("UPDATE entries SET state='directory_ready',target_identity=?3,last_error=NULL WHERE job_id=?1 AND ordinal=?2 AND state='dir_intent'",
+            params![job,sql_num(ordinal)?,serde_json::to_vec(identity)?])?!=1 {return Err(Error::Journal("directory intent missing".into()));}
+        tx.execute(
+            "INSERT INTO events(job_id,ordinal,state) VALUES(?1,?2,'directory_ready')",
+            params![job, sql_num(ordinal)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn reopen_directory_metadata(&mut self, job: i64, ordinal: usize) -> Result<()> {
+        if self.db.execute("UPDATE entries SET state='directory_ready' WHERE job_id=?1 AND ordinal=?2 AND kind='directory' AND state='committed'",
+            params![job,sql_num(ordinal)?])?!=1 {return Err(Error::Journal("committed directory missing".into()));}
+        Ok(())
+    }
+
+    pub fn skip_root(&mut self, job: i64) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let active:i64=tx.query_row("SELECT count(*) FROM entries WHERE job_id=?1 AND NOT(state IN ('planned','skipped') OR (ordinal=0 AND state='dir_intent'))",[job],|r|r.get(0))?;
+        if active != 0 {
+            return Err(Error::Journal(
+                "cannot skip a tree with work already started".into(),
+            ));
+        }
+        tx.execute("UPDATE entries SET state='skipped' WHERE job_id=?1", [job])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn skip_range(&mut self, job: i64, start: usize, end: usize) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let active:i64=tx.query_row("SELECT count(*) FROM entries WHERE job_id=?1 AND ordinal>=?2 AND ordinal<?3 AND NOT(state IN ('planned','skipped') OR (ordinal=?2 AND state='dir_intent'))",
+            params![job,sql_num(start)?,sql_num(end)?],|r|r.get(0))?;
+        if active != 0 {
+            return Err(Error::Journal(
+                "cannot skip entries with work already started".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE entries SET state='skipped' WHERE job_id=?1 AND ordinal>=?2 AND ordinal<?3",
+            params![job, sql_num(start)?, sql_num(end)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn entry_error(&mut self, job: i64, ordinal: usize, message: &str) -> Result<()> {
+        if self.db.execute(
+            "UPDATE entries SET last_error=?3 WHERE job_id=?1 AND ordinal=?2",
+            params![job, sql_num(ordinal)?, message],
+        )? != 1
+        {
+            return Err(Error::Journal("error entry missing".into()));
+        }
+        Ok(())
+    }
+
+    pub fn counts(&self, job: i64) -> Result<(usize, usize)> {
+        let (committed,skipped)=self.db.query_row("SELECT coalesce(sum(state='committed'),0),coalesce(sum(state='skipped'),0) FROM entries WHERE job_id=?1",
+            [job],|r|Ok((r.get::<_,u32>(0)?,r.get::<_,u32>(1)?)))?;
+        Ok((committed as usize, skipped as usize))
     }
 
     pub fn publish_intent(&mut self, job: i64, ordinal: usize, target: &Path) -> Result<()> {

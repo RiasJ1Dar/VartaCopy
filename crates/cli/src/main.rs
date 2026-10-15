@@ -20,7 +20,7 @@ use vartacopy_core::{
     about = "Verified Windows file and directory copy"
 )]
 struct Args {
-    /// Persistent job database; enables resumable copy.
+    /// Persistent job database (default: LOCALAPPDATA/VartaCopy/jobs.sqlite3).
     #[arg(long, global = true)]
     journal: Option<PathBuf>,
     #[command(subcommand)]
@@ -142,25 +142,25 @@ fn run(
                 Policy::Skip => Conflict::Skip,
                 Policy::KeepBoth => Conflict::KeepBoth,
             };
-            if args.journal.is_some() || enqueue {
-                let path = match args.journal {
-                    Some(path) => path,
-                    None => journal::default_path()?,
-                };
-                let mut journal = Journal::open(&path)?;
-                let id = journal.enqueue(&plan, conflict)?;
-                if enqueue {
-                    emit(&journal.job(id)?, json)?;
-                    return Ok(0);
-                }
-                let report = recovery::run(&mut journal, id, control, &mut |_| Ok(()))?;
-                let code = report.exit_code();
-                emit(&report, json)?;
+            if !plan.is_ready() {
+                let outcome = tree::execute(&plan, conflict, cancel)?;
+                let code = outcome.exit_code();
+                emit(&outcome, json)?;
                 return Ok(code);
             }
-            let outcome = tree::execute(&plan, conflict, cancel)?;
-            let code = outcome.exit_code();
-            emit(&outcome, json)?;
+            let path = match args.journal {
+                Some(path) => path,
+                None => journal::default_path()?,
+            };
+            let mut journal = Journal::open(&path)?;
+            let id = journal.enqueue(&plan, conflict)?;
+            if enqueue {
+                emit(&journal.job(id)?, json)?;
+                return Ok(0);
+            }
+            let report = recovery::run(&mut journal, id, control, &mut |_| Ok(()))?;
+            let code = report.exit_code();
+            emit(&report, json)?;
             Ok(code)
         }
         Command::Verify { left, right, json } => {

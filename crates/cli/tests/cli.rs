@@ -77,10 +77,17 @@ fn cli_durable_conflict_is_not_false_success_and_keeps_job_for_inspection() {
 }
 
 fn cli(args: &[&std::ffi::OsStr]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_vartacopy"))
-        .args(args)
-        .output()
-        .unwrap()
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vartacopy"));
+    command.args(args);
+    if args.first().is_some_and(|arg| *arg == "copy") && !args.iter().any(|arg| *arg == "--journal")
+    {
+        let path = std::path::Path::new(args[1])
+            .parent()
+            .unwrap()
+            .join(".test-jobs.sqlite");
+        command.arg("--journal").arg(path);
+    }
+    command.output().unwrap()
 }
 
 #[test]
@@ -107,7 +114,7 @@ fn cli_dry_run_copy_conflict_skip_and_verify_exit_codes() {
     ]);
     assert!(output.status.success(), "{output:?}");
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["status"], "copied_verified");
+    assert_eq!(result["status"], "completed");
     assert!(result["destination"]["windows_utf16"].is_array());
 
     let output = cli(&[
@@ -118,8 +125,8 @@ fn cli_dry_run_copy_conflict_skip_and_verify_exit_codes() {
     ]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stderr).unwrap()["status"],
-        "failed"
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"],
+        "interrupted"
     );
     let output = cli(&[
         "copy".as_ref(),
@@ -132,7 +139,7 @@ fn cli_dry_run_copy_conflict_skip_and_verify_exit_codes() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"],
-        "skipped_unverified"
+        "partial"
     );
 
     let target = dest.join(source.file_name().unwrap());
@@ -223,8 +230,8 @@ fn cli_tree_copy_dry_run_and_conflicts_report_truthful_counts() {
     ]);
     assert!(output.status.success(), "{output:?}");
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["status"], "copied_verified");
-    assert_eq!(result["files_copied"], 1);
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["entries_committed"], 4);
     assert_eq!(result["entries_failed"], 0);
     assert_eq!(
         fs::read(destination.join("tree/nested/file")).unwrap(),
@@ -240,9 +247,9 @@ fn cli_tree_copy_dry_run_and_conflicts_report_truthful_counts() {
     ]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["status"], "skipped_unverified");
-    assert_eq!(result["files_copied"], 0);
-    assert_eq!(result["streams_verified"], 0);
+    assert_eq!(result["status"], "partial");
+    assert_eq!(result["entries_committed"], 0);
+    assert_eq!(result["verified_bytes"], 0);
     assert_eq!(result["entries_skipped"], 4);
 }
 
@@ -301,7 +308,7 @@ fn cli_reparse_skip_is_partial_and_limits_never_write() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["status"], "partial");
-    assert_eq!(result["files_copied"], 1);
+    assert_eq!(result["entries_committed"], 2);
     assert_eq!(result["entries_skipped"], 1);
     assert!(!destination.join("tree/link").exists());
     fs::remove_dir(link).unwrap();

@@ -1,6 +1,7 @@
 //! Resumable verified file transfers. Every reused byte is rehashed in source and stage.
 #[cfg(test)]
 mod tests;
+mod tree;
 use crate::{
     Conflict, Error, Result,
     control::Control,
@@ -25,6 +26,10 @@ pub enum Phase {
     Published,
     Committed,
     Checking,
+    DirectoryIntent,
+    DirectoryPublished,
+    DirectoryReady,
+    DirectoryCommitted,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,12 +44,17 @@ pub struct Progress {
 #[derive(Debug, Serialize)]
 pub struct RunReport {
     pub job_id: i64,
+    pub destination: platform::PathRecord,
     pub status: String,
     pub entries_committed: usize,
     pub entries_skipped: usize,
+    pub entries_failed: usize,
+    pub entries_pending: usize,
     pub resumed_bytes: u64,
     pub verified_bytes: u64,
     pub error: Option<String>,
+    pub issues: Vec<crate::tree::EntryProblem>,
+    pub issues_omitted: usize,
 }
 impl RunReport {
     pub fn exit_code(&self) -> u8 {
@@ -346,6 +356,24 @@ fn resume_file(
     observer: &mut Observer<'_>,
 ) -> Result<(bool, u64, u64)> {
     control.checkpoint()?;
+    if entry
+        .target
+        .as_ref()
+        .is_some_and(|recorded| recorded.parent() != target.parent())
+    {
+        return Err(Error::Journal(
+            "recorded target lies outside selected parent".into(),
+        ));
+    }
+    if let Some(identity) = &entry.stage_identity {
+        if entry
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.identity == *identity)
+        {
+            return Err(Error::Journal("stage aliases source".into()));
+        }
+    }
     if entry.state == EntryState::Skipped {
         if let (Some(path), Some(identity)) = (&entry.stage, &entry.stage_identity) {
             if path.try_exists()? {
@@ -535,13 +563,9 @@ pub fn run(
     control: &Control,
     observer: &mut Observer<'_>,
 ) -> Result<RunReport> {
+    control.checkpoint()?;
     let job = journal.job(id)?;
     let entry = journal.entry(id, 0)?;
-    if job.entry_count != 1 || entry.kind != EntryKind::File {
-        return Err(Error::Journal(
-            "durable tree execution is the next implementation stage".into(),
-        ));
-    }
     let parent = required(job.destination.parent(), "job destination parent missing")?;
     let _parents = platform::guard_parents(&parent.join(".vartacopy-guard"))?;
     let parent_guard = platform::open_directory(parent, false)?;
@@ -549,44 +573,84 @@ pub fn run(
         return Err(Error::Verification("destination parent replaced".into()));
     }
     journal.set_job_status(id, "running", None)?;
-    match resume_file(journal, &job, entry, &job.destination, control, observer) {
-        Ok((copied, resumed, bytes)) => {
-            let status = if copied { "completed" } else { "partial" };
-            journal.set_job_status(id, status, None)?;
-            journal.flush()?;
-            Ok(RunReport {
-                job_id: id,
-                status: status.into(),
-                entries_committed: usize::from(copied),
-                entries_skipped: usize::from(!copied),
-                resumed_bytes: resumed,
-                verified_bytes: bytes,
-                error: None,
-            })
-        }
+    let mut report = RunReport {
+        job_id: id,
+        destination: job.destination.as_path().into(),
+        status: "running".into(),
+        entries_committed: 0,
+        entries_skipped: 0,
+        entries_failed: 0,
+        entries_pending: job.entry_count,
+        resumed_bytes: 0,
+        verified_bytes: 0,
+        error: None,
+        issues: Vec::new(),
+        issues_omitted: 0,
+    };
+    let result = if entry.kind == EntryKind::File && job.entry_count == 1 {
+        resume_file(journal, &job, entry, &job.destination, control, observer).map(
+            |(_, resumed, bytes)| {
+                report.resumed_bytes = resumed;
+                report.verified_bytes = bytes;
+            },
+        )
+    } else if entry.kind == EntryKind::Directory {
+        tree::run_tree(journal, &job, control, observer, &mut report)
+    } else {
+        Err(Error::Journal("invalid root entry".into()))
+    };
+    let primary = result.as_ref().err().map(ToString::to_string);
+    let (committed, skipped) = journal.counts(id).map_err(|error| {
+        Error::Journal(format!(
+            "cannot read persisted progress: {error}; primary error: {primary:?}"
+        ))
+    })?;
+    report.entries_committed = committed;
+    report.entries_skipped = skipped;
+    let root = journal.entry(id, 0)?;
+    report.destination = root.target.as_deref().unwrap_or(&job.destination).into();
+    report.entries_pending = job
+        .entry_count
+        .checked_sub(committed + skipped)
+        .ok_or_else(|| Error::Journal("entry counts exceed saved plan".into()))?;
+    match result {
         Err(error) => {
-            let status = if matches!(error, Error::Cancelled) {
+            report.status = if matches!(error, Error::Cancelled) {
                 "paused"
             } else {
                 "interrupted"
-            };
-            let message = error.to_string();
-            journal
-                .set_job_status(id, status, Some(&message))
-                .map_err(|save| {
-                    Error::Journal(format!(
-                        "job {id}: {message}; failed to persist error: {save}"
-                    ))
-                })?;
-            Ok(RunReport {
-                job_id: id,
-                status: status.into(),
-                entries_committed: 0,
-                entries_skipped: 0,
-                resumed_bytes: 0,
-                verified_bytes: 0,
-                error: Some(message),
-            })
+            }
+            .into();
+            if !matches!(error, Error::Cancelled) {
+                report.entries_failed += 1;
+            }
+            report.error = Some(error.to_string());
+        }
+        Ok(()) => {
+            report.status = if report.entries_failed > 0 || report.entries_pending > 0 {
+                "interrupted"
+            } else if skipped > 0 {
+                "partial"
+            } else {
+                "completed"
+            }
+            .into();
+            if report.entries_failed > 0 {
+                report.error = Some(format!(
+                    "{} entries failed; see issues",
+                    report.entries_failed
+                ));
+            }
         }
     }
+    journal
+        .set_job_status(id, &report.status, report.error.as_deref())
+        .map_err(|save| {
+            Error::Journal(format!(
+                "job {id}: {:?}; failed to persist outcome: {save}",
+                report.error
+            ))
+        })?;
+    journal.flush()?;
+    Ok(report)
 }
