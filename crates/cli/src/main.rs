@@ -68,6 +68,62 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect saved counts and a page of per-entry issues.
+    Show {
+        job_id: i64,
+        #[arg(long, default_value_t = 32)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a consistent JSON report without replacing an existing file.
+    Export {
+        job_id: i64,
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Waiting jobs in execution order; optionally execute until empty or cancelled.
+    Queue {
+        #[arg(long)]
+        run: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Schedule an unfinished job, or recheck a finished copy against recorded hashes.
+    Schedule {
+        job_id: i64,
+        #[arg(long)]
+        recheck: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Hold an inactive unfinished job. Owned partial data is retained.
+    Pause {
+        job_id: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel an inactive unfinished job. Owned partial data is retained.
+    Cancel {
+        job_id: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move a waiting job one place in the persisted queue.
+    Order {
+        job_id: i64,
+        #[arg(value_enum)]
+        direction: Direction,
+        #[arg(long)]
+        json: bool,
+    },
     /// Resume or reconcile a persisted job.
     Resume {
         job_id: i64,
@@ -75,6 +131,12 @@ enum Command {
         json: bool,
     },
 }
+#[derive(Clone, Copy, ValueEnum)]
+enum Direction {
+    Up,
+    Down,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Policy {
     Error,
@@ -184,6 +246,87 @@ fn run(
             emit(&journal.jobs(limit, offset)?, json)?;
             Ok(0)
         }
+        Command::Show {
+            job_id,
+            limit,
+            offset,
+            json,
+        } => {
+            let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
+            emit(&Journal::open(&path)?.details(job_id, limit, offset)?, json)?;
+            Ok(0)
+        }
+        Command::Export {
+            job_id,
+            path: output,
+            json,
+        } => {
+            let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
+            Journal::open(&path)?.export_report(job_id, &output)?;
+            emit(
+                &serde_json::json!({"status":"exported","job_id":job_id}),
+                json,
+            )?;
+            Ok(0)
+        }
+        Command::Queue {
+            run,
+            limit,
+            offset,
+            json,
+        } => {
+            let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
+            let mut journal = Journal::open(&path)?;
+            if !run {
+                emit(&journal.queue(limit, offset)?, json)?;
+                return Ok(0);
+            }
+            let mut code = 0;
+            // NDJSON with one result per job; no unbounded in-memory report list.
+            while let Some(job) = journal.queue(1, 0)?.into_iter().next() {
+                control.checkpoint()?;
+                let report = recovery::run(&mut journal, job.id, control, &mut |_| Ok(()))?;
+                code = code.max(report.exit_code());
+                emit(&report, json)?;
+                if control.is_cancelled() {
+                    return Ok(130);
+                }
+            }
+            Ok(code)
+        }
+        Command::Schedule {
+            job_id,
+            recheck,
+            json,
+        } => {
+            let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
+            let mut journal = Journal::open(&path)?;
+            if recheck {
+                journal.recheck(job_id)?;
+            } else {
+                journal.schedule(job_id)?;
+            }
+            emit(&journal.job(job_id)?, json)?;
+            Ok(0)
+        }
+        Command::Pause { job_id, json } | Command::Cancel { job_id, json } => {
+            let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
+            let mut journal = Journal::open(&path)?;
+            journal.hold(job_id, matches!(args.command, Command::Cancel { .. }))?;
+            emit(&journal.job(job_id)?, json)?;
+            Ok(0)
+        }
+        Command::Order {
+            job_id,
+            direction,
+            json,
+        } => {
+            let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
+            let mut journal = Journal::open(&path)?;
+            journal.move_queued(job_id, matches!(direction, Direction::Up))?;
+            emit(&journal.queue(256, 0)?, json)?;
+            Ok(0)
+        }
         Command::Resume { job_id, json } => {
             let path = match args.journal {
                 Some(path) => path,
@@ -215,7 +358,14 @@ fn main() -> ExitCode {
         Command::Copy { json, .. }
         | Command::Verify { json, .. }
         | Command::Jobs { json, .. }
-        | Command::Resume { json, .. } => *json,
+        | Command::Resume { json, .. }
+        | Command::Show { json, .. }
+        | Command::Export { json, .. }
+        | Command::Queue { json, .. }
+        | Command::Schedule { json, .. }
+        | Command::Pause { json, .. }
+        | Command::Cancel { json, .. }
+        | Command::Order { json, .. } => *json,
     };
     match run(args, &cancel, &control) {
         Ok(code) => ExitCode::from(code),

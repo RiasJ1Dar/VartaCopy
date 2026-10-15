@@ -143,6 +143,25 @@ fn optional_path<S: serde::Serializer>(
         .serialize(serializer)
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryIssue {
+    pub ordinal: usize,
+    #[serde(serialize_with = "crate::planner::serialize_path")]
+    pub relative: PathBuf,
+    pub state: EntryState,
+    pub message: String,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct JobDetails {
+    pub job: Job,
+    pub entries_committed: usize,
+    pub entries_skipped: usize,
+    pub entries_pending: usize,
+    pub issues: Vec<EntryIssue>,
+    pub issues_offset: usize,
+    pub has_more: bool,
+}
+
 #[derive(Debug)]
 pub struct Entry {
     pub ordinal: usize,
@@ -488,6 +507,134 @@ impl Journal {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         ids.into_iter().map(|id| self.job(id)).collect()
+    }
+
+    pub fn details(&self, id: i64, limit: usize, offset: usize) -> Result<JobDetails> {
+        if limit == 0 || limit > 256 {
+            return Err(Error::Journal(
+                "issue page must contain 1..256 entries".into(),
+            ));
+        }
+        let job = self.job(id)?;
+        let (committed, skipped) = self.counts(id)?;
+        let pending = job
+            .entry_count
+            .checked_sub(committed + skipped)
+            .ok_or_else(|| Error::Journal("invalid persisted counts".into()))?;
+        let mut statement = self.db.prepare("SELECT ordinal,relative,state,last_error FROM entries WHERE job_id=?1 AND last_error IS NOT NULL ORDER BY ordinal LIMIT ?2 OFFSET ?3")?;
+        let rows =
+            statement.query_map(params![id, sql_num(limit + 1)?, sql_num(offset)?], |r| {
+                Ok((
+                    r.get::<_, u32>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+        let mut issues = Vec::new();
+        for row in rows {
+            let (ordinal, relative, state, message) = row?;
+            issues.push(EntryIssue {
+                ordinal: ordinal as usize,
+                relative: decode_path(relative, true)?,
+                state: EntryState::parse(&state)?,
+                message,
+            });
+        }
+        let has_more = issues.len() > limit;
+        issues.truncate(limit);
+        Ok(JobDetails {
+            job,
+            entries_committed: committed,
+            entries_skipped: skipped,
+            entries_pending: pending,
+            issues,
+            issues_offset: offset,
+            has_more,
+        })
+    }
+
+    pub fn clear_entry_error(&mut self, job: i64, ordinal: usize) -> Result<()> {
+        if self.db.execute(
+            "UPDATE entries SET last_error=NULL WHERE job_id=?1 AND ordinal=?2",
+            params![job, sql_num(ordinal)?],
+        )? != 1
+        {
+            return Err(Error::Journal(
+                "entry missing while clearing failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Persistently hold or cancel an inactive unfinished job; retain owned data for recovery.
+    pub fn hold(&mut self, id: i64, cancel: bool) -> Result<()> {
+        let status = if cancel { "cancelled" } else { "paused" };
+        let tx = self.db.transaction()?;
+        if tx.execute(
+            "UPDATE jobs SET status=?2 WHERE id=?1 AND status IN ('queued','paused','interrupted')",
+            params![id, status],
+        )? != 1
+        {
+            return Err(Error::Journal("job is active or already finished".into()));
+        }
+        tx.execute(
+            "INSERT INTO events(job_id,state) VALUES(?1,?2)",
+            params![id, status],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Schedule integrity reconciliation of an already finished job, without recopying it.
+    pub fn recheck(&mut self, id: i64) -> Result<()> {
+        let tx = self.db.transaction()?;
+        if tx.execute("UPDATE jobs SET status='queued',last_error=NULL WHERE id=?1 AND status IN ('completed','partial')",[id])?!=1 {return Err(Error::Journal("only finished jobs can be rechecked".into()));}
+        tx.execute(
+            "INSERT INTO events(job_id,state) VALUES(?1,'recheck_queued')",
+            [id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Streaming consistent JSON snapshot, published without replacing an existing file.
+    pub fn export_report(&self, id: i64, path: &Path) -> Result<()> {
+        crate::validate_path(path)?;
+        let path = std::path::absolute(path)?;
+        let _parents = platform::guard_parents(&path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Journal("report parent missing".into()))?;
+        let tx = self.db.unchecked_transaction()?;
+        let details = self.details(id, 256, 0)?;
+        let mut stage = platform::Stage::create(parent)?;
+        stage
+            .file()
+            .write_all(b"{\"format\":\"vartacopy-job-report\",\"version\":1,\"summary\":")?;
+        serde_json::to_writer(stage.file(), &details)?;
+        stage.file().write_all(b",\"issues\":[")?;
+        let mut offset = 0;
+        let mut first = true;
+        loop {
+            let page = self.details(id, 256, offset)?;
+            for issue in page.issues {
+                if !first {
+                    stage.file().write_all(b",")?;
+                }
+                serde_json::to_writer(stage.file(), &issue)?;
+                first = false;
+            }
+            if !page.has_more {
+                break;
+            }
+            offset += 256;
+        }
+        stage.file().write_all(b"]}\n")?;
+        stage.file().sync_all()?;
+        tx.commit()?;
+        stage.publish(&path)?;
+        Ok(())
     }
 
     pub fn entry(&self, job: i64, ordinal: usize) -> Result<Entry> {

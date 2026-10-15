@@ -258,6 +258,7 @@ fn finish(
     control.checkpoint()?;
     let entry = journal.entry(job.id, directory.ordinal)?;
     if entry.state == EntryState::Committed {
+        journal.clear_entry_error(job.id, entry.ordinal)?;
         return Ok(());
     }
     if entry.state != EntryState::DirectoryReady {
@@ -305,6 +306,7 @@ pub(super) fn run_tree(
         let entry = journal.entry(job.id, ordinal)?;
         if entry.state == EntryState::Skipped {
             cleanup_skipped(job, &entry)?;
+            journal.clear_entry_error(job.id, ordinal)?;
             continue;
         }
         if blocked
@@ -357,6 +359,7 @@ pub(super) fn run_tree(
             }
             EntryKind::File => match resume_file(journal, job, entry, &target, control, observer) {
                 Ok((_, resumed, bytes)) => {
+                    journal.clear_entry_error(job.id, ordinal)?;
                     report.resumed_bytes += resumed;
                     report.verified_bytes += bytes;
                 }

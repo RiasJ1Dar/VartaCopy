@@ -313,3 +313,95 @@ fn cli_reparse_skip_is_partial_and_limits_never_write() {
     assert!(!destination.join("tree/link").exists());
     fs::remove_dir(link).unwrap();
 }
+
+#[test]
+fn cli_queue_controls_reports_and_recheck_without_source() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("dest");
+    fs::create_dir(&destination).unwrap();
+    let journal = root.path().join("jobs.sqlite");
+    for name in ["one", "two"] {
+        let source = root.path().join(name);
+        fs::write(&source, name.as_bytes()).unwrap();
+        let output = cli(&[
+            "copy".as_ref(),
+            source.as_os_str(),
+            destination.as_os_str(),
+            "--enqueue".as_ref(),
+            "--journal".as_ref(),
+            journal.as_os_str(),
+            "--json".as_ref(),
+        ]);
+        assert!(output.status.success(), "{output:?}");
+    }
+    let call = |args: &[&std::ffi::OsStr]| {
+        let mut all = vec!["--journal".as_ref(), journal.as_os_str()];
+        all.extend_from_slice(args);
+        cli(&all)
+    };
+    for args in [
+        vec!["pause", "1", "--json"],
+        vec!["schedule", "1", "--json"],
+        vec!["order", "2", "up", "--json"],
+    ] {
+        let output = call(&args.iter().map(|s| s.as_ref()).collect::<Vec<_>>());
+        assert!(output.status.success(), "{output:?}");
+    }
+    let output = call(&["queue".as_ref(), "--json".as_ref()]);
+    let jobs: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(jobs[0]["id"], 2);
+    let output = call(&["queue".as_ref(), "--run".as_ref(), "--json".as_ref()]);
+    assert!(output.status.success(), "{output:?}");
+    let reports = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(reports.lines().count(), 2);
+    assert_eq!(fs::read(destination.join("one")).unwrap(), b"one");
+    assert_eq!(fs::read(destination.join("two")).unwrap(), b"two");
+    fs::remove_file(root.path().join("one")).unwrap();
+    let output = call(&[
+        "schedule".as_ref(),
+        "1".as_ref(),
+        "--recheck".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let output = call(&["queue".as_ref(), "--run".as_ref(), "--json".as_ref()]);
+    assert!(output.status.success(), "{output:?}");
+    fs::write(destination.join("one"), b"bad").unwrap();
+    assert!(
+        call(&["schedule".as_ref(), "1".as_ref(), "--recheck".as_ref()])
+            .status
+            .success()
+    );
+    let output = call(&["queue".as_ref(), "--run".as_ref(), "--json".as_ref()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let output = call(&["show".as_ref(), "1".as_ref(), "--json".as_ref()]);
+    let details: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(details["job"]["status"], "interrupted");
+    assert_eq!(details["issues"].as_array().unwrap().len(), 1);
+    let report = root.path().join("report.json");
+    let output = call(&[
+        "export".as_ref(),
+        "1".as_ref(),
+        report.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&report).unwrap()).unwrap()["summary"]
+            ["job"]["status"],
+        "interrupted"
+    );
+    assert_eq!(
+        call(&["export".as_ref(), "1".as_ref(), report.as_os_str()])
+            .status
+            .code(),
+        Some(1)
+    );
+    fs::write(destination.join("one"), b"one").unwrap();
+    assert!(call(&["schedule".as_ref(), "1".as_ref()]).status.success());
+    assert!(call(&["queue".as_ref(), "--run".as_ref()]).status.success());
+    let output = call(&["show".as_ref(), "1".as_ref(), "--json".as_ref()]);
+    let details: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(details["job"]["status"], "completed");
+    assert!(details["issues"].as_array().unwrap().is_empty());
+}

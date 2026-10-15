@@ -331,3 +331,49 @@ fn peer_flush_is_durable_while_owner_retains_an_old_read_snapshot() {
         "completed"
     );
 }
+
+#[test]
+fn report_streams_all_issue_pages_and_never_replaces_existing_output() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("tree");
+    let dest = root.path().join("dest");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&dest).unwrap();
+    for i in 0..300 {
+        fs::write(source.join(format!("file-{i}")), b"data").unwrap();
+    }
+    let plan = scan(
+        &source,
+        &dest,
+        ScanOptions::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let mut journal = Journal::open(&root.path().join("jobs.sqlite")).unwrap();
+    let id = journal.enqueue(&plan, Conflict::Error).unwrap();
+    for i in 1..=300 {
+        journal.entry_error(id, i, "example failure").unwrap();
+    }
+    let first = journal.details(id, 256, 0).unwrap();
+    assert_eq!(first.issues.len(), 256);
+    assert!(first.has_more);
+    let second = journal.details(id, 256, 256).unwrap();
+    assert_eq!(second.issues.len(), 44);
+    assert!(!second.has_more);
+    let output = root.path().join("report.json");
+    journal.export_report(id, &output).unwrap();
+    let data = fs::read(&output).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+    assert_eq!(json["issues"].as_array().unwrap().len(), 300);
+    assert_eq!(json["summary"]["entries_pending"], 301);
+    assert!(json["issues"][0]["relative"]["windows_utf16"].is_array());
+    assert!(journal.export_report(id, &output).is_err());
+    assert_eq!(fs::read(output).unwrap(), data);
+    assert!(journal.details(id, 257, 0).is_err());
+    journal.hold(id, false).unwrap();
+    assert_eq!(journal.job(id).unwrap().status, "paused");
+    journal.schedule(id).unwrap();
+    journal.hold(id, true).unwrap();
+    assert_eq!(journal.job(id).unwrap().status, "cancelled");
+    assert!(journal.recheck(id).is_err());
+}

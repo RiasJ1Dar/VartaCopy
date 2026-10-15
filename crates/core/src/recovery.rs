@@ -598,6 +598,9 @@ pub fn run(
     } else {
         Err(Error::Journal("invalid root entry".into()))
     };
+    if result.is_ok() && job.entry_count == 1 {
+        journal.clear_entry_error(id, 0)?;
+    }
     let primary = result.as_ref().err().map(ToString::to_string);
     let (committed, skipped) = journal.counts(id).map_err(|error| {
         Error::Journal(format!(
@@ -622,6 +625,9 @@ pub fn run(
             .into();
             if !matches!(error, Error::Cancelled) {
                 report.entries_failed += 1;
+                if job.entry_count == 1 {
+                    journal.entry_error(id, 0, &error.to_string())?;
+                }
             }
             report.error = Some(error.to_string());
         }
