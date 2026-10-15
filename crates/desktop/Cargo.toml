@@ -1,0 +1,26 @@
+[package]
+name = "vartacopy-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+# Windows filenames are case-insensitive; do not collide with the CLI vartacopy.exe.
+name = "vartacopy-gui"
+path = "src/main.rs"
+
+[dependencies]
+vartacopy-core = { path = "../core" }
+eframe = { version = "=0.36.2", default-features = false, features = ["glow", "accesskit", "default_fonts"] }
+rfd = { version = "=0.17.2", default-features = false }
+serde_json.workspace = true
+
+[features]
+test-harness = ["eframe/__screenshot"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

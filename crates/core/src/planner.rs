@@ -101,6 +101,9 @@ impl PlannedEntry {
     pub fn kind(&self) -> EntryKind {
         self.kind
     }
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
+    }
 }
 
 #[derive(Debug, Default, Serialize)]

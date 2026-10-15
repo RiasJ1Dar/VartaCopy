@@ -166,7 +166,7 @@ pub struct Chunk {
 pub struct Journal {
     db: Connection,
     _file: File,
-    _writer: File,
+    _writer: std::sync::Arc<File>,
     _parents: Vec<File>,
     path: PathBuf,
 }
@@ -178,7 +178,7 @@ fn encode_path(path: &Path) -> Vec<u8> {
         .collect()
 }
 fn decode_path(bytes: Vec<u8>, relative: bool) -> Result<PathBuf> {
-    if bytes.len() > 65534 || bytes.len() % 2 != 0 {
+    if bytes.len() > 65534 || !bytes.len().is_multiple_of(2) {
         return Err(Error::Journal("invalid UTF-16 path length".into()));
     }
     let units: Vec<u16> = bytes
@@ -305,7 +305,7 @@ impl Journal {
         Ok(Self {
             db,
             _file: file,
-            _writer: writer,
+            _writer: std::sync::Arc::new(writer),
             _parents: parents,
             path,
         })
@@ -333,7 +333,7 @@ impl Journal {
         Ok(Self {
             db,
             _file: self._file.try_clone()?,
-            _writer: self._writer.try_clone()?,
+            _writer: self._writer.clone(),
             _parents: self
                 ._parents
                 .iter()
@@ -806,6 +806,12 @@ impl Journal {
     pub fn flush(&self) -> Result<()> {
         // End a fresh WAL connection's schema-read transaction before checkpointing.
         self.db.execute_batch("BEGIN IMMEDIATE; COMMIT;")?;
+        // FULL commits already synced the WAL. A peer may have a live read snapshot:
+        // truncating here would falsely fail a durable completed/paused transfer.
+        // The last connection checkpoints once peers have released their lease.
+        if std::sync::Arc::strong_count(&self._writer) > 1 {
+            return Ok(());
+        }
         let busy: i32 = self
             .db
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;

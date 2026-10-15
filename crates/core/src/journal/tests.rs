@@ -302,3 +302,32 @@ fn migrates_version_one_atomically_and_recovers_running_jobs() {
     assert_eq!(journal.queue(1, 0).unwrap()[0].id, second);
     assert!(journal.queue(257, 0).is_err());
 }
+
+#[test]
+fn peer_flush_is_durable_while_owner_retains_an_old_read_snapshot() {
+    let (root, plan) = fixture();
+    let path = root.path().join("jobs.sqlite");
+    let mut owner = Journal::open(&path).unwrap();
+    let id = owner.enqueue(&plan, Conflict::Error).unwrap();
+    let mut peer = owner.peer().unwrap();
+    owner.db.execute_batch("BEGIN DEFERRED;").unwrap();
+    assert_eq!(owner.job(id).unwrap().status, "queued");
+    let report = crate::recovery::run(
+        &mut peer,
+        id,
+        &crate::control::Control::default(),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(report.status, "completed");
+    assert_eq!(owner.job(id).unwrap().status, "queued");
+    owner.db.execute_batch("COMMIT;").unwrap();
+    assert_eq!(owner.job(id).unwrap().status, "completed");
+    drop(peer);
+    owner.flush().unwrap();
+    drop(owner);
+    assert_eq!(
+        Journal::open(&path).unwrap().job(id).unwrap().status,
+        "completed"
+    );
+}

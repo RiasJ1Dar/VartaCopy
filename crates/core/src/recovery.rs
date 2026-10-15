@@ -365,22 +365,21 @@ fn resume_file(
             "recorded target lies outside selected parent".into(),
         ));
     }
-    if let Some(identity) = &entry.stage_identity {
-        if entry
+    if let Some(identity) = &entry.stage_identity
+        && entry
             .snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.identity == *identity)
-        {
-            return Err(Error::Journal("stage aliases source".into()));
-        }
+    {
+        return Err(Error::Journal("stage aliases source".into()));
     }
     if entry.state == EntryState::Skipped {
-        if let (Some(path), Some(identity)) = (&entry.stage, &entry.stage_identity) {
-            if path.try_exists()? {
-                let _parents = platform::guard_parents(path)?;
-                let mut stage = platform::Stage::reopen(path, identity)?;
-                stage.discard()?;
-            }
+        if let (Some(path), Some(identity)) = (&entry.stage, &entry.stage_identity)
+            && path.try_exists()?
+        {
+            let _parents = platform::guard_parents(path)?;
+            let mut stage = platform::Stage::reopen(path, identity)?;
+            stage.discard()?;
         }
         return Ok((false, 0, 0));
     }
