@@ -8,7 +8,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use vartacopy_core::{
     Conflict, Error, Result,
@@ -68,6 +68,7 @@ pub enum Command {
     ClearErrors,
 }
 enum Message {
+    Wake,
     Command(Command),
     Planned(Result<OperationPlan>, Conflict),
     Finished(i64, Result<RunReport>),
@@ -75,18 +76,28 @@ enum Message {
 
 pub struct Client {
     sender: SyncSender<Message>,
-    state: Arc<Mutex<State>>,
+    state: Arc<Shared>,
     shutdown: Arc<AtomicBool>,
     scan_cancel: Arc<AtomicBool>,
     active_control: Arc<Mutex<Option<Arc<Control>>>>,
 }
-fn edit<T>(state: &Mutex<State>, f: impl FnOnce(&mut State) -> T) -> Result<T> {
-    let mut state = state
+struct Shared {
+    state: Mutex<State>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+fn quiet<T>(state: &Shared, f: impl FnOnce(&mut State) -> T) -> Result<T> {
+    let mut guard = state
+        .state
         .lock()
         .map_err(|_| Error::Journal("desktop state poisoned".into()))?;
-    Ok(f(&mut state))
+    Ok(f(&mut guard))
 }
-fn error(state: &Mutex<State>, message: impl ToString) {
+fn edit<T>(state: &Shared, f: impl FnOnce(&mut State) -> T) -> Result<T> {
+    let value = quiet(state, f)?;
+    (state.wake)();
+    Ok(value)
+}
+fn error(state: &Shared, message: impl ToString) {
     let message: String = message.to_string().chars().take(8192).collect();
     if let Err(failure) = edit(state, |s| {
         if s.errors.len() == 32 {
@@ -100,11 +111,28 @@ fn error(state: &Mutex<State>, message: impl ToString) {
 type ProgressHook = Arc<dyn Fn(&Progress) + Send + Sync>;
 impl Client {
     pub fn start(path: PathBuf) -> std::io::Result<Self> {
-        Self::start_with_hook(path, None)
+        Self::start_with_notify(path, Arc::new(|| {}))
     }
+    pub fn start_with_notify(
+        path: PathBuf,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> std::io::Result<Self> {
+        Self::start_config(path, None, wake)
+    }
+    #[cfg(test)]
     fn start_with_hook(path: PathBuf, hook: Option<ProgressHook>) -> std::io::Result<Self> {
+        Self::start_config(path, hook, Arc::new(|| {}))
+    }
+    fn start_config(
+        path: PathBuf,
+        hook: Option<ProgressHook>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(64);
-        let state = Arc::new(Mutex::new(State::default()));
+        let state = Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            wake,
+        });
         let shutdown = Arc::new(AtomicBool::new(false));
         let scan_cancel = Arc::new(AtomicBool::new(false));
         let active_control = Arc::new(Mutex::new(None));
@@ -159,7 +187,7 @@ impl Client {
         Ok(client)
     }
     pub fn snapshot(&self) -> Result<State> {
-        edit(&self.state, |s| s.clone())
+        quiet(&self.state, |s| s.clone())
     }
     pub fn send(&self, command: Command) -> std::result::Result<(), String> {
         self.sender
@@ -169,6 +197,12 @@ impl Client {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         self.scan_cancel.store(true, Ordering::Relaxed);
+        // Full means existing commands already wake recv; disconnected means the actor exited.
+        match self.sender.try_send(Message::Wake) {
+            Ok(())
+            | Err(mpsc::TrySendError::Full(_))
+            | Err(mpsc::TrySendError::Disconnected(_)) => {}
+        }
         match self.active_control.lock() {
             Ok(guard) => {
                 if let Some(control) = guard.as_ref() {
@@ -185,11 +219,11 @@ impl Drop for Client {
     }
 }
 
-fn refresh(journal: &Journal, state: &Mutex<State>) -> Result<()> {
-    let offset = edit(state, |s| s.offset)?;
+fn refresh(journal: &Journal, state: &Shared) -> Result<()> {
+    let offset = quiet(state, |s| s.offset)?;
     let queue = journal.queue(32, 0)?;
     let history = journal.jobs(32, offset)?;
-    let selected = edit(state, |s| {
+    let selected = quiet(state, |s| {
         s.details.as_ref().map(|d| (d.job.id, d.issues_offset))
     })?;
     let details = selected
@@ -209,7 +243,7 @@ fn actor(
     path: PathBuf,
     receiver: Receiver<Message>,
     sender: SyncSender<Message>,
-    state: &Arc<Mutex<State>>,
+    state: &Arc<Shared>,
     shutdown: &AtomicBool,
     scan_cancel: &Arc<AtomicBool>,
     active_control: &Mutex<Option<Arc<Control>>>,
@@ -239,9 +273,10 @@ fn actor(
                 break;
             }
         }
-        if let Ok(message) = receiver.recv_timeout(Duration::from_millis(30)) {
+        if let Ok(message) = receiver.recv() {
             let result: Result<()> = (|| {
                 match message {
+                    Message::Wake => {}
                     Message::Command(Command::Submit {
                         source,
                         destination,
@@ -423,8 +458,9 @@ fn actor(
             if let Err(e) = result {
                 error(state, e);
             }
+        } else {
+            break;
         }
-        edit(state, |s| s.automatic = automatic)?;
         if automatic && transfer.is_none() && !shutdown.load(Ordering::Acquire) {
             if let Some(job) = journal.queue(1, 0)?.into_iter().next() {
                 let mut peer = journal.peer()?;
@@ -451,17 +487,23 @@ fn actor(
                     thread::Builder::new()
                         .name("vartacopy-transfer".into())
                         .spawn(move || {
+                            let mut last_progress = Instant::now();
                             let outcome =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     recovery::run(&mut peer, id, &control, &mut |event| {
                                         if let Some(hook) = progress_hook.as_ref() {
                                             hook(&event);
                                         }
-                                        edit(&shared, |s| {
+                                        quiet(&shared, |s| {
                                             if let Some(a) = s.active.as_mut() {
                                                 a.progress = Some(event);
                                             }
-                                        })
+                                        })?;
+                                        if last_progress.elapsed() >= Duration::from_millis(100) {
+                                            (shared.wake)();
+                                            last_progress = Instant::now();
+                                        }
+                                        Ok(())
                                     })
                                 }));
                             let result = outcome.unwrap_or_else(|_| {
@@ -478,6 +520,12 @@ fn actor(
             } else {
                 automatic = false;
             }
+        }
+        if shutdown.load(Ordering::Acquire) {
+            automatic = false;
+        }
+        if quiet(state, |s| s.automatic)? != automatic {
+            edit(state, |s| s.automatic = automatic)?;
         }
     }
     journal.flush()?;
@@ -566,7 +614,9 @@ mod tests {
         assert_eq!(recovered.queue.len(), 1);
         client.send(Command::Resume(first_id)).unwrap();
         let done = wait(&client, |s| {
-            s.history.len() == 2 && s.history.iter().all(|j| j.status == "completed")
+            !s.automatic
+                && s.history.len() == 2
+                && s.history.iter().all(|j| j.status == "completed")
         });
         assert!(done.errors.is_empty(), "{:?}", done.errors);
         assert_eq!(
@@ -703,5 +753,32 @@ mod tests {
         });
         client.shutdown();
         wait(&client, |s| s.closed);
+    }
+    #[test]
+    fn snapshot_reads_and_idle_actor_do_not_wake_ui_but_shutdown_does() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let client = Client::start_with_notify(
+            root.path().join("jobs.sqlite"),
+            Arc::new(move || tx.send(()).unwrap()),
+        )
+        .unwrap();
+        // Initial history and readiness each publish one state change.
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(client.snapshot().unwrap().ready);
+        for _ in 0..100 {
+            assert!(client.snapshot().unwrap().ready);
+        }
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(80)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "idle UI must not be polled"
+        );
+        client.shutdown();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(wait(&client, |s| s.closed).closed);
     }
 }

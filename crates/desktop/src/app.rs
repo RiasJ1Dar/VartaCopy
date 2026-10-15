@@ -1,6 +1,9 @@
 use crate::worker::{Client, Command, State};
 use eframe::egui::{self, Color32, RichText};
-use std::{path::PathBuf, sync::mpsc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, mpsc},
+};
 use vartacopy_core::{Conflict, journal::Job, planner::ReparsePolicy, recovery::Phase};
 const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
 const INK: Color32 = Color32::from_rgb(15, 23, 42);
@@ -59,6 +62,7 @@ pub struct App {
     picker: Option<mpsc::Receiver<(Picker, Option<PathBuf>)>>,
     closing: bool,
     journal: PathBuf,
+    context: egui::Context,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf) -> std::io::Result<Self> {
@@ -101,7 +105,10 @@ impl App {
         style.visuals.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
         ctx.set_global_style(style);
         Ok(Self {
-            client: Client::start(path.clone())?,
+            client: Client::start_with_notify(path.clone(), {
+                let ctx = ctx.clone();
+                Arc::new(move || ctx.request_repaint())
+            })?,
             state: State::default(),
             source: PathInput::default(),
             destination: PathInput::default(),
@@ -113,6 +120,7 @@ impl App {
             picker: None,
             closing: false,
             journal: path,
+            context: ctx.clone(),
         })
     }
     fn command(&mut self, command: Command) {
@@ -125,6 +133,7 @@ impl App {
             return;
         }
         let (tx, rx) = mpsc::channel();
+        let context = self.context.clone();
         let result = std::thread::Builder::new()
             .name("vartacopy-dialog".into())
             .spawn(move || {
@@ -144,6 +153,7 @@ impl App {
                 if let Err(e) = tx.send((kind, value)) {
                     eprintln!("VartaCopy: file dialog result undelivered: {e}");
                 }
+                context.request_repaint();
             });
         match result {
             Ok(_) => self.picker = Some(rx),
@@ -500,7 +510,7 @@ impl eframe::App for App {
         {
             self.source.set(path);
         }
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // Worker and dialog completions wake the UI; an idle window needs no timer.
     }
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(root,|ui|{
