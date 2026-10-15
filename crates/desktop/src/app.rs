@@ -1,14 +1,19 @@
 mod dialogs;
+mod navigation;
+mod system_style;
+#[cfg(test)]
+mod ui_tests;
 mod view;
 use crate::worker::{Client, Command, State};
 use eframe::egui::{self, RichText};
+use navigation::{Pane, composite, lock_arrows, navigate};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
 };
 use vartacopy_core::{
     Conflict,
-    journal::{EntryState, Job},
+    journal::{EntryState, EntrySummary, Job},
     planner::{EntryKind, ReparsePolicy},
     recovery::Phase,
 };
@@ -70,9 +75,23 @@ pub struct App {
     messages_open: bool,
     settings_open: bool,
     file_selected: Option<usize>,
+    file_details: Option<(Job, EntrySummary)>,
+    file_visible: std::ops::Range<usize>,
+    file_scroll: Option<usize>,
+    pane: Pane,
+    command_focus: Option<egui::Id>,
+    return_focus: Option<egui::Id>,
+    pending_focus: Option<egui::Id>,
+    focus_attempts: u8,
+    job_scroll: bool,
+    jobs_open: bool,
     file_open: bool,
+    file_focus: bool,
     files_pending: Option<(i64, usize)>,
     theme: egui::ThemePreference,
+    base_styles: [egui::Style; 2],
+    contrast: Option<system_style::Palette>,
+    settings_watch: Option<system_style::Watch>,
     banner: Option<String>,
     picker: Option<mpsc::Receiver<(Picker, Option<PathBuf>)>>,
     closing: bool,
@@ -129,6 +148,27 @@ impl App {
                 .text_styles
                 .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
         });
+        let base_styles = [
+            (*ctx.style_of(egui::Theme::Light)).clone(),
+            (*ctx.style_of(egui::Theme::Dark)).clone(),
+        ];
+        let settings_watch = if cc.winit_window().is_some() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let handle = cc
+                .window_handle()
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+                return Err(std::io::Error::other("expected a Windows GUI handle"));
+            };
+            Some(system_style::Watch::attach(
+                handle.hwnd.get() as _,
+                ctx.clone(),
+            )?)
+        } else {
+            None
+        };
+        let contrast = system_style::Palette::read()?;
+        system_style::apply(ctx, &base_styles, contrast);
         Ok(Self {
             client: Client::start_with_notify(path.clone(), {
                 let ctx = ctx.clone();
@@ -149,9 +189,23 @@ impl App {
             messages_open: false,
             settings_open: false,
             file_selected: None,
+            file_details: None,
+            file_visible: 0..0,
+            file_scroll: None,
+            pane: Pane::Commands,
+            command_focus: None,
+            return_focus: None,
+            pending_focus: None,
+            focus_attempts: 0,
+            job_scroll: false,
+            jobs_open: false,
             file_open: false,
+            file_focus: false,
             files_pending: None,
             theme: egui::ThemePreference::System,
+            base_styles,
+            contrast,
+            settings_watch,
             banner: None,
             picker: None,
             closing: false,
@@ -204,6 +258,9 @@ impl App {
     fn select(&mut self, id: i64) {
         self.selected = Some(id);
         self.file_selected = None;
+        self.file_details = None;
+        self.file_scroll = Some(0);
+        self.file_visible = 0..0;
         self.file_open = false;
         self.command(Command::Inspect { id, offset: 0 });
         self.load_files(id, 0);
@@ -246,7 +303,8 @@ impl App {
             start,
         });
         if accepted {
-            self.new_operation = false;
+            self.return_focus = self.command_focus;
+            self.close_form();
             self.banner = None;
             self.history = false;
         }
@@ -254,6 +312,23 @@ impl App {
 }
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self
+            .settings_watch
+            .as_ref()
+            .is_some_and(|watch| watch.take_changed())
+        {
+            match system_style::Palette::read() {
+                Ok(palette) => {
+                    self.contrast = palette;
+                    system_style::apply(ctx, &self.base_styles, palette);
+                }
+                Err(error) => {
+                    self.banner = Some(format!(
+                        "Не вдалося прочитати системні параметри доступності: {error}"
+                    ))
+                }
+            }
+        }
         match self.client.snapshot() {
             Ok(state) => self.state = state,
             Err(e) => self.banner = Some(e.to_string()),
@@ -287,6 +362,9 @@ impl eframe::App for App {
         {
             self.files_pending = None;
         }
+        if self.file_open && self.file_details.is_none() {
+            self.inspect_file();
+        }
         let newest = self.state.history.first().map(|j| j.id);
         if newest != self.newest {
             let initial = self.newest.is_none();
@@ -309,16 +387,15 @@ impl eframe::App for App {
             && self.state.ready
             && !self.closing
         {
-            self.new_operation = true;
-            self.form_focus = true;
+            self.open_form();
         }
         if let Some(path) =
             ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
         {
             self.source.set(path);
-            self.new_operation = true;
-            self.form_focus = true;
+            self.open_form();
         }
+        self.shortcuts(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
             self.closing = true;
             self.client.shutdown();
@@ -331,12 +408,17 @@ impl eframe::App for App {
         }
     }
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if root.available_width() >= 680.0 {
+            self.jobs_open = false;
+        }
         egui::Panel::top("toolbar").show(root, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(root, |ui| self.footer(ui));
-        egui::Panel::left("jobs")
-            .default_size(216.0)
-            .size_range(180.0..=320.0)
-            .show(root, |ui| self.sidebar(ui));
+        if root.available_width() >= 680.0 {
+            egui::Panel::left("jobs")
+                .default_size(216.0)
+                .size_range(180.0..=320.0)
+                .show(root, |ui| self.sidebar(ui));
+        }
         egui::CentralPanel::default().show(root, |ui| {
             if let Some(job) = self.selected_job() {
                 self.operation(ui, &job);
@@ -350,13 +432,30 @@ impl eframe::App for App {
                         .add_enabled(self.state.ready, egui::Button::new("Нова операція…"))
                         .clicked()
                     {
-                        self.new_operation = true;
-                        self.form_focus = true;
+                        self.open_form();
                     }
                 });
             }
         });
         self.dialogs();
+        if let Some(id) = self.pending_focus {
+            if self
+                .context
+                .read_response(id)
+                .is_some_and(|r| r.enabled() && r.sense.is_focusable())
+            {
+                self.context.memory_mut(|m| m.request_focus(id));
+                self.pending_focus = None;
+            } else {
+                self.focus_attempts += 1;
+                if self.focus_attempts < 4 {
+                    self.context.request_repaint();
+                } else {
+                    self.pending_focus = None;
+                    self.banner = Some("Не вдалося перейти до області. Повторіть F6.".into());
+                }
+            }
+        }
     }
 }
 fn name(path: &Path) -> String {
@@ -411,28 +510,10 @@ fn path_line(ui: &mut egui::Ui, label: &str, path: &Path) {
         });
     });
 }
-fn table_row(
-    ui: &mut egui::Ui,
-    name: &str,
-    state: &str,
-    size: &str,
-    selected: bool,
-) -> egui::Response {
-    let width = ui.available_width();
-    let inner = ui.horizontal(|ui| {
-        let r = ui.add_sized(
-            [(width - 218.0).max(90.0), 28.0],
-            egui::Button::new("")
-                .left_text(name)
-                .selected(selected)
-                .frame(selected)
-                .wrap_mode(egui::TextWrapMode::Truncate),
-        );
-        ui.add_sized([124.0, 28.0], egui::Label::new(state).truncate());
-        ui.add_sized([78.0, 28.0], egui::Label::new(size).truncate());
-        r
-    });
-    inner.inner
+fn column_widths(width: f32) -> [f32; 3] {
+    let status = if width < 430.0 { 100.0 } else { 124.0 };
+    let size = if width < 430.0 { 64.0 } else { 78.0 };
+    [(width - status - size - 16.0).max(60.0), status, size]
 }
 fn entry_status(state: EntryState) -> &'static str {
     match state {

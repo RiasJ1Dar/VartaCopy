@@ -1,0 +1,228 @@
+use super::*;
+use eframe::App as _;
+use egui::accesskit::{Node, NodeId, Role};
+use std::{
+    fs,
+    sync::atomic::AtomicBool,
+    time::{Duration, Instant},
+};
+use vartacopy_core::{
+    journal::Journal,
+    planner::{self, ScanOptions},
+};
+fn fixture() -> (tempfile::TempDir, App) {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let dest = root.path().join("dest");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&dest).unwrap();
+    for n in 0..140 {
+        fs::write(source.join(format!("file-{n:03}")), b"data").unwrap();
+    }
+    let path = root.path().join("jobs.sqlite");
+    let mut journal = Journal::open(&path).unwrap();
+    let plan = planner::scan(
+        &source,
+        &dest,
+        ScanOptions::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let id = journal.enqueue(&plan, Conflict::Error).unwrap();
+    drop(journal);
+    let context = egui::Context::default();
+    let mut app = App::new(&eframe::CreationContext::_new_kittest(context), path).unwrap();
+    app.select(id);
+    update(&mut app, |s| s.ready && s.files.is_some());
+    (root, app)
+}
+fn update(app: &mut App, condition: impl Fn(&State) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = app.client.snapshot().unwrap();
+        if condition(&state) {
+            app.state = state;
+            return;
+        }
+        assert!(Instant::now() < deadline, "UI worker timeout");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+fn render(app: &mut App, size: [f32; 2], key: Option<egui::Key>) -> Vec<(NodeId, Node)> {
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(size[0], size[1]),
+        )),
+        events: key
+            .map(|key| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            })
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let ctx = app.context.clone();
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut output = ctx.run_ui(input, |ui| {
+        app.shortcuts(ui.ctx());
+        app.ui(ui, &mut frame);
+    });
+    let nodes = output
+        .platform_output
+        .accesskit_update
+        .take()
+        .unwrap()
+        .nodes;
+    output.drop_without_applying_deltas();
+    nodes
+}
+#[test]
+fn virtual_grid_has_real_rows_cells_and_one_keyboard_focus_target() {
+    let (_root, mut app) = fixture();
+    render(&mut app, [980.0, 640.0], None);
+    let id = app.files_id();
+    app.context.memory_mut(|m| m.request_focus(id));
+    render(&mut app, [980.0, 640.0], None);
+    let nodes = render(&mut app, [980.0, 640.0], Some(egui::Key::ArrowDown));
+    assert_eq!(app.file_selected, Some(0));
+    let grid = nodes
+        .iter()
+        .find(|(node, _)| *node == id.accesskit_id())
+        .unwrap();
+    assert_eq!(grid.1.role(), Role::Grid);
+    assert_eq!(grid.1.row_count(), Some(141));
+    assert_eq!(grid.1.column_count(), Some(3));
+    assert!(grid.1.active_descendant().is_some());
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|(_, n)| n.role() == Role::ColumnHeader)
+            .count(),
+        3
+    );
+    let rows = nodes.iter().filter(|(_, n)| n.role() == Role::Row).count();
+    assert!((3..30).contains(&rows));
+    assert!(
+        nodes
+            .iter()
+            .filter(|(_, n)| matches!(n.role(), Role::Row | Role::Cell | Role::ListBoxOption))
+            .all(|(_, n)| !n.supports_action(egui::accesskit::Action::Focus))
+    );
+    assert_eq!(
+        nodes.iter().filter(|(_, n)| n.role() == Role::Cell).count(),
+        rows * 3
+    );
+    render(&mut app, [980.0, 640.0], Some(egui::Key::ArrowDown));
+    assert_eq!(app.file_selected, Some(1));
+    render(&mut app, [980.0, 640.0], Some(egui::Key::End));
+    assert_eq!(app.file_selected, Some(140));
+    update(&mut app, |s| {
+        s.files
+            .as_ref()
+            .is_some_and(|p| p.offset > 0 && p.offset + p.entries.len() == 141)
+    });
+    render(&mut app, [980.0, 640.0], None);
+    assert!(app.file_visible.contains(&140));
+    render(&mut app, [980.0, 640.0], Some(egui::Key::Enter));
+    assert!(app.file_open);
+    assert_eq!(app.file_details.as_ref().unwrap().1.ordinal, 140);
+    render(&mut app, [980.0, 640.0], None);
+    let nodes = render(&mut app, [980.0, 640.0], None);
+    let focused = app.context.memory(|m| m.focused()).unwrap().accesskit_id();
+    let focus = &nodes.iter().find(|(id, _)| *id == focused).unwrap().1;
+    assert_eq!(focus.label(), Some("Копіювати повний шлях"));
+    render(&mut app, [980.0, 640.0], Some(egui::Key::Home));
+    assert_eq!(
+        app.file_selected,
+        Some(140),
+        "dialog must isolate table keys"
+    );
+    render(&mut app, [980.0, 640.0], Some(egui::Key::Escape));
+    assert!(!app.file_open);
+    assert_eq!(app.context.memory(|m| m.focused()), Some(id));
+    render(&mut app, [980.0, 640.0], Some(egui::Key::Home));
+    assert_eq!(app.file_selected, Some(0));
+}
+#[test]
+fn absent_targets_stop_focus_retries_and_wide_layout_has_one_job_list() {
+    let (_root, mut app) = fixture();
+    render(&mut app, [980.0, 640.0], None);
+    app.jobs_open = true;
+    let nodes = render(&mut app, [980.0, 640.0], None);
+    assert!(!app.jobs_open);
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|(_, n)| n.role() == Role::ListBox)
+            .count(),
+        1
+    );
+    app.selected = None;
+    app.pane = Pane::Jobs;
+    render(&mut app, [980.0, 640.0], Some(egui::Key::F6));
+    assert_eq!(app.pending_focus, None);
+    assert_eq!(app.context.memory(|m| m.focused()), app.command_focus);
+    app.request_focus(Some(egui::Id::new("nonexistent")));
+    for _ in 0..5 {
+        render(&mut app, [980.0, 640.0], None);
+    }
+    assert!(app.pending_focus.is_none());
+    assert!(app.banner.is_some());
+    app.request_focus(Some(egui::Id::new("nonexistent")));
+    app.open_form();
+    assert!(app.pending_focus.is_none());
+}
+#[test]
+fn f6_cycles_panes_and_form_returns_focus_in_a_narrow_logical_viewport() {
+    let (_root, mut app) = fixture();
+    render(&mut app, [380.0, 240.0], None);
+    let command = app.command_focus.unwrap();
+    app.context.memory_mut(|m| m.request_focus(command));
+    let nodes = render(&mut app, [380.0, 240.0], Some(egui::Key::F6));
+    render(&mut app, [380.0, 240.0], None);
+    render(&mut app, [380.0, 240.0], None);
+    assert!(app.jobs_open);
+    assert!(nodes.iter().any(|(_, n)| n.role() == Role::ListBox));
+    assert_eq!(app.context.memory(|m| m.focused()), Some(app.jobs_id()));
+    render(&mut app, [380.0, 240.0], Some(egui::Key::F6));
+    assert!(!app.jobs_open);
+    assert_eq!(app.context.memory(|m| m.focused()), Some(app.files_id()));
+    render(&mut app, [380.0, 240.0], Some(egui::Key::F6));
+    assert_eq!(app.context.memory(|m| m.focused()), Some(command));
+    app.open_form();
+    let nodes = render(&mut app, [380.0, 240.0], None);
+    let focused = app.context.memory(|m| m.focused()).unwrap().accesskit_id();
+    assert_eq!(
+        nodes
+            .iter()
+            .find(|(id, _)| *id == focused)
+            .unwrap()
+            .1
+            .role(),
+        Role::TextInput
+    );
+    for label in ["Копіювати", "До черги", "Скасувати"] {
+        let node = &nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(label))
+            .unwrap()
+            .1;
+        let bounds = node.bounds().unwrap();
+        assert!(
+            bounds.x0 >= 0.0 && bounds.x1 <= 380.0,
+            "{label}: {bounds:?}"
+        );
+        assert!(
+            bounds.y0 >= 0.0 && bounds.y1 <= 240.0,
+            "{label}: {bounds:?}"
+        );
+    }
+    render(&mut app, [380.0, 240.0], Some(egui::Key::Escape));
+    assert!(!app.new_operation);
+    assert_eq!(app.context.memory(|m| m.focused()), Some(command));
+}

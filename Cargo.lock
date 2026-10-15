@@ -2937,10 +2937,12 @@ name = "vartacopy-desktop"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "raw-window-handle",
  "rfd",
  "serde_json",
  "tempfile",
  "vartacopy-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

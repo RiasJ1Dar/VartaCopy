@@ -1,6 +1,6 @@
 use super::*;
 impl App {
-    fn job_row(&mut self, ui: &mut egui::Ui, job: &Job) {
+    fn job_row(&mut self, ui: &mut egui::Ui, job: &Job, index: usize, list_id: egui::Id) {
         let running = self.state.active.as_ref().is_some_and(|a| a.id == job.id);
         let selected = self.selected == Some(job.id);
         let caption = format!(
@@ -8,43 +8,59 @@ impl App {
             job.id,
             short_status(if running { "running" } else { &job.status })
         );
-        let frame = egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .fill(if selected {
-                ui.visuals().selection.bg_fill
-            } else {
-                egui::Color32::TRANSPARENT
-            })
-            .corner_radius(3)
-            .show(ui, |ui| {
-                ui.set_width((ui.available_width() - 16.0).max(100.0));
-                if selected {
-                    ui.visuals_mut().override_text_color =
-                        Some(ui.visuals().selection.stroke.color);
-                }
-                ui.add(egui::Label::new(name(&job.source)).truncate());
-                ui.label(RichText::new(&caption).small());
-            });
-        let response = frame.response.interact(egui::Sense::click());
-        response.widget_info(|| {
+        let row = ui
+            .scope_builder(
+                egui::UiBuilder::new()
+                    .id(egui::Id::new(("job", job.id)))
+                    .sense(egui::Sense::CLICK),
+                |ui| {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .fill(if selected {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .corner_radius(3)
+                        .show(ui, |ui| {
+                            ui.set_width((ui.available_width() - 16.0).max(100.0));
+                            if selected {
+                                ui.visuals_mut().override_text_color =
+                                    Some(ui.visuals().selection.stroke.color);
+                            }
+                            ui.add(egui::Label::new(name(&job.source)).truncate());
+                            ui.label(RichText::new(&caption).small());
+                        });
+                },
+            )
+            .response;
+        row.widget_info(|| {
             egui::WidgetInfo::labeled(
-                egui::WidgetType::Button,
+                egui::WidgetType::Other,
                 ui.is_enabled(),
                 format!("{} {caption}", name(&job.source)),
             )
         });
-        if response.has_focus() {
-            ui.painter().rect_stroke(
-                response.rect,
-                3,
-                ui.visuals().selection.stroke,
-                egui::StrokeKind::Inside,
-            );
+        ui.ctx().accesskit_node_builder(row.id, |n| {
+            n.set_role(egui::accesskit::Role::ListBoxOption);
+            n.set_selected(selected);
+            n.set_position_in_set(index + 1);
+        });
+        if selected {
+            if self.job_scroll {
+                row.scroll_to_me(Some(egui::Align::Center));
+                self.job_scroll = false;
+            }
+            ui.ctx().accesskit_node_builder(list_id, |n| {
+                n.set_active_descendant(row.id.accesskit_id())
+            });
         }
-        if response.clicked() {
+        if row.clicked() {
             self.select(job.id);
+            self.pane = Pane::Jobs;
+            ui.memory_mut(|m| m.request_focus(list_id));
         }
-        response.on_hover_text(job.source.display().to_string());
+        row.on_hover_text(job.source.display().to_string());
     }
     pub(super) fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -52,39 +68,66 @@ impl App {
             ui.selectable_value(&mut self.history, true, "Історія");
         });
         ui.separator();
-        let jobs = if self.history {
+        let mut jobs = if self.history {
             self.state.history.clone()
         } else {
             self.state.queue.clone()
         };
-        let active = if !self.history {
-            self.state.active.as_ref().map(|a| a.job.clone())
-        } else {
-            None
-        };
+        if !self.history
+            && let Some(active) = self.state.active.as_ref()
+        {
+            jobs.insert(0, active.job.clone());
+        }
+        let id = self.jobs_id();
+        if ui.memory(|m| m.has_focus(id)) && self.main_keys() {
+            self.pane = Pane::Jobs;
+            lock_arrows(ui.ctx(), id);
+            let selected = jobs.iter().position(|j| Some(j.id) == self.selected);
+            if let Some(index) = navigate(ui, selected, jobs.len(), 8) {
+                self.select(jobs[index].id);
+                self.job_scroll = true;
+            }
+        }
         let bottom = if self.history { 36.0 } else { 0.0 };
-        egui::ScrollArea::vertical()
-            .id_salt("queue")
-            .max_height((ui.available_height() - bottom).max(80.0))
-            .show(ui, |ui| {
-                if let Some(job) = active.as_ref() {
-                    self.job_row(ui, job);
-                    ui.separator();
-                }
-                for job in &jobs {
-                    self.job_row(ui, job);
-                }
-                if jobs.is_empty() && active.is_none() {
-                    ui.label(
-                        RichText::new(if self.history {
-                            "Історія порожня"
-                        } else {
-                            "Черга порожня"
-                        })
-                        .weak(),
-                    );
-                }
+        let label = if self.history {
+            "Історія операцій"
+        } else {
+            "Черга операцій"
+        };
+        let list = ui.scope_builder(
+            egui::UiBuilder::new()
+                .id(id)
+                .sense(egui::Sense::focusable_noninteractive()),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("queue")
+                    .max_height((ui.available_height() - bottom).max(36.0))
+                    .show(ui, |ui| {
+                        for (index, job) in jobs.iter().enumerate() {
+                            self.job_row(ui, job, index, id);
+                        }
+                        if jobs.is_empty() {
+                            ui.label(if self.history {
+                                "Історія порожня"
+                            } else {
+                                "Черга порожня"
+                            });
+                        }
+                    });
+            },
+        );
+        composite(
+            &list.response,
+            egui::accesskit::Role::ListBox,
+            label,
+            jobs.len(),
+        );
+        // composite clears active descendant so it cannot point at a removed job.
+        if let Some(index) = jobs.iter().position(|j| Some(j.id) == self.selected) {
+            ui.ctx().accesskit_node_builder(id, |n| {
+                n.set_active_descendant(egui::Id::new(("job", jobs[index].id)).accesskit_id())
             });
+        }
         if self.history {
             ui.horizontal(|ui| {
                 if ui
@@ -104,16 +147,18 @@ impl App {
     }
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui
+            let new = ui
                 .add_enabled(
                     self.state.ready && !self.closing,
                     egui::Button::new("Нова операція…"),
                 )
-                .on_hover_text("Ctrl+N")
-                .clicked()
-            {
-                self.new_operation = true;
-                self.form_focus = true;
+                .on_hover_text("Ctrl+N");
+            self.command_focus = Some(new.id);
+            if new.has_focus() {
+                self.pane = Pane::Commands;
+            }
+            if new.clicked() {
+                self.open_form();
             }
             let can_run = self.state.ready
                 && !self.closing
@@ -134,6 +179,13 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button("Меню", |ui| {
+                    if ui.button("Черга та історія…").clicked() {
+                        self.jobs_open = ui.ctx().content_rect().width() < 680.0;
+                        self.job_scroll = true;
+                        self.request_focus(Some(self.jobs_id()));
+                        ui.close();
+                    }
+
                     if ui.button("Вигляд і правила…").clicked() {
                         self.settings_open = true;
                         ui.close();
@@ -154,12 +206,14 @@ impl App {
             )
             .truncate(),
         );
-        path_line(ui, "З:", &job.source);
-        path_line(
-            ui,
-            "До:",
-            job.output_root.as_ref().unwrap_or(&job.destination),
-        );
+        if ui.available_height() >= 330.0 {
+            path_line(ui, "З:", &job.source);
+            path_line(
+                ui,
+                "До:",
+                job.output_root.as_ref().unwrap_or(&job.destination),
+            );
+        }
         if let Some(a) = active.as_ref() {
             if !a.request.is_empty() {
                 ui.label("Зупиняю поточний крок I/O, зберігаю прогрес…");
@@ -316,91 +370,204 @@ impl App {
             ui.label("Завантажую список файлів…");
             return;
         };
-        ui.separator();
-        ui.horizontal(|ui| {
-            let width = ui.available_width();
-            ui.add_sized(
-                [(width - 218.0).max(90.0), 28.0],
-                egui::Label::new(RichText::new("Назва").strong()),
-            );
-            ui.add_sized(
-                [124.0, 28.0],
-                egui::Label::new(RichText::new("Стан").strong()),
-            );
-            ui.add_sized(
-                [78.0, 28.0],
-                egui::Label::new(RichText::new("Розмір").strong()),
-            );
-        });
-        ui.separator();
+        let id = self.files_id();
+        if ui.memory(|m| m.has_focus(id)) && self.main_keys() {
+            self.pane = Pane::Files;
+            lock_arrows(ui.ctx(), id);
+            if let Some(target) = navigate(
+                ui,
+                self.file_selected,
+                page.total,
+                self.file_visible.len().saturating_sub(1),
+            ) {
+                self.file_selected = Some(target);
+                if !self.file_visible.contains(&target) {
+                    self.file_scroll = Some(target.saturating_sub(self.file_visible.len() / 2));
+                }
+                if target < page.offset || target >= page.offset + page.entries.len() {
+                    self.load_files(job.id, target.saturating_sub(16));
+                }
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                self.inspect_file();
+            }
+        }
         let mut needed = None;
-        let spacing = ui.spacing().item_spacing.y;
-        ui.spacing_mut().item_spacing.y = 0.0;
-        egui::ScrollArea::vertical()
-            .id_salt(("files", job.id))
-            .auto_shrink([false, false])
-            .show_rows(ui, 28.0, page.total, |ui, range| {
-                if (range.start < page.offset || range.end > page.offset + page.entries.len())
-                    && self.files_pending.is_none()
-                {
-                    needed = Some(range.start.saturating_sub(16));
-                }
-                for ordinal in range {
-                    let entry = ordinal
-                        .checked_sub(page.offset)
-                        .and_then(|n| page.entries.get(n));
-                    let Some(e) = entry else {
-                        ui.add_sized(
-                            [ui.available_width(), 28.0],
-                            egui::Label::new("Завантаження…"),
-                        );
-                        continue;
-                    };
-                    let filename = if e.relative.as_os_str().is_empty() {
-                        name(&job.source)
-                    } else {
-                        e.relative.display().to_string()
-                    };
-                    let current = self
-                        .state
-                        .active
-                        .as_ref()
-                        .filter(|a| a.id == job.id)
-                        .and_then(|a| a.progress.as_ref())
-                        .filter(|p| p.entry == ordinal);
-                    let state = if e.error.is_some() {
-                        "Помилка"
-                    } else if let Some(p) = current {
-                        phase(p.phase)
-                    } else {
-                        entry_status(e.state)
-                    };
-                    let size = match e.kind {
-                        EntryKind::Directory => "Каталог".into(),
-                        _ => e.bytes.map(bytes).unwrap_or_else(|| "—".into()),
-                    };
-                    let selected = self.file_selected == Some(ordinal);
-                    let response = table_row(ui, &filename, state, &size, selected);
-                    if response.clicked() {
-                        self.file_selected = Some(ordinal);
-                    }
-                    if response.double_clicked()
-                        || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+        let mut active_row = None;
+        let grid = ui.scope_builder(
+            egui::UiBuilder::new()
+                .id(id)
+                .sense(egui::Sense::focusable_noninteractive()),
+            |ui| {
+                ui.separator();
+                let widths = column_widths(ui.available_width());
+                ui.horizontal(|ui| {
+                    for (column, (label, width)) in ["Назва", "Стан", "Розмір"]
+                        .into_iter()
+                        .zip(widths)
+                        .enumerate()
                     {
-                        self.file_selected = Some(ordinal);
-                        self.file_open = true;
+                        let r = ui.add_sized(
+                            [width, 24.0],
+                            egui::Label::new(RichText::new(label).strong())
+                                .halign(if column == 2 {
+                                    egui::Align::Max
+                                } else {
+                                    egui::Align::Min
+                                })
+                                .truncate(),
+                        );
+                        ui.ctx().accesskit_node_builder(r.id, |n| {
+                            n.set_role(egui::accesskit::Role::ColumnHeader);
+                            n.set_label(label);
+                            n.set_column_index(column);
+                        });
                     }
-                    response.context_menu(|ui| {
-                        if ui.button("Подробиці файла…").clicked() {
-                            self.file_selected = Some(ordinal);
-                            self.file_open = true;
-                            ui.close();
-                        }
-                    });
-                    response.on_hover_text(e.error.as_deref().unwrap_or(&filename));
+                });
+                ui.separator();
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let mut scroll = egui::ScrollArea::vertical()
+                    .id_salt(("files", job.id))
+                    .auto_shrink([false, false]);
+                if let Some(target) = self.file_scroll.take() {
+                    scroll = scroll.vertical_scroll_offset(target as f32 * 28.0);
                 }
-            });
-        ui.spacing_mut().item_spacing.y = spacing;
+                scroll.show_rows(ui, 28.0, page.total, |ui, range| {
+                    self.file_visible = range.clone();
+                    if (range.start < page.offset || range.end > page.offset + page.entries.len())
+                        && self.files_pending.is_none()
+                    {
+                        needed = Some(range.start.saturating_sub(16));
+                    }
+                    for ordinal in range {
+                        let Some(e) = ordinal
+                            .checked_sub(page.offset)
+                            .and_then(|n| page.entries.get(n))
+                        else {
+                            ui.add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::Label::new("Завантаження…"),
+                            );
+                            continue;
+                        };
+                        let filename = if e.relative.as_os_str().is_empty() {
+                            name(&job.source)
+                        } else {
+                            e.relative.display().to_string()
+                        };
+                        let current = self
+                            .state
+                            .active
+                            .as_ref()
+                            .filter(|a| a.id == job.id)
+                            .and_then(|a| a.progress.as_ref())
+                            .filter(|p| p.entry == ordinal);
+                        let state = if e.error.is_some() {
+                            "Помилка"
+                        } else if let Some(p) = current {
+                            phase(p.phase)
+                        } else {
+                            entry_status(e.state)
+                        };
+                        let size = match e.kind {
+                            EntryKind::Directory => "Каталог".into(),
+                            _ => e.bytes.map(bytes).unwrap_or_else(|| "—".into()),
+                        };
+                        let selected = self.file_selected == Some(ordinal);
+                        let row_id = egui::Id::new(("file_row", job.id, ordinal));
+                        let row = ui
+                            .scope_builder(
+                                egui::UiBuilder::new().id(row_id).sense(egui::Sense::CLICK),
+                                |ui| {
+                                    if selected {
+                                        ui.visuals_mut().override_text_color =
+                                            Some(ui.visuals().selection.stroke.color);
+                                    }
+                                    let rect = egui::Rect::from_min_size(
+                                        ui.cursor().min,
+                                        egui::vec2(ui.available_width(), 28.0),
+                                    );
+                                    if selected {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            0,
+                                            ui.visuals().selection.bg_fill,
+                                        );
+                                    }
+                                    ui.horizontal(|ui| {
+                                        for (column, (text, width)) in
+                                            [filename.as_str(), state, size.as_str()]
+                                                .into_iter()
+                                                .zip(column_widths(ui.available_width()))
+                                                .enumerate()
+                                        {
+                                            let r = ui.add_sized(
+                                                [width, 28.0],
+                                                egui::Label::new(text)
+                                                    .halign(if column == 2 {
+                                                        egui::Align::Max
+                                                    } else {
+                                                        egui::Align::Min
+                                                    })
+                                                    .truncate(),
+                                            );
+                                            ui.ctx().accesskit_node_builder(r.id, |n| {
+                                                n.set_role(egui::accesskit::Role::Cell);
+                                                n.set_label(text);
+                                                n.set_row_index(ordinal);
+                                                n.set_column_index(column);
+                                            });
+                                        }
+                                    });
+                                },
+                            )
+                            .response;
+                        row.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Other,
+                                true,
+                                format!("{filename}, {state}, {size}"),
+                            )
+                        });
+                        ui.ctx().accesskit_node_builder(row.id, |n| {
+                            n.set_role(egui::accesskit::Role::Row);
+                            n.set_row_index(ordinal);
+                            n.set_selected(selected);
+                        });
+                        if selected {
+                            active_row = Some(row.id);
+                        }
+                        if row.clicked() {
+                            self.file_selected = Some(ordinal);
+                            self.pane = Pane::Files;
+                            ui.memory_mut(|m| m.request_focus(id));
+                        }
+                        if row.double_clicked() {
+                            self.file_selected = Some(ordinal);
+                            self.inspect_file();
+                        }
+                        row.context_menu(|ui| {
+                            if ui.button("Подробиці файла…").clicked() {
+                                self.file_selected = Some(ordinal);
+                                self.inspect_file();
+                                ui.close();
+                            }
+                        });
+                        row.on_hover_text(e.error.as_deref().unwrap_or(&filename));
+                    }
+                });
+            },
+        );
+        composite(
+            &grid.response,
+            egui::accesskit::Role::Grid,
+            &format!("Файли операції #{}", job.id),
+            page.total,
+        );
+        if let Some(row) = active_row {
+            ui.ctx()
+                .accesskit_node_builder(id, |n| n.set_active_descendant(row.accesskit_id()));
+        }
         if let Some(offset) = needed {
             self.load_files(job.id, offset);
         }

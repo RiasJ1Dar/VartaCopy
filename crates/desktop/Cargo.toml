@@ -15,6 +15,8 @@ vartacopy-core = { path = "../core" }
 eframe = { version = "=0.36.2", default-features = false, features = ["glow", "accesskit", "default_fonts"] }
 rfd = { version = "=0.17.2", default-features = false }
 serde_json.workspace = true
+raw-window-handle = "0.6"
+windows-sys = { workspace = true, features = ["Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi"] }
 
 [features]
 test-harness = ["eframe/__screenshot"]

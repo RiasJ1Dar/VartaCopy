@@ -5,7 +5,11 @@ impl App {
             return;
         }
         let ctx = self.context.clone();
-        let response = egui::Modal::new(egui::Id::new("new_operation")).show(&ctx, |ui| {
+        let mut modal = egui::Modal::new(egui::Id::new("new_operation"));
+        if self.contrast.is_some() {
+            modal = modal.backdrop_color(egui::Color32::TRANSPARENT);
+        }
+        let response = modal.show(&ctx, |ui| {
             ui.set_width((ctx.content_rect().width() - 64.0).clamp(280.0, 560.0));
             ui.label(RichText::new("Нова операція").size(20.0).strong());
             ui.add_space(6.0);
@@ -87,26 +91,40 @@ impl App {
                     self.submit(false);
                 }
                 if ui.button("Скасувати").clicked() {
-                    self.new_operation = false;
+                    self.close_form();
                 }
             });
         });
         if response.should_close() && self.picker.is_none() {
-            self.new_operation = false;
+            self.close_form();
         }
     }
     pub(super) fn dialogs(&mut self) {
         self.form();
         let ctx = self.context.clone();
+        if self.jobs_open {
+            let mut open = true;
+            egui::Window::new("Черга та історія")
+                .open(&mut open)
+                .default_width(280.0)
+                .max_height((ctx.content_rect().height() - 48.0).max(100.0))
+                .show(&ctx, |ui| self.sidebar(ui));
+            self.jobs_open = open;
+            if !open {
+                self.pending_focus = None;
+                self.restore_focus();
+            }
+        }
         if self.details_open {
             let mut open = true;
             egui::Window::new("Подробиці операції")
                 .open(&mut open)
                 .default_width(580.0)
+                .max_width((ctx.content_rect().width() - 32.0).max(240.0))
                 .resizable(true)
                 .show(&ctx, |ui| {
                     egui::ScrollArea::vertical()
-                        .max_height(400.0)
+                        .max_height((ctx.content_rect().height() - 110.0).clamp(80.0, 400.0))
                         .show(ui, |ui| {
                             if let Some(job) = self.selected_job() {
                                 ui.label(format!("Операція #{} · {}", job.id, status(&job.status)));
@@ -191,15 +209,9 @@ impl App {
             egui::Window::new("Подробиці файла")
                 .open(&mut open)
                 .default_width(560.0)
+                .max_width((ctx.content_rect().width() - 32.0).max(240.0))
                 .show(&ctx, |ui| {
-                    if let Some((job, e)) = self.selected_job().and_then(|j| {
-                        self.state.files.as_ref().and_then(|p| {
-                            p.entries
-                                .iter()
-                                .find(|e| Some(e.ordinal) == self.file_selected)
-                                .map(|e| (j, e))
-                        })
-                    }) {
+                    if let Some((job, e)) = self.file_details.as_ref() {
                         let source = if e.relative.as_os_str().is_empty() {
                             job.source.clone()
                         } else {
@@ -207,7 +219,8 @@ impl App {
                         };
                         ui.label(entry_status(e.state));
                         ui.label(source.display().to_string());
-                        if ui.button("Копіювати повний шлях").clicked() {
+                        let copy = ui.button("Копіювати повний шлях");
+                        if copy.clicked() {
                             ui.ctx().copy_text(source.to_string_lossy().into_owned());
                         }
                         if let Some(error) = &e.error {
@@ -216,10 +229,17 @@ impl App {
                         if let Some(size) = e.bytes {
                             ui.label(format!("Розмір усіх потоків: {}", bytes(size)));
                         }
+                        if self.file_focus {
+                            self.request_focus(Some(copy.id));
+                            self.file_focus = false;
+                        }
                     } else {
-                        ui.label("Поверніться до рядка файла, щоб завантажити подробиці.");
+                        ui.label("Завантажую подробиці файла…");
                     }
                 });
+            if !open {
+                self.restore_focus();
+            }
             self.file_open = open;
         }
         if self.messages_open {
@@ -227,9 +247,10 @@ impl App {
             egui::Window::new("Повідомлення")
                 .open(&mut open)
                 .default_width(580.0)
+                .max_width((ctx.content_rect().width() - 32.0).max(240.0))
                 .show(&ctx, |ui| {
                     egui::ScrollArea::vertical()
-                        .max_height(360.0)
+                        .max_height((ctx.content_rect().height() - 110.0).clamp(80.0, 360.0))
                         .show(ui, |ui| {
                             if let Some(e) = &self.banner {
                                 ui.colored_label(ui.visuals().error_fg_color, e);
@@ -251,20 +272,64 @@ impl App {
         }
         if self.settings_open {
             let mut open = true;
-            egui::Window::new("Вигляд і правила").open(&mut open).default_width(560.0).show(&ctx,|ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Тема:");
-                    for (value,label) in [(egui::ThemePreference::System,"Системна"),(egui::ThemePreference::Light,"Світла"),(egui::ThemePreference::Dark,"Темна")] {
-                        if ui.selectable_value(&mut self.theme,value,label).changed() {ctx.set_theme(self.theme);}
-                    }
-                });
-                ui.label("Масштаб інтерфейсу: Ctrl+плюс / Ctrl+мінус; Ctrl+0 — скинути.");
-                ui.separator();
-                ui.label(format!("Журнал: {}",self.journal.display()));
-                ui.label("Після збою виберіть операцію в історії та натисніть «Відновити». Записані блоки перевіряються повторно.");
-                ui.label("Зайняті каталоги не об’єднуються. Пропущені елементи дають частковий результат. ACL і власник успадковуються від призначення.");
-            });
+            egui::Window::new("Вигляд і правила")
+                .open(&mut open)
+                .default_width(560.0)
+                .max_width((ctx.content_rect().width() - 32.0).max(240.0))
+                .show(&ctx, |ui| self.settings_contents(ui));
             self.settings_open = open;
         }
+    }
+    fn settings_contents(&mut self, ui: &mut egui::Ui) {
+        let ctx = self.context.clone();
+        egui::ScrollArea::vertical()
+            .max_height((ctx.content_rect().height() - 110.0).clamp(80.0, 400.0))
+            .show(ui, |ui| {
+                if self.contrast.is_some() {
+                    ui.label("Застосовано контрастну тему Windows.");
+                }
+                ui.add_enabled_ui(self.contrast.is_none(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Тема:");
+                        for (value, label) in [
+                            (egui::ThemePreference::System, "Системна"),
+                            (egui::ThemePreference::Light, "Світла"),
+                            (egui::ThemePreference::Dark, "Темна"),
+                        ] {
+                            if ui.selectable_value(&mut self.theme, value, label).changed() {
+                                ctx.set_theme(self.theme);
+                            }
+                        }
+                    });
+                });
+                let mut zoom = ctx.zoom_factor();
+                egui::ComboBox::from_label("Масштаб")
+                    .selected_text(format!("{:.0}%", zoom * 100.0))
+                    .show_ui(ui, |ui| {
+                        for value in [1.0, 1.25, 1.5, 2.0] {
+                            let label = format!("{:.0}%", value * 100.0);
+                            if ui.selectable_value(&mut zoom, value, label).changed() {
+                                ctx.set_zoom_factor(value);
+                            }
+                        }
+                    });
+                ui.label("Масштаб інтерфейсу: Ctrl+плюс / Ctrl+мінус; Ctrl+0 — скинути.");
+                ui.label(concat!(
+                    "F6 / Shift+F6 — між командами, чергою й файлами. ",
+                    "У списках: стрілки, Home/End, Page Up/Down. ",
+                    "Enter — подробиці файла, Esc — закрити.",
+                ));
+                ui.separator();
+                ui.label(format!("Журнал: {}", self.journal.display()));
+                ui.label(concat!(
+                    "Після збою виберіть операцію в історії та натисніть «Відновити». ",
+                    "Записані блоки перевіряються повторно.",
+                ));
+                ui.label(concat!(
+                    "Зайняті каталоги не об’єднуються. ",
+                    "Пропущені елементи дають частковий результат. ",
+                    "ACL і власник успадковуються від призначення.",
+                ));
+            });
     }
 }
