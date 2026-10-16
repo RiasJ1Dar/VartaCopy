@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/RiasJ1Dar/VartaCopy/specs/behavior-v1.schema.json",
+  "title": "Reviewed behavioral handoff for independent implementation",
+  "description": "Only externally observable behavior and independently chosen requirements. No vendor source, binary, resources, screenshots or raw evidence paths. A schema is not proof of participant independence or legal status.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "reference", "environment", "cases", "manifest_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "binary_sha256"],
+      "properties": {
+        "name": {"$ref": "#/$defs/text"},
+        "version": {"$ref": "#/$defs/text"},
+        "binary_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os_build", "filesystem", "edition", "settings"],
+      "properties": {
+        "os_build": {"$ref": "#/$defs/text"},
+        "filesystem": {"$ref": "#/$defs/text"},
+        "edition": {"$ref": "#/$defs/text"},
+        "settings": {"$ref": "#/$defs/lines"}
+      }
+    },
+    "cases": {
+      "type": "array", "minItems": 1, "maxItems": 64,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "title", "area", "fixture", "actions", "observed", "requirements", "provenance"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^CR-[A-Z]+-[0-9]{3}$"},
+          "title": {"$ref": "#/$defs/text"},
+          "area": {"$ref": "#/$defs/text"},
+          "fixture": {"$ref": "#/$defs/lines"},
+          "actions": {"$ref": "#/$defs/lines"},
+          "observed": {
+            "description": "Behavior actually observed in the named reference build, including limitations.",
+            "$ref": "#/$defs/lines"
+          },
+          "requirements": {
+            "description": "Chosen VartaCopy behavior; deliberate improvements must be explicit and need not duplicate reference defects.",
+            "$ref": "#/$defs/lines"
+          },
+          "provenance": {
+            "type": "object", "additionalProperties": false,
+            "required": ["evidence_sha256"],
+            "properties": {
+              "evidence_sha256": {
+                "type": "array", "minItems": 1, "maxItems": 16,
+                "items": {"$ref": "#/$defs/digest"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "manifest_sha256": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "text": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "lines": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/text"}},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

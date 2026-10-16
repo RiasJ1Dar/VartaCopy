@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "reference": {
+    "name": "TeraCopy",
+    "version": "4.0.5 (uninstall record)",
+    "binary_sha256": "1f0cca0be4e6a22e856c3b0de6655a1af8059a06cc66133398307de335098c6f"
+  },
+  "environment": {
+    "os_build": "Windows 11 Pro build 26300",
+    "filesystem": "Local NTFS; source and destination on the same volume",
+    "edition": "TeraCopy Pro/Business entitlement not verified",
+    "settings": [
+      "Existing user installation; settings not reset.",
+      "Handler confirmation was enabled as observed; factory defaults not established.",
+      "Ukrainian UI, dark theme as observed.",
+      "Observation scope: one selected source folder; no other volume, UNC/SMB, mixed selection, drag modifiers or fresh-install defaults were tested.",
+      "Observer previously had access to VartaCopy source code; strict retrospective clean-room independence is not established.",
+      "Boundary review checks the recorded prose and provenance declarations; the reviewer did not repeat the GUI experiment or authenticate participant identities."
+    ]
+  },
+  "cases": [
+    {
+      "id": "CR-SHELL-001",
+      "title": "Вибір обробника після перетягування",
+      "area": "Explorer integration",
+      "fixture": [
+        "A source folder and an empty destination on the same local NTFS volume.",
+        "Source contains two ordinary files, one named NTFS stream on a file and one empty child folder."
+      ],
+      "actions": [
+        "Перетягнути джерельну папку лівою кнопкою на папку призначення на тому самому томі."
+      ],
+      "observed": [
+        "До перенесення показано вибір системного обробника або TeraCopy; намір операції — переміщення."
+      ],
+      "requirements": [
+        "Перед виконанням показувати джерела, призначення та вид операції.",
+        "Користувач може обрати системний обробник або VartaCopy. Поки move не реалізовано, не підміняти його копіюванням без явного вибору користувача."
+      ],
+      "provenance": {
+        "evidence_sha256": [
+          "f4811012ba9999434d184060ea3389c33a71a9de40ed255019828fa739f8bded",
+          "c5ff1ead5ca6c88a2d99183643f0eb7ad7d0b358641ebd3a65603f807fcaa445"
+        ]
+      }
+    },
+    {
+      "id": "CR-SHELL-002",
+      "title": "Скасування до вибору обробника",
+      "area": "Explorer integration",
+      "fixture": [
+        "A source folder and an empty destination on the same local NTFS volume.",
+        "Source contains two ordinary files, one named NTFS stream on a file and one empty child folder."
+      ],
+      "actions": [
+        "Викликати вибір обробника перетягуванням.",
+        "Закрити діалог до вибору обробника."
+      ],
+      "observed": [
+        "Одразу після закриття діалогу джерельна папка існувала, а папка призначення містила нуль елементів. Незмінність усіх байтів джерела цим кроком не перевірялася."
+      ],
+      "requirements": [
+        "Власна вимога VartaCopy: скасування до підтвердження не змінює джерело та призначення."
+      ],
+      "provenance": {
+        "evidence_sha256": [
+          "f4811012ba9999434d184060ea3389c33a71a9de40ed255019828fa739f8bded",
+          "c5ff1ead5ca6c88a2d99183643f0eb7ad7d0b358641ebd3a65603f807fcaa445"
+        ]
+      }
+    },
+    {
+      "id": "CR-SHELL-003",
+      "title": "Копіювання через буфер Провідника",
+      "area": "Explorer integration",
+      "fixture": [
+        "A source folder and an empty destination on the same local NTFS volume.",
+        "Source contains two ordinary files, one named NTFS stream on a file and one empty child folder.",
+        "The copy destination was empty; no collision was tested."
+      ],
+      "actions": [
+        "Вибрати джерельну папку, Ctrl+C.",
+        "Відкрити папку призначення, Ctrl+V.",
+        "Обрати звичайний обробник TeraCopy."
+      ],
+      "observed": [
+        "З’явився вибір обробника копіювання.",
+        "Після вибору TeraCopy дерево скопійовано, джерело залишилося.",
+        "У записі зовнішньої перевірки результату SHA-256 джерела і призначення збігаються для двох звичайних файлів та одного ADS; порожня папка збережена."
+      ],
+      "requirements": [
+        "Узгоджувати намір copy зі стандартною командою Провідника.",
+        "Після явного вибору VartaCopy копіювати дерево зі збереженням підтриманих потоків і порожніх папок.",
+        "Вимога VartaCopy понад цей дослід: показувати завершення лише після власної readback перевірки; спосіб внутрішньої перевірки TeraCopy цим дослідом не встановлено."
+      ],
+      "provenance": {
+        "evidence_sha256": [
+          "f4811012ba9999434d184060ea3389c33a71a9de40ed255019828fa739f8bded",
+          "c5ff1ead5ca6c88a2d99183643f0eb7ad7d0b358641ebd3a65603f807fcaa445"
+        ]
+      }
+    },
+    {
+      "id": "CR-SHELL-004",
+      "title": "Додавання джерела із сучасного меню",
+      "area": "Explorer integration",
+      "fixture": [
+        "A source folder and an empty destination on the same local NTFS volume.",
+        "Source contains two ordinary files, one named NTFS stream on a file and one empty child folder.",
+        "Only one folder was selected in the modern Windows 11 menu; mixed multi-selection and the classic menu were not tested."
+      ],
+      "actions": [
+        "Відкрити сучасне контекстне меню Windows 11 на одній папці.",
+        "Обрати команду TeraCopy."
+      ],
+      "observed": [
+        "У наявному вікні з’явилося нове завдання з джерелом і без призначення; завершене завдання залишилося в історії.",
+        "У цьому кроці передавання файлів не запитувалось."
+      ],
+      "requirements": [
+        "Показувати команду VartaCopy у сучасному меню для підтриманого вибору.",
+        "Додати джерело до чернетки наявного GUI, зберігши історію.",
+        "Копіювання починається лише після вибору призначення та явного запуску."
+      ],
+      "provenance": {
+        "evidence_sha256": [
+          "f4811012ba9999434d184060ea3389c33a71a9de40ed255019828fa739f8bded",
+          "c5ff1ead5ca6c88a2d99183643f0eb7ad7d0b358641ebd3a65603f807fcaa445"
+        ]
+      }
+    }
+  ],
+  "manifest_sha256": "2d206c20d40770afd7d828ab97636c069971b78490a4d3c2305f0feb0e26b2e3"
+}
