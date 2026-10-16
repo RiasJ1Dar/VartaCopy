@@ -2948,6 +2948,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vartacopy-explorer-command"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "windows",
+]
+
+[[package]]
 name = "vartacopy-platform-windows"
 version = "0.1.0-alpha.1"
 dependencies = [

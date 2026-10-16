@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "behavior_contract": "explorer-v2.json",
+  "behavior_sha256": "1c76768f206e22527cdf98922f4bf52c4f1855fe116f190cb2cb00c18ece6a6e",
+  "package_name": "VartaCopy.Explorer",
+  "publisher": "CN=VartaCopy Development",
+  "publisher_display_name": "VartaCopy",
+  "application_id": "VartaCopy",
+  "package_version": "0.1.0.0",
+  "architecture": "x64",
+  "minimum_windows_version": "10.0.22000.0",
+  "command_clsid": "c282efce-1e66-41b6-a895-b43bcb86c1fb",
+  "command_verb": "VartaCopyAddSource",
+  "command_title": "Додати до VartaCopy…",
+  "item_type": "Directory",
+  "dll_filename": "vartacopy_explorer.dll",
+  "gui_filename": "vartacopy-gui.exe",
+  "scope": "One ordinary local filesystem folder; source-only GUI draft; explicit copy start.",
+  "signing": "Development identity only. Production signing and publisher migration remain separate decisions. Do not automatically import certificates or modify machine trust."
+}
