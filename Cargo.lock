@@ -2970,6 +2970,7 @@ name = "vartacopy-shell-windows"
 version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
+ "serde",
  "serde_json",
  "tempfile",
  "windows-sys 0.61.2",
