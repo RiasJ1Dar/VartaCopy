@@ -14,13 +14,13 @@ impl App {
                 "expected 1..512 absolute source paths",
             ));
         }
-        let mut sources = if self.new_operation && !self.source.text.is_empty() {
-            std::iter::once(self.source.path())
-                .chain(self.additional_sources.iter().cloned())
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let mut sources = Vec::new();
+        if self.new_operation {
+            if !self.source.text.is_empty() {
+                sources.push(self.source.path());
+            }
+            sources.extend(self.additional_sources.iter().cloned());
+        }
         for path in paths {
             if !sources.contains(&path) {
                 sources.push(path);
@@ -28,6 +28,11 @@ impl App {
         }
         if sources.len() > 512 {
             return Err(std::io::Error::other("draft already contains 512 sources"));
+        }
+        // A closed form ends its draft session. Never reuse its old destination for
+        // a new shell/drop request; an open manual draft keeps the user's choice.
+        if !self.new_operation {
+            self.destination = PathInput::default();
         }
         self.source.set(sources.remove(0));
         self.additional_sources = sources;

@@ -240,3 +240,141 @@ fn f6_cycles_panes_and_form_returns_focus_in_a_narrow_logical_viewport() {
     assert!(!app.new_operation);
     assert_eq!(app.context.memory(|m| m.focused()), Some(command));
 }
+
+fn receive_shell(app: &mut App, paths: Vec<PathBuf>) {
+    let (tx, rx) = mpsc::channel();
+    app.shell = Some(rx);
+    tx.send(paths).unwrap();
+    let ctx = app.context.clone();
+    let mut frame = eframe::Frame::_new_kittest();
+    let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.logic(ui.ctx(), &mut frame);
+    });
+    output.drop_without_applying_deltas();
+}
+
+#[test]
+fn shell_draft_after_completion_or_cancel_has_no_stale_destination_or_transfer() {
+    let (root, mut app) = fixture();
+    assert!(app.command(Command::RunQueue(true)));
+    update(&mut app, |s| {
+        s.active.is_none()
+            && s.queue.is_empty()
+            && s.history.iter().any(|j| j.status == "completed")
+    });
+    let completed = app
+        .state
+        .history
+        .iter()
+        .find(|j| j.status == "completed")
+        .unwrap()
+        .clone();
+    let old_destination = root.path().join("dest");
+    let incoming = root.path().join("new source");
+    fs::create_dir(&incoming).unwrap();
+    fs::write(incoming.join("file"), b"unchanged source").unwrap();
+    app.source.set(root.path().join("source"));
+    app.additional_sources.push(root.path().join("stale extra"));
+    app.destination.set(old_destination.clone());
+    let history_before = app.state.history.len();
+
+    receive_shell(&mut app, vec![incoming.clone()]);
+    assert!(app.new_operation);
+    assert_eq!(app.source.path(), incoming);
+    assert!(app.additional_sources.is_empty());
+    assert!(app.destination.text.is_empty());
+    assert!(app.destination.native.is_none());
+    let nodes = render(&mut app, [980.0, 640.0], None);
+    for label in ["Копіювати", "До черги"] {
+        let node = &nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(label))
+            .unwrap()
+            .1;
+        assert!(node.is_disabled(), "{label} needs a destination");
+    }
+    app.destination.set(old_destination.clone());
+    render(&mut app, [980.0, 640.0], Some(egui::Key::Escape));
+    assert!(!app.new_operation);
+    receive_shell(&mut app, vec![root.path().join("source")]);
+    assert!(app.destination.text.is_empty());
+    assert!(app.destination.native.is_none());
+    assert!(app.additional_sources.is_empty());
+    assert_eq!(app.source.path(), root.path().join("source"));
+    let state = app.client.snapshot().unwrap();
+    assert!(state.active.is_none());
+    assert!(!state.planning);
+    assert!(state.queue.is_empty());
+    assert_eq!(state.history.len(), history_before);
+    assert!(
+        state
+            .history
+            .iter()
+            .any(|j| j.id == completed.id && j.status == "completed")
+    );
+    assert_eq!(
+        fs::read(incoming.join("file")).unwrap(),
+        b"unchanged source"
+    );
+    assert!(!old_destination.join("new source").exists());
+    assert_eq!(
+        fs::read(completed.output_root.as_ref().unwrap().join("file-000")).unwrap(),
+        b"data"
+    );
+}
+
+#[test]
+fn shell_deliveries_preserve_open_manual_draft_and_accumulate_sources() {
+    let (root, mut app) = fixture();
+    let manual = root.path().join("manual");
+    let destination = root.path().join("chosen destination");
+    let first = root.path().join("first shell source");
+    let second = root.path().join("second shell source");
+    app.open_form();
+    app.source.set(manual.clone());
+    app.destination.set(destination.clone());
+    app.conflict = 2;
+    app.skip_links = true;
+    receive_shell(&mut app, vec![first.clone()]);
+    receive_shell(&mut app, vec![first.clone(), second.clone()]);
+    assert_eq!(app.source.path(), manual);
+    assert_eq!(app.additional_sources, vec![first.clone(), second.clone()]);
+    assert_eq!(app.destination.path(), destination);
+    assert_eq!(app.conflict, 2);
+    assert!(app.skip_links);
+    assert!(app.new_operation);
+
+    // Editing the primary source to empty must not discard the other draft roots.
+    app.source = PathInput::default();
+    let third = root.path().join("third shell source");
+    receive_shell(&mut app, vec![third.clone()]);
+    assert_eq!(app.source.path(), first);
+    assert_eq!(app.additional_sources, vec![second, third]);
+    assert_eq!(app.destination.path(), destination);
+    assert_eq!(app.state.history.len(), 1);
+    assert!(app.state.active.is_none());
+}
+
+#[test]
+fn rejected_shell_selection_does_not_mutate_closed_or_full_open_draft() {
+    let (root, mut app) = fixture();
+    let source = root.path().join("manual");
+    let destination = root.path().join("chosen destination");
+    app.source.set(source.clone());
+    app.destination.set(destination.clone());
+    assert!(app.add_sources(vec![PathBuf::from("relative")]).is_err());
+    assert!(!app.new_operation);
+    assert_eq!(app.source.path(), source);
+    assert_eq!(app.destination.path(), destination);
+
+    app.open_form();
+    app.additional_sources = (1..512)
+        .map(|n| root.path().join(format!("source-{n}")))
+        .collect();
+    let additional = app.additional_sources.clone();
+    assert!(app.add_sources(vec![root.path().join("overflow")]).is_err());
+    assert_eq!(app.source.path(), source);
+    assert_eq!(app.additional_sources, additional);
+    assert_eq!(app.destination.path(), destination);
+    assert!(app.new_operation);
+}
