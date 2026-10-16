@@ -147,6 +147,7 @@ from the VartaCopy repository and inspect the actual staged executable/package::
     rea inspect-pe-resources ABSOLUTE/PATH/external/vartacopy-gui.exe --format json --full-output
     rea inspect-artifact ABSOLUTE/PATH/VartaCopy.Explorer.msix --format json --full-output
     rea inspect-rust-binary ABSOLUTE/PATH/external/vartacopy_explorer.dll --format json --full-output
+    rea inspect-sqlite-database ABSOLUTE/PATH/jobs.sqlite3 --table jobs --column id --column operation --column status --schema-scope database --row-limit 5 --format json --full-output
 
 Use ``inspect-artifact`` for the MSIX inventory; ``inspect`` requests a native
 analysis overview and does not supply the same archive-only workflow. These
@@ -158,6 +159,15 @@ parser, so separately parse the returned byte range to verify MSIX attributes.
 Archive inventory and resource inspection do not verify signature trust or
 Explorer activation. Missing ``.dep-v0`` Rust metadata means dependencies were
 not recovered by this route; it does not establish that dependencies are absent.
+
+For journal inspection, supply an application-created backup or a quiescent
+database and its sibling WAL, if present. Do not inspect an actively changing
+production journal as though it were an atomic snapshot. The SQLite route reads
+private copies and reports committed schema and a bounded, unordered row sample;
+it does not verify full integrity or prove crash recovery. Node.js 26.5.0 supports
+this route without a separate SQLite installation. On a fresh enqueue-only test
+fixture, REA reported the persisted ``move`` operation and ``queued`` status,
+with unchanged source journal SHA256 and no destination files.
 
 REA analysis of third-party reference artifacts belongs to the black room.
 White implementers receive only reviewed neutral requirements and evidence
