@@ -135,3 +135,31 @@ References
 * `Microsoft: mt.exe <https://learn.microsoft.com/en-us/windows/win32/sbscs/mt-exe>`_
 * `Microsoft: Package.EffectiveExternalPath <https://learn.microsoft.com/en-us/uwp/api/windows.applicationmodel.package.effectiveexternalpath>`_
 * `Microsoft: Create a certificate for package signing <https://learn.microsoft.com/en-us/windows/msix/package/create-certificate-package-signing>`_
+
+Optional REA artifact inspection
+-------------------------------
+
+REA is a development tool and is not a VartaCopy runtime dependency. The verified
+CLI version for this workflow is 6.5.0 (Node.js 26.5.0). Install the CLI separately
+from the VartaCopy repository and inspect the actual staged executable/package::
+
+    npm install --global rea-agents@6.5.0 --ignore-scripts
+    rea inspect-pe-resources ABSOLUTE/PATH/external/vartacopy-gui.exe --format json --full-output
+    rea inspect-artifact ABSOLUTE/PATH/VartaCopy.Explorer.msix --format json --full-output
+    rea inspect-rust-binary ABSOLUTE/PATH/external/vartacopy_explorer.dll --format json --full-output
+
+Use ``inspect-artifact`` for the MSIX inventory; ``inspect`` requests a native
+analysis overview and does not supply the same archive-only workflow. These
+static commands require no Ghidra/Hopper/IDA installation and do not launch the
+selected application. Preserve the complete Evidence, input hashes and returned
+limitations outside the source repository. PE resource type 24/name 1 identifies
+the embedded application manifest; its payload is opaque to the REA resource
+parser, so separately parse the returned byte range to verify MSIX attributes.
+Archive inventory and resource inspection do not verify signature trust or
+Explorer activation. Missing ``.dep-v0`` Rust metadata means dependencies were
+not recovered by this route; it does not establish that dependencies are absent.
+
+REA analysis of third-party reference artifacts belongs to the black room.
+White implementers receive only reviewed neutral requirements and evidence
+appropriate to their role. REA availability does not enforce filesystem or
+context isolation. Source-code navigation continues to use codebase-memory.
