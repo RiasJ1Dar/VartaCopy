@@ -112,6 +112,11 @@ Rust 1.95+ та MSVC Build Tools для x64::
     cargo test --workspace --all-features --target x86_64-pc-windows-msvc
     cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings
 
+Єдиний запуск перевірок (Python 3.11+) — ``python tools/check.py``:
+форматування, Rust-тести, clippy та Python-тести. ``--offline`` використовує
+лише кешовані Cargo-залежності. Інструмент фіксує ``--workspace --all-features``
+для тестів і clippy, щоб обидві перевірки мали однаковий набір можливостей.
+
 ``python tools/package.py`` створює portable ZIP з manifest SHA-256,
 ліцензією проєкту та notices залежностей. Готові пакети мають static CRT.
 Вихідний код — MIT; ліцензії залежностей збережені окремо в пакеті.
