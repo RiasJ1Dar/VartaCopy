@@ -1,9 +1,14 @@
 //! Local SQLite journal. Filesystem mutations and SQL commits are reconciled, never treated as one transaction.
+mod dispatch;
 #[cfg(test)]
 mod tests;
 use crate::{
     Conflict, Error, Result,
     planner::{EntryKind, OperationPlan, Snapshot},
+};
+pub use dispatch::{
+    DispatchEngine, DispatchPage, DispatchReceipt, DispatchState, MAX_CANONICAL_REQUEST_BYTES,
+    MAX_NATIVE_RESULT_BYTES,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
@@ -15,7 +20,7 @@ use std::time::Duration;
 use vartacopy_platform_windows as platform;
 
 const APPLICATION_ID: i32 = 0x56415254;
-const VERSION: i32 = 3;
+const VERSION: i32 = 4;
 pub fn default_path() -> Result<PathBuf> {
     let root = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| Error::Journal("LOCALAPPDATA is not configured".into()))?;
@@ -323,6 +328,7 @@ impl Journal {
             // A crash cannot expose a half-initialized default journal.
             let memory = Connection::open_in_memory()?;
             memory.execute_batch(SCHEMA)?;
+            memory.execute_batch(dispatch::SCHEMA)?;
             memory.pragma_update(None, "application_id", APPLICATION_ID)?;
             memory.pragma_update(None, "user_version", VERSION)?;
             let image = memory.serialize("main")?;
@@ -368,6 +374,12 @@ impl Journal {
                     state TEXT NOT NULL CHECK(state IN ('intent','removed')),
                     PRIMARY KEY(job_id,ordinal), FOREIGN KEY(job_id,ordinal) REFERENCES entries(job_id,ordinal));
                 PRAGMA user_version=3; COMMIT;")?;
+        }
+        if version <= 3 {
+            db.execute_batch(&format!(
+                "BEGIN IMMEDIATE; {} PRAGMA user_version=4; COMMIT;",
+                dispatch::SCHEMA
+            ))?;
         }
         let mode: String = db.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         db.pragma_update(None, "synchronous", "FULL")?;
@@ -525,6 +537,18 @@ impl Journal {
         conflict: Conflict,
         operation: OperationKind,
     ) -> Result<Vec<i64>> {
+        let tx = self.db.transaction()?;
+        let ids = Self::insert_batch(&tx, plans, conflict, operation)?;
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    fn insert_batch(
+        tx: &rusqlite::Transaction<'_>,
+        plans: &[OperationPlan],
+        conflict: Conflict,
+        operation: OperationKind,
+    ) -> Result<Vec<i64>> {
         let entries = plans
             .iter()
             .try_fold(0usize, |n, p| n.checked_add(p.entries.len()));
@@ -539,7 +563,6 @@ impl Journal {
         if plans.is_empty() || plans.len() > 512 || plans.iter().any(|p| !p.is_ready()) {
             return Err(Error::Journal("batch requires 1..512 ready plans".into()));
         }
-        let tx = self.db.transaction()?;
         let mut ids = Vec::with_capacity(plans.len());
         for plan in plans {
             tx.execute("INSERT INTO jobs(source,destination,parent_identity,conflict,entry_count,operation,queue_position) VALUES(?1,?2,?3,?4,?5,?6,(SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs))",
@@ -572,7 +595,6 @@ impl Journal {
             tx.execute("INSERT INTO events(job_id,state) VALUES(?1,'queued')", [id])?;
             ids.push(id);
         }
-        tx.commit()?;
         Ok(ids)
     }
 
