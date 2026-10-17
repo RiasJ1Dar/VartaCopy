@@ -15,7 +15,7 @@ use std::time::Duration;
 use vartacopy_platform_windows as platform;
 
 const APPLICATION_ID: i32 = 0x56415254;
-const VERSION: i32 = 2;
+const VERSION: i32 = 3;
 pub fn default_path() -> Result<PathBuf> {
     let root = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| Error::Journal("LOCALAPPDATA is not configured".into()))?;
@@ -36,6 +36,7 @@ CREATE TABLE jobs(
  destination BLOB NOT NULL CHECK(length(destination)<=65534),
  parent_identity BLOB NOT NULL,
  conflict TEXT NOT NULL,
+ operation TEXT NOT NULL DEFAULT 'copy' CHECK(operation IN ('copy','move')),
  queue_position INTEGER NOT NULL DEFAULT 0,
  entry_count INTEGER NOT NULL CHECK(entry_count BETWEEN 1 AND 100000),
  status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','paused','interrupted','completed','partial','cancelled')),
@@ -62,7 +63,36 @@ CREATE TABLE events(
  ordinal INTEGER, state TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT(unixepoch())
 );
 CREATE INDEX events_job ON events(job_id,id);
+CREATE TABLE cleanup(
+ job_id INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('intent','removed')),
+ PRIMARY KEY(job_id,ordinal),
+ FOREIGN KEY(job_id,ordinal) REFERENCES entries(job_id,ordinal)
+);
 ";
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    #[default]
+    Copy,
+    Move,
+}
+impl OperationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Move => "move",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "copy" => Ok(Self::Copy),
+            "move" => Ok(Self::Move),
+            _ => Err(Error::Journal(format!("unknown operation: {value}"))),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -120,6 +150,7 @@ impl EntryState {
 #[derive(Debug, Clone, Serialize)]
 pub struct Job {
     pub id: i64,
+    pub operation: OperationKind,
     #[serde(serialize_with = "crate::planner::serialize_path")]
     pub source: PathBuf,
     #[serde(serialize_with = "crate::planner::serialize_path")]
@@ -154,8 +185,10 @@ pub struct EntryIssue {
 #[derive(Debug, Clone, Serialize)]
 pub struct JobDetails {
     pub job: Job,
+    /// Destination copy commitments; Move cleanup is a separate durable fact.
     pub entries_committed: usize,
     pub entries_skipped: usize,
+    /// For Move, entries whose source removal remains unresolved (excluding skips).
     pub entries_pending: usize,
     pub issues: Vec<EntryIssue>,
     pub issues_offset: usize,
@@ -328,6 +361,14 @@ impl Journal {
                 COMMIT;",
             )?;
         }
+        if version <= 2 {
+            db.execute_batch("BEGIN IMMEDIATE;
+                ALTER TABLE jobs ADD COLUMN operation TEXT NOT NULL DEFAULT 'copy' CHECK(operation IN ('copy','move'));
+                CREATE TABLE cleanup(job_id INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('intent','removed')),
+                    PRIMARY KEY(job_id,ordinal), FOREIGN KEY(job_id,ordinal) REFERENCES entries(job_id,ordinal));
+                PRAGMA user_version=3; COMMIT;")?;
+        }
         let mode: String = db.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "foreign_keys", true)?;
@@ -405,10 +446,11 @@ impl Journal {
         ids.into_iter().map(|id| self.job(id)).collect()
     }
 
-    /// A waiting/paused/interrupted/cancelled job can be scheduled without changing its plan.
+    /// Schedule an inactive job without changing its plan. Partial Move jobs
+    /// require explicit resume to continue cleanup; partial Copy remains closed.
     pub fn schedule(&mut self, id: i64) -> Result<()> {
         let tx = self.db.transaction()?;
-        let changed = tx.execute("UPDATE jobs SET status='queued',last_error=NULL WHERE id=?1 AND status IN ('queued','paused','interrupted','cancelled')", [id])?;
+        let changed = tx.execute("UPDATE jobs SET status='queued',last_error=NULL WHERE id=?1 AND (status IN ('queued','paused','interrupted','cancelled') OR (status='partial' AND operation='move'))", [id])?;
         if changed != 1 {
             return Err(Error::Journal(
                 "only unfinished inactive jobs can be scheduled".into(),
@@ -455,7 +497,15 @@ impl Journal {
     }
 
     pub fn enqueue(&mut self, plan: &OperationPlan, conflict: Conflict) -> Result<i64> {
-        self.enqueue_many(std::slice::from_ref(plan), conflict)?
+        self.enqueue_with_operation(plan, conflict, OperationKind::Copy)
+    }
+    pub fn enqueue_with_operation(
+        &mut self,
+        plan: &OperationPlan,
+        conflict: Conflict,
+        operation: OperationKind,
+    ) -> Result<i64> {
+        self.enqueue_many_with_operation(std::slice::from_ref(plan), conflict, operation)?
             .into_iter()
             .next()
             .ok_or_else(|| Error::Journal("no job saved".into()))
@@ -466,6 +516,14 @@ impl Journal {
         &mut self,
         plans: &[OperationPlan],
         conflict: Conflict,
+    ) -> Result<Vec<i64>> {
+        self.enqueue_many_with_operation(plans, conflict, OperationKind::Copy)
+    }
+    pub fn enqueue_many_with_operation(
+        &mut self,
+        plans: &[OperationPlan],
+        conflict: Conflict,
+        operation: OperationKind,
     ) -> Result<Vec<i64>> {
         let entries = plans
             .iter()
@@ -484,9 +542,9 @@ impl Journal {
         let tx = self.db.transaction()?;
         let mut ids = Vec::with_capacity(plans.len());
         for plan in plans {
-            tx.execute("INSERT INTO jobs(source,destination,parent_identity,conflict,entry_count,queue_position) VALUES(?1,?2,?3,?4,?5,(SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs))",
+            tx.execute("INSERT INTO jobs(source,destination,parent_identity,conflict,entry_count,operation,queue_position) VALUES(?1,?2,?3,?4,?5,?6,(SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs))",
             params![encode_path(&plan.source),encode_path(&plan.destination),
-                serde_json::to_vec(&plan.destination_parent_identity)?,serde_json::to_string(&conflict)?,sql_num(plan.entries.len())?])?;
+                serde_json::to_vec(&plan.destination_parent_identity)?,serde_json::to_string(&conflict)?,sql_num(plan.entries.len())?,operation.as_str()])?;
             let id = tx.last_insert_rowid();
             {
                 let mut insert=tx.prepare("INSERT INTO entries(job_id,ordinal,relative,kind,snapshot,state) VALUES(?1,?2,?3,?4,?5,?6)")?;
@@ -528,6 +586,11 @@ impl Journal {
         }
         Ok(Job {
             id,
+            operation: OperationKind::parse(&self.db.query_row(
+                "SELECT operation FROM jobs WHERE id=?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )?)?,
             source: decode_path(raw.0, false)?,
             destination: decode_path(raw.1, false)?,
             parent_identity: serde_json::from_slice(&raw.2)?,
@@ -563,9 +626,14 @@ impl Journal {
         }
         let job = self.job(id)?;
         let (committed, skipped) = self.counts(id)?;
+        let finished = if job.operation == OperationKind::Move {
+            self.cleanup_removed(id)?
+        } else {
+            committed
+        };
         let pending = job
             .entry_count
-            .checked_sub(committed + skipped)
+            .checked_sub(finished + skipped)
             .ok_or_else(|| Error::Journal("invalid persisted counts".into()))?;
         let mut statement = self.db.prepare("SELECT ordinal,relative,state,last_error FROM entries WHERE job_id=?1 AND last_error IS NOT NULL ORDER BY ordinal LIMIT ?2 OFFSET ?3")?;
         let rows =
@@ -690,8 +758,15 @@ impl Journal {
         Ok(())
     }
 
-    /// Schedule integrity reconciliation of an already finished job, without recopying it.
+    /// Schedule integrity reconciliation of a finished Copy job. Move requires
+    /// explicit resume: recheck must never authorize further source deletion.
     pub fn recheck(&mut self, id: i64) -> Result<()> {
+        if self.job(id)?.operation == OperationKind::Move {
+            return Err(Error::Journal(
+                "Move jobs cannot be rechecked; use explicit resume to continue source cleanup"
+                    .into(),
+            ));
+        }
         let tx = self.db.transaction()?;
         if tx.execute("UPDATE jobs SET status='queued',last_error=NULL WHERE id=?1 AND status IN ('completed','partial')",[id])?!=1 {return Err(Error::Journal("only finished jobs can be rechecked".into()));}
         tx.execute(
@@ -782,6 +857,66 @@ impl Journal {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn cleanup_state(&self, job: i64, ordinal: usize) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .db
+            .query_row(
+                "SELECT state FROM cleanup WHERE job_id=?1 AND ordinal=?2",
+                params![job, sql_num(ordinal)?],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn cleanup_transition(
+        &mut self,
+        job: i64,
+        ordinal: usize,
+        removed: bool,
+    ) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let operation: String =
+            tx.query_row("SELECT operation FROM jobs WHERE id=?1", [job], |r| {
+                r.get(0)
+            })?;
+        let state: String = tx.query_row(
+            "SELECT state FROM entries WHERE job_id=?1 AND ordinal=?2",
+            params![job, sql_num(ordinal)?],
+            |r| r.get(0),
+        )?;
+        if operation != "move" || state != "committed" {
+            return Err(Error::Journal(
+                "cleanup requires a committed Move entry".into(),
+            ));
+        }
+        let next = if removed { "removed" } else { "intent" };
+        if removed {
+            if tx.execute("UPDATE cleanup SET state='removed' WHERE job_id=?1 AND ordinal=?2 AND state='intent'",params![job,sql_num(ordinal)?])? != 1 {
+                return Err(Error::Journal("cleanup removal requires durable intent".into()));
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO cleanup(job_id,ordinal,state) VALUES(?1,?2,'intent')",
+                params![job, sql_num(ordinal)?],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO events(job_id,ordinal,state) VALUES(?1,?2,?3)",
+            params![job, sql_num(ordinal)?, format!("cleanup_{next}")],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_removed(&self, job: i64) -> Result<usize> {
+        Ok(self.db.query_row(
+            "SELECT count(*) FROM cleanup WHERE job_id=?1 AND state='removed'",
+            [job],
+            |r| r.get::<_, u32>(0),
+        )? as usize)
     }
 
     pub fn set_root(&mut self, job: i64, path: &Path, identity: &platform::Identity) -> Result<()> {

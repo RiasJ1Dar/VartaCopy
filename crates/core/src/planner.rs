@@ -63,6 +63,19 @@ pub struct Snapshot {
     pub(crate) streams: Vec<platform::Stream>,
 }
 impl Snapshot {
+    pub(crate) fn validate_cleanup_directory(&self, file: &File, path: &Path) -> Result<()> {
+        // Removing our own children changes LastWriteTime. Identity, attributes
+        // and ADS must remain unchanged; Windows enforces empty-only deletion.
+        if self.identity != platform::identity(file)?
+            || self.attributes != file.metadata()?.file_attributes()
+            || self.streams != platform::streams(path)?
+        {
+            return Err(Error::Verification(
+                "source directory changed during cleanup".into(),
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn validate(&self, file: &File, path: &Path, directory: bool) -> Result<()> {
         let metadata = file.metadata()?;
         if self.identity != platform::identity(file)?

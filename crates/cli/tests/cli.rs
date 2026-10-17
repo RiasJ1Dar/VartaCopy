@@ -23,6 +23,7 @@ fn cli_enqueue_jobs_resume_and_idempotent_completed_job() {
     let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let id = queued["id"].as_i64().unwrap().to_string();
     assert_eq!(queued["status"], "queued");
+    assert_eq!(queued["operation"], "copy");
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
     let output = cli(&[
         "jobs".as_ref(),
@@ -49,6 +50,158 @@ fn cli_enqueue_jobs_resume_and_idempotent_completed_job() {
         assert_eq!(fs::read(destination.join("file")).unwrap(), b"durable");
     }
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+}
+
+#[test]
+fn cli_move_dry_run_never_creates_journal_or_changes_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("tree");
+    let destination = root.path().join("dest");
+    let journal = root.path().join("absent-parent/jobs.sqlite");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(source.join("nested/data"), b"dry move").unwrap();
+    for command in ["move", "enqueue"] {
+        let mut args = vec![
+            command.as_ref(),
+            source.as_os_str(),
+            destination.as_os_str(),
+            "--journal".as_ref(),
+            journal.as_os_str(),
+            "--dry-run".as_ref(),
+            "--json".as_ref(),
+        ];
+        if command == "enqueue" {
+            args.extend([
+                std::ffi::OsStr::new("--operation"),
+                std::ffi::OsStr::new("move"),
+            ]);
+        }
+        let output = cli(&args);
+        assert!(output.status.success(), "{output:?}");
+        assert!(!journal.parent().unwrap().exists());
+        assert_eq!(fs::read(source.join("nested/data")).unwrap(), b"dry move");
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn cli_move_and_enqueued_move_persist_operation_and_report_cleanup_truthfully() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("dest");
+    let journal = root.path().join("jobs.sqlite");
+    fs::create_dir(&destination).unwrap();
+    for enqueue in [false, true] {
+        let source = root.path().join(if enqueue {
+            "queued-move"
+        } else {
+            "direct-move"
+        });
+        fs::write(&source, b"verified move").unwrap();
+        let mut args = vec![
+            std::ffi::OsStr::new(if enqueue { "enqueue" } else { "move" }),
+            source.as_os_str(),
+            destination.as_os_str(),
+            "--journal".as_ref(),
+            journal.as_os_str(),
+            "--json".as_ref(),
+        ];
+        if enqueue {
+            args.extend([
+                std::ffi::OsStr::new("--operation"),
+                std::ffi::OsStr::new("move"),
+            ]);
+        }
+        let output = cli(&args);
+        let mut report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if enqueue {
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(report["operation"], "move");
+            assert_eq!(report["status"], "queued");
+            assert!(source.exists());
+            assert!(!destination.join(source.file_name().unwrap()).exists());
+            let id = report["id"].to_string();
+            let resumed = cli(&[
+                "resume".as_ref(),
+                id.as_ref(),
+                "--journal".as_ref(),
+                journal.as_os_str(),
+                "--json".as_ref(),
+            ]);
+            report = serde_json::from_slice(&resumed.stdout).unwrap();
+            assert_eq!(
+                resumed.status.code(),
+                Some(if report["status"] == "completed" {
+                    0
+                } else {
+                    2
+                }),
+                "{resumed:?}"
+            );
+        } else {
+            assert_eq!(
+                output.status.code(),
+                Some(if report["status"] == "completed" {
+                    0
+                } else {
+                    2
+                }),
+                "{output:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(destination.join(source.file_name().unwrap())).unwrap(),
+            b"verified move"
+        );
+        match report["status"].as_str().unwrap() {
+            "completed" => assert!(!source.exists()),
+            "partial" => {
+                assert_eq!(fs::read(&source).unwrap(), b"verified move");
+                assert!(report["error"].is_string(), "{report}");
+            }
+            other => panic!("unexpected Move status {other}: {report}"),
+        }
+        let jobs = cli(&[
+            "jobs".as_ref(),
+            "--journal".as_ref(),
+            journal.as_os_str(),
+            "--json".as_ref(),
+        ]);
+        assert!(jobs.status.success());
+        let jobs: serde_json::Value = serde_json::from_slice(&jobs.stdout).unwrap();
+        assert!(
+            jobs.as_array()
+                .unwrap()
+                .iter()
+                .all(|job| job["operation"] == "move")
+        );
+    }
+}
+
+#[test]
+fn cli_move_skip_conflict_is_partial_and_keeps_source() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("same");
+    let destination = root.path().join("dest");
+    let journal = root.path().join("jobs.sqlite");
+    fs::create_dir(&destination).unwrap();
+    fs::write(&source, b"original").unwrap();
+    fs::write(destination.join("same"), b"existing").unwrap();
+    let output = cli(&[
+        "move".as_ref(),
+        source.as_os_str(),
+        destination.as_os_str(),
+        "--journal".as_ref(),
+        journal.as_os_str(),
+        "--on-conflict".as_ref(),
+        "skip".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "partial");
+    assert_eq!(fs::read(source).unwrap(), b"original");
+    assert_eq!(fs::read(destination.join("same")).unwrap(), b"existing");
 }
 
 #[test]

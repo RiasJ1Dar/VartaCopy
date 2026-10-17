@@ -7,10 +7,102 @@ use std::time::Duration;
 use vartacopy_core::{
     Conflict,
     control::Control,
-    journal::{CHUNK_BYTES, Journal},
+    journal::{CHUNK_BYTES, Journal, OperationKind},
     planner::{ScanOptions, scan},
     recovery,
 };
+
+#[test]
+fn terminate_process_at_move_cleanup_boundaries_preserves_data_and_replacement_sources() {
+    for phase in [
+        "cleanup_intent",
+        "source_delete_prepared",
+        "source_removed",
+        "cleanup_committed",
+    ] {
+        for replace_source in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("move.bin");
+            let destination = root.path().join("destination");
+            fs::create_dir(&destination).unwrap();
+            let data = vec![97; CHUNK_BYTES + 701];
+            fs::write(&source, &data).unwrap();
+            let ads = std::path::PathBuf::from(format!("{}:note", source.display()));
+            fs::write(&ads, b"move alternate data").unwrap();
+            let path = root.path().join("jobs.sqlite");
+            let id = {
+                let plan = scan(
+                    &source,
+                    &destination,
+                    ScanOptions::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                Journal::open(&path)
+                    .unwrap()
+                    .enqueue_with_operation(&plan, Conflict::Error, OperationKind::Move)
+                    .unwrap()
+            };
+            kill_at_operation(&path, id, phase, OperationKind::Move);
+            let target = destination.join("move.bin");
+            // A real process kill must never leave neither verified output nor source.
+            assert_eq!(fs::read(&target).unwrap(), data, "{phase}");
+            assert_eq!(
+                fs::read(format!("{}:note", target.display())).unwrap(),
+                b"move alternate data",
+                "{phase}"
+            );
+            if source.exists() {
+                assert_eq!(fs::read(&source).unwrap(), data, "{phase}");
+                assert_eq!(fs::read(&ads).unwrap(), b"move alternate data", "{phase}");
+            }
+            if replace_source {
+                if source.exists() {
+                    fs::rename(&source, root.path().join("original-retained.bin")).unwrap();
+                }
+                fs::write(&source, b"replacement must survive").unwrap();
+            }
+            let mut journal = Journal::open(&path).unwrap();
+            for _ in 0..2 {
+                let report =
+                    recovery::run(&mut journal, id, &Control::default(), &mut |_| Ok(())).unwrap();
+                assert_eq!(journal.job(id).unwrap().operation, OperationKind::Move);
+                assert_eq!(fs::read(&target).unwrap(), data, "{phase}");
+                assert_eq!(
+                    fs::read(format!("{}:note", target.display())).unwrap(),
+                    b"move alternate data"
+                );
+                if replace_source {
+                    assert_eq!(
+                        fs::read(&source).unwrap(),
+                        b"replacement must survive",
+                        "{phase}: {report:?}"
+                    );
+                    assert!(
+                        matches!(report.status.as_str(), "partial" | "completed"),
+                        "{report:?}"
+                    );
+                    if phase == "cleanup_intent" || phase == "source_delete_prepared" {
+                        assert_eq!(
+                            report.status, "partial",
+                            "replacement identity must block pending cleanup"
+                        );
+                    }
+                } else {
+                    if phase == "source_removed" {
+                        // Filesystem deletion alone is not durable proof: an ambiguous
+                        // missing source remains pending until the cleanup SQL commit.
+                        assert_eq!(report.status, "partial", "{phase}: {report:?}");
+                        assert_eq!(report.entries_pending, 1, "{phase}: {report:?}");
+                    } else {
+                        assert_eq!(report.status, "completed", "{phase}: {report:?}");
+                    }
+                    assert!(!source.exists(), "{phase}");
+                }
+            }
+        }
+    }
+}
 
 #[test]
 fn terminate_process_at_every_boundary_then_resume_without_rust_destructors() {
@@ -79,10 +171,15 @@ fn terminate_process_at_every_boundary_then_resume_without_rust_destructors() {
 }
 
 fn kill_at(path: &std::path::Path, id: i64, phase: &str) {
+    kill_at_operation(path, id, phase, OperationKind::Copy);
+}
+
+fn kill_at_operation(path: &std::path::Path, id: i64, phase: &str, operation: OperationKind) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_vartacopy-fault"))
         .arg(path)
         .arg(id.to_string())
         .arg(phase)
+        .args(["--operation", operation.as_str()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -13,7 +13,7 @@ use std::{
 };
 use vartacopy_core::{
     Conflict,
-    journal::{EntryState, EntrySummary, Job},
+    journal::{EntryState, EntrySummary, Job, JobDetails, OperationKind},
     planner::{EntryKind, ReparsePolicy},
     recovery::Phase,
 };
@@ -64,6 +64,7 @@ pub struct App {
     source: PathInput,
     additional_sources: Vec<PathBuf>,
     destination: PathInput,
+    operation: OperationKind,
     conflict: usize,
     skip_links: bool,
     history: bool,
@@ -181,6 +182,7 @@ impl App {
             source: PathInput::default(),
             additional_sources: Vec::new(),
             destination: PathInput::default(),
+            operation: OperationKind::Copy,
             conflict: 0,
             skip_links: false,
             history: false,
@@ -352,6 +354,7 @@ impl App {
             } else {
                 ReparsePolicy::Reject
             },
+            operation: self.operation,
             start,
         });
         if accepted {
@@ -630,10 +633,53 @@ fn entry_status(state: EntryState) -> &'static str {
         EntryState::Copying => "Копіювання",
         EntryState::Verified => "Перевірено",
         EntryState::Publishing => "Публікація",
-        EntryState::Committed => "Готово",
+        EntryState::Committed => "Копію збережено",
         EntryState::Skipped => "Пропущено",
         EntryState::DirIntent => "Створення",
         EntryState::DirectoryReady => "Каталог створено",
+    }
+}
+fn operation_action(operation: OperationKind) -> &'static str {
+    match operation {
+        OperationKind::Copy => "Копіювати",
+        OperationKind::Move => "Перемістити",
+    }
+}
+fn operation_name(operation: OperationKind) -> &'static str {
+    match operation {
+        OperationKind::Copy => "Копіювання",
+        OperationKind::Move => "Переміщення",
+    }
+}
+fn job_status(job: &Job) -> &str {
+    match (job.operation, job.status.as_str()) {
+        (OperationKind::Move, "completed") => "Переміщено з перевіркою",
+        (OperationKind::Move, "partial") => {
+            "Частково — переміщення не завершено; перевірте збережені джерела"
+        }
+        (OperationKind::Move, "cancelled") => {
+            "Зупинено — збережені результати й решта джерел залишаються"
+        }
+        (OperationKind::Move, "paused") => "На паузі — переміщення не завершено",
+        _ => status(&job.status),
+    }
+}
+fn job_counts(details: &JobDetails) -> String {
+    if details.job.operation == OperationKind::Move {
+        let moved = details
+            .job
+            .entry_count
+            .saturating_sub(details.entries_skipped)
+            .saturating_sub(details.entries_pending);
+        format!(
+            "Скопійовано/перевірено у призначенні {} · переміщено {} · пропущено {} · залишилося перемістити {}",
+            details.entries_committed, moved, details.entries_skipped, details.entries_pending
+        )
+    } else {
+        format!(
+            "Готово {} · пропущено {} · залишилося {}",
+            details.entries_committed, details.entries_skipped, details.entries_pending
+        )
     }
 }
 fn short_status(value: &str) -> &str {
@@ -666,7 +712,7 @@ fn status(value: &str) -> &str {
         "interrupted" => "Перервано — потрібне відновлення",
         "cancelled" => "Зупинено",
         "completed" => "Завершено з перевіркою",
-        "partial" => "Частково — є пропущені елементи",
+        "partial" => "Частково — є пропущені елементи або збережені джерела",
         _ => value,
     }
 }
@@ -677,11 +723,15 @@ fn phase(value: Phase) -> &'static str {
         Phase::Checking | Phase::Verified => "Перевірка даних",
         Phase::PublishIntent => "Публікація файла",
         Phase::Published => "Файл опубліковано",
-        Phase::Committed => "Файл завершено",
+        Phase::Committed => "Копію файлу збережено",
         Phase::DirectoryIntent | Phase::DirectoryPublished | Phase::DirectoryReady => {
             "Створення каталогу"
         }
         Phase::DirectoryCommitted => "Збереження метаданих каталогу",
+        Phase::CleanupIntent => "Підготовка видалення джерела",
+        Phase::SourceDeletePrepared => "Перевірка джерела перед видаленням",
+        Phase::SourceRemoved => "Джерело видалено",
+        Phase::CleanupCommitted => "Видалення джерела збережено в журналі",
     }
 }
 

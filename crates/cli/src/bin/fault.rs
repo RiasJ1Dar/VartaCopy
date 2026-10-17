@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use vartacopy_core::{
     control::Control,
-    journal::Journal,
+    journal::{Journal, OperationKind},
     recovery::{self, Phase},
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,7 +21,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_string()
             .map_err(|_| "phase is not UTF-8")?,
     ))?;
+    let operation = match args.next() {
+        None => OperationKind::Copy,
+        Some(flag) if flag == "--operation" => match args.next().as_deref() {
+            Some(value) if value == "copy" => OperationKind::Copy,
+            Some(value) if value == "move" => OperationKind::Move,
+            _ => return Err("expected --operation copy|move".into()),
+        },
+        Some(_) => return Err("unexpected fault argument".into()),
+    };
+    if args.next().is_some() {
+        return Err("unexpected trailing fault argument".into());
+    }
     let mut journal = Journal::open(&path)?;
+    if journal.job(id)?.operation != operation {
+        return Err("fault operation differs from persisted job".into());
+    }
     let mut reached = false;
     let report = recovery::run(&mut journal, id, &Control::default(), &mut |event| {
         if !reached && event.phase == phase {

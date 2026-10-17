@@ -1,11 +1,12 @@
 //! Resumable verified file transfers. Every reused byte is rehashed in source and stage.
+mod move_cleanup;
 #[cfg(test)]
 mod tests;
 mod tree;
 use crate::{
     Conflict, Error, Result,
     control::Control,
-    journal::{CHUNK_BYTES, Chunk, Entry, EntryState, Job, Journal},
+    journal::{CHUNK_BYTES, Chunk, Entry, EntryState, Job, Journal, OperationKind},
     planner::EntryKind,
 };
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,10 @@ pub enum Phase {
     DirectoryPublished,
     DirectoryReady,
     DirectoryCommitted,
+    CleanupIntent,
+    SourceDeletePrepared,
+    SourceRemoved,
+    CleanupCommitted,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -586,7 +591,7 @@ pub fn run(
         issues: Vec::new(),
         issues_omitted: 0,
     };
-    let result = if entry.kind == EntryKind::File && job.entry_count == 1 {
+    let mut result = if entry.kind == EntryKind::File && job.entry_count == 1 {
         resume_file(journal, &job, entry, &job.destination, control, observer).map(
             |(_, resumed, bytes)| {
                 report.resumed_bytes = resumed;
@@ -600,6 +605,9 @@ pub fn run(
     };
     if result.is_ok() && job.entry_count == 1 {
         journal.clear_entry_error(id, 0)?;
+    }
+    if result.is_ok() && job.operation == OperationKind::Move && report.entries_failed == 0 {
+        result = move_cleanup::run(journal, &job, control, observer, &mut report);
     }
     let primary = result.as_ref().err().map(ToString::to_string);
     let (committed, skipped) = journal.counts(id).map_err(|error| {
@@ -615,14 +623,25 @@ pub fn run(
         .entry_count
         .checked_sub(committed + skipped)
         .ok_or_else(|| Error::Journal("entry counts exceed saved plan".into()))?;
+    if job.operation == OperationKind::Move {
+        report.entries_pending = job
+            .entry_count
+            .checked_sub(journal.cleanup_removed(id)? + skipped)
+            .ok_or_else(|| Error::Journal("cleanup count exceeds plan".into()))?;
+    }
     match result {
         Err(error) => {
-            report.status = if matches!(error, Error::Cancelled) {
-                "paused"
-            } else {
-                "interrupted"
-            }
-            .into();
+            report.status =
+                if job.operation == OperationKind::Move && matches!(error, Error::Cancelled) {
+                    "cancelled"
+                } else if job.operation == OperationKind::Move && committed > 0 {
+                    "partial"
+                } else if matches!(error, Error::Cancelled) {
+                    "paused"
+                } else {
+                    "interrupted"
+                }
+                .into();
             if !matches!(error, Error::Cancelled) {
                 report.entries_failed += 1;
                 if job.entry_count == 1 {
@@ -632,7 +651,11 @@ pub fn run(
             report.error = Some(error.to_string());
         }
         Ok(()) => {
-            report.status = if report.entries_failed > 0 || report.entries_pending > 0 {
+            report.status = if job.operation == OperationKind::Move
+                && (report.entries_failed > 0 || report.entries_pending > 0)
+            {
+                "partial"
+            } else if report.entries_failed > 0 || report.entries_pending > 0 {
                 "interrupted"
             } else if skipped > 0 {
                 "partial"

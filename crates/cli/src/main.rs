@@ -8,7 +8,7 @@ use std::sync::{
 use vartacopy_core::{
     Conflict, Error,
     control::Control,
-    journal::{self, Journal},
+    journal::{self, Journal, OperationKind},
     planner::{self, ReparsePolicy, ScanLimits, ScanOptions},
     recovery, tree,
 };
@@ -17,7 +17,7 @@ use vartacopy_core::{
 #[command(
     name = "vartacopy",
     version,
-    about = "Verified Windows file and directory copy"
+    about = "Verified Windows file and directory copy and move"
 )]
 struct Args {
     /// Persistent job database (default: LOCALAPPDATA/VartaCopy/jobs.sqlite3).
@@ -38,27 +38,15 @@ enum Command {
         gui: Option<PathBuf>,
     },
     /// Copy a file or tree into an existing directory; directory trees are never merged.
-    Copy {
-        source: PathBuf,
-        destination: PathBuf,
-        #[arg(long)]
-        dry_run: bool,
-        /// Save the plan without starting it.
-        #[arg(long)]
-        enqueue: bool,
-        #[arg(long, value_enum, default_value = "error")]
-        on_conflict: Policy,
-        /// Refuse reparse points, or explicitly skip them with a partial result.
-        #[arg(long, value_enum, default_value = "reject")]
-        reparse: Links,
-        /// Maximum planned entries, including directories (up to 100000).
-        #[arg(long, default_value_t = 100_000)]
-        max_entries: usize,
-        /// Maximum relative entry depth (up to 256).
-        #[arg(long, default_value_t = 128)]
-        max_depth: usize,
-        #[arg(long)]
-        json: bool,
+    Copy(TransferArgs),
+    /// Move a file or tree using verified publication and durable source cleanup.
+    Move(TransferArgs),
+    /// Save a copy or move plan without starting it.
+    Enqueue {
+        #[command(flatten)]
+        transfer: TransferArgs,
+        #[arg(long, value_enum, default_value = "copy")]
+        operation: Operation,
     },
     /// Compare all data streams using BLAKE3 readback, regardless of size/mtime.
     Verify {
@@ -139,6 +127,42 @@ enum Command {
         json: bool,
     },
 }
+#[derive(clap::Args)]
+struct TransferArgs {
+    source: PathBuf,
+    destination: PathBuf,
+    #[arg(long)]
+    dry_run: bool,
+    /// Save the plan without starting it.
+    #[arg(long)]
+    enqueue: bool,
+    #[arg(long, value_enum, default_value = "error")]
+    on_conflict: Policy,
+    /// Refuse reparse points, or explicitly skip them with a partial result.
+    #[arg(long, value_enum, default_value = "reject")]
+    reparse: Links,
+    /// Maximum planned entries, including directories (up to 100000).
+    #[arg(long, default_value_t = 100_000)]
+    max_entries: usize,
+    /// Maximum relative entry depth (up to 256).
+    #[arg(long, default_value_t = 128)]
+    max_depth: usize,
+    #[arg(long)]
+    json: bool,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum Operation {
+    Copy,
+    Move,
+}
+impl From<Operation> for OperationKind {
+    fn from(value: Operation) -> Self {
+        match value {
+            Operation::Copy => Self::Copy,
+            Operation::Move => Self::Move,
+        }
+    }
+}
 #[derive(Clone, Copy, ValueEnum)]
 enum ExplorerAction {
     Install,
@@ -210,59 +234,18 @@ fn run(
             }
             Ok(0)
         }
-        Command::Copy {
-            source,
-            destination,
-            dry_run,
-            enqueue,
-            on_conflict,
-            reparse,
-            max_entries,
-            max_depth,
-            json,
+        Command::Copy(options) => {
+            transfer(options, OperationKind::Copy, args.journal, cancel, control)
+        }
+        Command::Move(options) => {
+            transfer(options, OperationKind::Move, args.journal, cancel, control)
+        }
+        Command::Enqueue {
+            transfer: mut options,
+            operation,
         } => {
-            let options = ScanOptions {
-                reparse: match reparse {
-                    Links::Reject => ReparsePolicy::Reject,
-                    Links::Skip => ReparsePolicy::Skip,
-                },
-                limits: ScanLimits {
-                    max_entries,
-                    max_depth,
-                    ..ScanLimits::default()
-                },
-            };
-            let plan = planner::scan(&source, &destination, options, cancel)?;
-            if dry_run {
-                let code = if plan.is_ready() { 0 } else { 2 };
-                emit(&plan, json)?;
-                return Ok(code);
-            }
-            let conflict = match on_conflict {
-                Policy::Error => Conflict::Error,
-                Policy::Skip => Conflict::Skip,
-                Policy::KeepBoth => Conflict::KeepBoth,
-            };
-            if !plan.is_ready() {
-                let outcome = tree::execute(&plan, conflict, cancel)?;
-                let code = outcome.exit_code();
-                emit(&outcome, json)?;
-                return Ok(code);
-            }
-            let path = match args.journal {
-                Some(path) => path,
-                None => journal::default_path()?,
-            };
-            let mut journal = Journal::open(&path)?;
-            let id = journal.enqueue(&plan, conflict)?;
-            if enqueue {
-                emit(&journal.job(id)?, json)?;
-                return Ok(0);
-            }
-            let report = recovery::run(&mut journal, id, control, &mut |_| Ok(()))?;
-            let code = report.exit_code();
-            emit(&report, json)?;
-            Ok(code)
+            options.enqueue = true;
+            transfer(options, operation.into(), args.journal, cancel, control)
         }
         Command::Verify { left, right, json } => {
             let streams = vartacopy_core::verify(&left, &right, cancel)?;
@@ -380,6 +363,68 @@ fn run(
     }
 }
 
+fn transfer(
+    options: TransferArgs,
+    operation: OperationKind,
+    journal_path: Option<PathBuf>,
+    cancel: &AtomicBool,
+    control: &Control,
+) -> Result<u8, Box<dyn std::error::Error>> {
+    let TransferArgs {
+        source,
+        destination,
+        dry_run,
+        enqueue,
+        on_conflict,
+        reparse,
+        max_entries,
+        max_depth,
+        json,
+    } = options;
+    let options = ScanOptions {
+        reparse: match reparse {
+            Links::Reject => ReparsePolicy::Reject,
+            Links::Skip => ReparsePolicy::Skip,
+        },
+        limits: ScanLimits {
+            max_entries,
+            max_depth,
+            ..ScanLimits::default()
+        },
+    };
+    let plan = planner::scan(&source, &destination, options, cancel)?;
+    if dry_run {
+        let code = if plan.is_ready() { 0 } else { 2 };
+        emit(&plan, json)?;
+        return Ok(code);
+    }
+    let conflict = match on_conflict {
+        Policy::Error => Conflict::Error,
+        Policy::Skip => Conflict::Skip,
+        Policy::KeepBoth => Conflict::KeepBoth,
+    };
+    if !plan.is_ready() && operation == OperationKind::Copy && !enqueue {
+        let outcome = tree::execute(&plan, conflict, cancel)?;
+        let code = outcome.exit_code();
+        emit(&outcome, json)?;
+        return Ok(code);
+    }
+    let path = match journal_path {
+        Some(path) => path,
+        None => journal::default_path()?,
+    };
+    let mut journal = Journal::open(&path)?;
+    let id = journal.enqueue_with_operation(&plan, conflict, operation)?;
+    if enqueue {
+        emit(&journal.job(id)?, json)?;
+        return Ok(0);
+    }
+    let report = recovery::run(&mut journal, id, control, &mut |_| Ok(()))?;
+    let code = report.exit_code();
+    emit(&report, json)?;
+    Ok(code)
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -395,7 +440,12 @@ fn main() -> ExitCode {
     }
     let json = match &args.command {
         Command::Explorer { .. } => false,
-        Command::Copy { json, .. }
+        Command::Copy(TransferArgs { json, .. })
+        | Command::Move(TransferArgs { json, .. })
+        | Command::Enqueue {
+            transfer: TransferArgs { json, .. },
+            ..
+        }
         | Command::Verify { json, .. }
         | Command::Jobs { json, .. }
         | Command::Resume { json, .. }

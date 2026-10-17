@@ -1,5 +1,5 @@
 //! Windows-only verified copy engine, bounded planning, and directory traversal.
-//! ACL/owner are inherited at the destination. Move and durable resume are not implemented.
+//! ACL/owner are inherited at the destination. Durable Move verifies copies before guarded cleanup.
 pub mod control;
 pub mod journal;
 pub mod planner;

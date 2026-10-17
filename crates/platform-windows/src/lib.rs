@@ -26,13 +26,70 @@ mod publication_tests {
         }
         assert_eq!(std::fs::read_dir(&canonical).unwrap().count(), 16);
     }
+
+    #[test]
+    fn source_id_lookup_distinguishes_renames_removal_and_volume_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in [false, true] {
+            let source = root
+                .path()
+                .join(if directory { "directory" } else { "file" });
+            if directory {
+                std::fs::create_dir(&source).unwrap();
+            } else {
+                std::fs::write(&source, b"payload").unwrap();
+            }
+            let guard = if directory {
+                open_directory(&source, false).unwrap()
+            } else {
+                open_source(&source).unwrap()
+            };
+            let expected = identity(&guard).unwrap();
+            drop(guard);
+            assert!(identity_exists_on_source_volume(&source, &expected).unwrap());
+            let renamed = source.with_extension("renamed");
+            std::fs::rename(&source, &renamed).unwrap();
+            assert!(identity_exists_on_source_volume(&source, &expected).unwrap());
+            let mut wrong_volume = expected.clone();
+            wrong_volume.volume_serial ^= 1;
+            assert!(identity_exists_on_source_volume(&source, &wrong_volume).is_err());
+            if directory {
+                std::fs::remove_dir(&renamed).unwrap();
+            } else {
+                std::fs::remove_file(&renamed).unwrap();
+            }
+            match identity_exists_on_source_volume(&source, &expected) {
+                Ok(false) => {}
+                // This NTFS host returns 87 for deleted IDs. It is also used
+                // for invalid/unsupported requests, so preserve ambiguity.
+                Err(error) => assert_eq!(error.raw_os_error(), Some(87)),
+                Ok(true) => panic!("deleted identity unexpectedly remains live"),
+            }
+            for unsupported in [
+                r"\\server\share\file",
+                r"\\?\UNC\server\share\file",
+                r"\\?\Volume{00000000-0000-0000-0000-000000000000}\file",
+            ] {
+                assert_eq!(
+                    identity_exists_on_source_volume(Path::new(unsupported), &expected)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::Unsupported
+                );
+            }
+        }
+    }
 }
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::{offset_of, size_of};
-use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+use std::os::windows::{
+    ffi::OsStrExt,
+    fs::OpenOptionsExt,
+    io::{AsRawHandle, FromRawHandle},
+};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -180,6 +237,162 @@ pub fn open_source(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// A TxF writer freezes the entire NTFS object, including creation of new ADS.
+/// Ordinary sharing flags and oplocks protect individual streams only. Systems
+/// without TxF fail closed; there is deliberately no unguarded deletion fallback.
+pub struct CleanupOwner {
+    file: Option<File>,
+    transaction: File,
+    finished: bool,
+    removal_prepared: bool,
+}
+impl CleanupOwner {
+    pub fn open(
+        path: &Path,
+        expected: &Identity,
+        directory: bool,
+        delete: bool,
+    ) -> io::Result<Self> {
+        // SAFETY: null optional arguments select system defaults; result checked.
+        let transaction = unsafe {
+            CreateTransaction(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if transaction == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a newly created owned transaction HANDLE is closed once by File.
+        let transaction = unsafe { File::from_raw_handle(transaction) };
+        let mut owner = Self {
+            file: None,
+            transaction,
+            finished: false,
+            removal_prepared: false,
+        };
+        let name = wide(path.as_os_str())?;
+        // FILE_WRITE_ATTRIBUTES obtains a transacted writer without modifying
+        // source bytes or metadata. This lock covers all streams and hardlinks.
+        let access = FILE_READ_ATTRIBUTES
+            | FILE_WRITE_ATTRIBUTES
+            | if delete { 0x0001_0000 } else { 0 }
+            | if directory { 0 } else { 0x8000_0000 };
+        // SAFETY: NUL-terminated name, valid transaction and null optional inputs.
+        let raw = unsafe {
+            CreateFileTransactedW(
+                name.as_ptr(),
+                access,
+                FILE_SHARE_READ,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        0
+                    },
+                std::ptr::null_mut(),
+                owner.transaction.as_raw_handle() as HANDLE,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::new(
+                io::Error::last_os_error().kind(),
+                format!(
+                    "Move requires an NTFS transaction guard: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        // SAFETY: raw is a new valid owned file handle, closed exactly once.
+        let file = unsafe { File::from_raw_handle(raw) };
+        let metadata = file.metadata()?;
+        if is_reparse(&metadata) || metadata.is_dir() != directory || identity(&file)? != *expected
+        {
+            return Err(io::Error::other(
+                "transaction cleanup identity/type mismatch",
+            ));
+        }
+        owner.file = Some(file);
+        Ok(owner)
+    }
+    pub fn file(&self) -> io::Result<&File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("cleanup owner already closed"))
+    }
+    pub fn prepare_removal(&mut self, expected: &Identity) -> io::Result<()> {
+        remove_owned(self.file()?, expected)?;
+        self.removal_prepared = true;
+        Ok(())
+    }
+    pub fn commit_removal(mut self) -> io::Result<()> {
+        if !self.removal_prepared {
+            return Err(io::Error::other("removal must be prepared before commit"));
+        }
+        drop(self.file.take());
+        // SAFETY: valid transaction, with every transacted file handle closed.
+        if unsafe { CommitTransaction(self.transaction.as_raw_handle() as HANDLE) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+impl Drop for CleanupOwner {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.finished {
+            // SAFETY: transaction handle remains valid until this Drop returns.
+            if unsafe { RollbackTransaction(self.transaction.as_raw_handle() as HANDLE) } == 0 {
+                eprintln!(
+                    "vartacopy: cannot roll back Move guard: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+/// Read an ADS while the base source is exclusively guarded against writers.
+pub fn open_cleanup_stream(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// Delete only the object owned by this handle. Windows rejects nonempty
+/// directories and readonly files; no path traversal or recursive delete occurs.
+fn remove_owned(file: &File, expected: &Identity) -> io::Result<()> {
+    if is_reparse(&file.metadata()?) || identity(file)? != *expected {
+        return Err(io::Error::other("cleanup identity changed"));
+    }
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: valid DELETE-access handle and correctly sized immutable input.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as HANDLE,
+            FileDispositionInfo,
+            (&info as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Open an existing directory without following its final reparse point.
 /// Denying DELETE sharing pins its name while descendants are accessed.
 pub fn open_directory(path: &Path, write_attributes: bool) -> io::Result<File> {
@@ -247,6 +460,99 @@ pub fn identity(file: &File) -> io::Result<Identity> {
         volume_serial: info.VolumeSerialNumber,
         file_id: info.FileId.Identifier,
     })
+}
+
+/// Read-only reconciliation of a missing source name. A live identity may have
+/// been renamed and must never be treated as removed, or deleted through this
+/// lookup. Only local drive-letter paths are supported; other namespaces and
+/// any lookup/volume-verification failure must be handled as unresolved.
+pub fn identity_exists_on_source_volume(source: &Path, expected: &Identity) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::{Component, Prefix};
+    let drive = match source.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) if source.is_absolute() => drive,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Move identity reconciliation requires a local drive-letter source path",
+                ));
+            }
+        },
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Move identity reconciliation requires an absolute local source path",
+            ));
+        }
+    };
+    let root = wide(OsStr::new(&format!("{}:\\", char::from(drive))))?;
+    let mut volume = vec![0u16; 64];
+    // SAFETY: root is NUL-terminated and volume has the advertised capacity.
+    if unsafe {
+        GetVolumeNameForVolumeMountPointW(root.as_ptr(), volume.as_mut_ptr(), volume.len() as u32)
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let length = volume
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or_else(|| io::Error::other("unterminated volume GUID path"))?;
+    if length == 0 || volume[length - 1] != u16::from(b'\\') {
+        return Err(io::Error::other("invalid volume GUID path"));
+    }
+    let root_path = PathBuf::from(OsString::from_wide(&volume[..length]));
+    let root_guard = open_directory(&root_path, false)?;
+    if identity(&root_guard)?.volume_serial != expected.volume_serial {
+        return Err(io::Error::other(
+            "source volume identity changed; cleanup unresolved",
+        ));
+    }
+    // CreateFile interprets a GUID name without the trailing slash as a raw
+    // volume handle. Resolve once to the GUID so drive-letter reassignment
+    // cannot redirect the ID lookup after checking the recorded volume.
+    let volume_path = PathBuf::from(OsString::from_wide(&volume[..length - 1]));
+    let volume_guard = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(volume_path)?;
+    let descriptor = FILE_ID_DESCRIPTOR {
+        dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
+        Type: ExtendedFileIdType,
+        Anonymous: FILE_ID_DESCRIPTOR_0 {
+            ExtendedFileId: FILE_ID_128 {
+                Identifier: expected.file_id,
+            },
+        },
+    };
+    // SAFETY: valid volume handle and matching descriptor layout; no data,
+    // modification or DELETE access is requested on the located object.
+    let raw = unsafe {
+        OpenFileById(
+            volume_guard.as_raw_handle() as HANDLE,
+            &descriptor,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        // An absent ID has a specific native result. Unsupported, access denied,
+        // invalid parameter and other failures are not evidence of removal.
+        if error.raw_os_error() == Some(2) {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    // SAFETY: successful newly owned handle is closed exactly once by File.
+    let found = unsafe { File::from_raw_handle(raw) };
+    if identity(&found)? != *expected {
+        return Err(io::Error::other("source ID lookup identity mismatch"));
+    }
+    Ok(true)
 }
 
 pub fn stream_path(base: &Path, suffix: &OsStr) -> PathBuf {

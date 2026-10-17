@@ -81,6 +81,106 @@ fn render(app: &mut App, size: [f32; 2], key: Option<egui::Key>) -> Vec<(NodeId,
     output.drop_without_applying_deltas();
     nodes
 }
+
+#[test]
+fn move_form_has_named_choice_and_submits_persisted_move_without_changing_copy_drafts() {
+    let (root, mut app) = fixture();
+    assert_eq!(app.operation, OperationKind::Copy);
+    app.source.set(root.path().join("source"));
+    app.destination.set(root.path().join("dest"));
+    app.open_form();
+    app.operation = OperationKind::Move;
+    let nodes = render(&mut app, [540.0, 640.0], None);
+    let radios: Vec<_> = nodes
+        .iter()
+        .filter(|(_, n)| n.role() == Role::RadioButton)
+        .map(|(_, n)| n.label())
+        .collect();
+    assert!(radios.contains(&Some("Копіювати")));
+    assert!(radios.contains(&Some("Перемістити")));
+    assert!(
+        nodes
+            .iter()
+            .any(|(_, n)| n.role() == Role::Button && n.label() == Some("Перемістити"))
+    );
+    app.submit(false);
+    update(&mut app, |s| !s.planning && s.queue.len() == 2);
+    assert_eq!(app.state.queue[0].operation, OperationKind::Copy);
+    assert_eq!(app.state.queue[1].operation, OperationKind::Move);
+    assert!(root.path().join("source").exists());
+    assert!(!root.path().join("dest/source").exists());
+    app.add_sources(vec![root.path().join("source")]).unwrap();
+    assert_eq!(app.operation, OperationKind::Copy);
+    assert!(app.destination.text.is_empty());
+    let mut job = app.state.queue[1].clone();
+    job.status = "partial".into();
+    assert!(job_status(&job).contains("не завершено"));
+    assert!(!job_status(&job).contains("Переміщено з перевіркою"));
+    job.status = "cancelled".into();
+    assert!(job_status(&job).contains("залишаються"));
+    job.status = "completed".into();
+    assert_eq!(job_status(&job), "Переміщено з перевіркою");
+    job.status = "partial".into();
+    app.close_form();
+    app.selected = Some(job.id);
+    app.state.details = None;
+    app.state.queue.clear();
+    app.state.history = vec![job];
+    let nodes = render(&mut app, [980.0, 640.0], None);
+    assert!(
+        nodes
+            .iter()
+            .any(|(_, n)| n.role() == Role::Button && n.label() == Some("Відновити переміщення"))
+    );
+    assert!(
+        !nodes
+            .iter()
+            .any(|(_, n)| n.role() == Role::Button && n.label() == Some("Перевірити"))
+    );
+    app.client.shutdown();
+    update(&mut app, |s| s.closed);
+}
+
+#[test]
+fn move_summary_separates_destination_copies_from_durable_source_removals() {
+    let (_root, mut app) = fixture();
+    let mut details = app.state.details.as_ref().unwrap().as_ref().clone();
+    details.job.operation = OperationKind::Move;
+    details.job.status = "partial".into();
+    details.job.entry_count = 5;
+    details.entries_committed = 4;
+    details.entries_skipped = 1;
+    details.entries_pending = 3;
+    let summary = job_counts(&details);
+    assert!(summary.contains("у призначенні 4"));
+    assert!(summary.contains("переміщено 1"));
+    assert!(summary.contains("залишилося перемістити 3"));
+    assert!(!summary.contains("Готово 4"));
+    app.state.history = vec![details.job.clone()];
+    app.state.details = Some(Arc::new(details.clone()));
+    let nodes = render(&mut app, [980.0, 640.0], None);
+    assert!(
+        nodes
+            .iter()
+            .any(|(_, node)| node.value() == Some(summary.as_str()))
+    );
+    app.details_open = true;
+    let nodes = render(&mut app, [980.0, 640.0], None);
+    assert!(
+        nodes
+            .iter()
+            .any(|(_, node)| node.value() == Some(summary.as_str()))
+    );
+    assert_eq!(entry_status(EntryState::Committed), "Копію збережено");
+    assert_eq!(phase(Phase::Committed), "Копію файлу збережено");
+    details.job.operation = OperationKind::Copy;
+    assert_eq!(
+        job_counts(&details),
+        "Готово 4 · пропущено 1 · залишилося 3"
+    );
+    app.client.shutdown();
+    update(&mut app, |s| s.closed);
+}
 #[test]
 fn virtual_grid_has_real_rows_cells_and_one_keyboard_focus_target() {
     let (_root, mut app) = fixture();

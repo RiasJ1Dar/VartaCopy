@@ -13,6 +13,11 @@ impl App {
             ui.set_width((ctx.content_rect().width() - 64.0).clamp(280.0, 560.0));
             ui.label(RichText::new("Нова операція").size(20.0).strong());
             ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Дія:");
+                ui.radio_value(&mut self.operation, OperationKind::Copy, "Копіювати");
+                ui.radio_value(&mut self.operation, OperationKind::Move, "Перемістити");
+            });
             egui::ScrollArea::vertical()
                 .id_salt("operation_fields")
                 .max_height((ctx.content_rect().height() - 130.0).max(64.0))
@@ -90,9 +95,10 @@ impl App {
                         );
                     });
                     ui.label(
-                        RichText::new(
-                            "Копія створюється всередині призначення. Перевірка BLAKE3 увімкнена.",
-                        )
+                        RichText::new(match self.operation {
+                            OperationKind::Copy => "Копія створюється всередині призначення. Перевірка BLAKE3 увімкнена.",
+                            OperationKind::Move => "Джерело видаляється лише після перевірки копії. При зупинці збережені файли залишаються для відновлення.",
+                        })
                         .small()
                         .weak(),
                     );
@@ -106,7 +112,7 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Копіювати").selected(true))
+                    .add_enabled(enabled, egui::Button::new(operation_action(self.operation)).selected(true))
                     .clicked()
                 {
                     self.submit(true);
@@ -154,7 +160,12 @@ impl App {
                         .max_height((ctx.content_rect().height() - 110.0).clamp(80.0, 400.0))
                         .show(ui, |ui| {
                             if let Some(job) = self.selected_job() {
-                                ui.label(format!("Операція #{} · {}", job.id, status(&job.status)));
+                                ui.label(format!(
+                                    "{} #{} · {}",
+                                    operation_name(job.operation),
+                                    job.id,
+                                    job_status(&job)
+                                ));
                                 ui.label(job.source.display().to_string());
                                 ui.label(
                                     job.output_root
@@ -169,10 +180,7 @@ impl App {
                                 if let Some(d) =
                                     self.state.details.clone().filter(|d| d.job.id == job.id)
                                 {
-                                    ui.label(format!(
-                                        "Готово {} · пропущено {} · залишилося {}",
-                                        d.entries_committed, d.entries_skipped, d.entries_pending
-                                    ));
+                                    ui.label(job_counts(&d));
                                     for issue in &d.issues {
                                         ui.colored_label(
                                             ui.visuals().error_fg_color,

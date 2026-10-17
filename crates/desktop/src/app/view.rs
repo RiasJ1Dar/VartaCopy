@@ -4,8 +4,9 @@ impl App {
         let running = self.state.active.as_ref().is_some_and(|a| a.id == job.id);
         let selected = self.selected == Some(job.id);
         let caption = format!(
-            "#{} · {}",
+            "#{} · {} · {}",
             job.id,
+            operation_name(job.operation),
             short_status(if running { "running" } else { &job.status })
         );
         let row = ui
@@ -205,7 +206,13 @@ impl App {
         let active = self.state.active.clone().filter(|a| a.id == job.id);
         ui.add(
             egui::Label::new(
-                RichText::new(format!("{} · #{}", name(&job.source), job.id)).strong(),
+                RichText::new(format!(
+                    "{} · {} · #{}",
+                    operation_name(job.operation),
+                    name(&job.source),
+                    job.id
+                ))
+                .strong(),
             )
             .truncate(),
         );
@@ -247,15 +254,9 @@ impl App {
                     .text(text),
             );
         } else {
-            ui.label(status(&job.status));
+            ui.label(job_status(job));
             if let Some(d) = self.state.details.as_ref().filter(|d| d.job.id == job.id) {
-                ui.label(
-                    RichText::new(format!(
-                        "Готово {} · пропущено {} · залишилося {}",
-                        d.entries_committed, d.entries_skipped, d.entries_pending
-                    ))
-                    .weak(),
-                );
+                ui.label(RichText::new(job_counts(d)).weak());
             }
         }
         if let Some(e) = &job.last_error
@@ -280,20 +281,26 @@ impl App {
                     }
                 });
             } else {
-                if matches!(
+                let resumable = matches!(
                     job.status.as_str(),
                     "queued" | "paused" | "interrupted" | "cancelled"
-                ) && ui
-                    .button(if job.status == "queued" {
-                        "Запустити"
-                    } else {
-                        "Відновити"
-                    })
-                    .clicked()
+                ) || (job.operation == OperationKind::Move
+                    && job.status == "partial");
+                if resumable
+                    && ui
+                        .button(if job.status == "queued" {
+                            "Запустити"
+                        } else if job.operation == OperationKind::Move {
+                            "Відновити переміщення"
+                        } else {
+                            "Відновити"
+                        })
+                        .clicked()
                 {
                     self.command(Command::Resume(job.id));
                 }
-                if matches!(job.status.as_str(), "completed" | "partial")
+                if job.operation == OperationKind::Copy
+                    && matches!(job.status.as_str(), "completed" | "partial")
                     && ui.button("Перевірити").clicked()
                 {
                     self.command(Command::Recheck(job.id));
@@ -326,14 +333,14 @@ impl App {
                 }
                 if active.is_none() && job.status == "queued" {
                     if ui.button("Вище в черзі").clicked() {
-                        self.command(Command::Move {
+                        self.command(Command::Reorder {
                             id: job.id,
                             earlier: true,
                         });
                         ui.close();
                     }
                     if ui.button("Нижче в черзі").clicked() {
-                        self.command(Command::Move {
+                        self.command(Command::Reorder {
                             id: job.id,
                             earlier: false,
                         });

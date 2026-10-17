@@ -33,6 +33,7 @@ impl App {
         // a new shell/drop request; an open manual draft keeps the user's choice.
         if !self.new_operation {
             self.destination = PathInput::default();
+            self.operation = OperationKind::Copy;
         }
         self.source.set(sources.remove(0));
         self.additional_sources = sources;
@@ -43,6 +44,7 @@ impl App {
         self.pending_focus = None;
         if !self.new_operation {
             self.return_focus = self.context.memory(|m| m.focused());
+            self.operation = OperationKind::Copy;
         }
         self.new_operation = true;
         self.form_focus = true;

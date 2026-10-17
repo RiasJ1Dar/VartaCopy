@@ -13,7 +13,7 @@ use std::{
 use vartacopy_core::{
     Conflict, Error, Result,
     control::Control,
-    journal::{EntryPage, Job, JobDetails, Journal},
+    journal::{EntryPage, Job, JobDetails, Journal, OperationKind},
     planner::{self, OperationPlan, ReparsePolicy, ScanOptions},
     recovery::{self, Progress, RunReport},
 };
@@ -48,6 +48,7 @@ pub enum Command {
         destination: PathBuf,
         conflict: Conflict,
         reparse: ReparsePolicy,
+        operation: OperationKind,
         start: bool,
     },
     SubmitMany {
@@ -55,13 +56,14 @@ pub enum Command {
         destination: PathBuf,
         conflict: Conflict,
         reparse: ReparsePolicy,
+        operation: OperationKind,
         start: bool,
     },
     RunQueue(bool),
     Resume(i64),
     Pause(i64),
     Cancel(i64),
-    Move {
+    Reorder {
         id: i64,
         earlier: bool,
     },
@@ -85,8 +87,14 @@ enum Message {
     Wake,
     ViewTick,
     Command(Command),
-    Planned(Result<Vec<OperationPlan>>, Conflict, bool),
+    Planned(Result<Vec<OperationPlan>>, Conflict, OperationKind, bool),
     Finished(i64, Result<RunReport>),
+}
+
+#[derive(Clone, Copy)]
+enum StopRequest {
+    Pause,
+    Cancel,
 }
 
 pub struct Client {
@@ -240,6 +248,7 @@ fn scan_request(
     destination: PathBuf,
     conflict: Conflict,
     reparse: ReparsePolicy,
+    operation: OperationKind,
     start: bool,
     planning: &mut Option<thread::JoinHandle<()>>,
     scan_cancel: &Arc<AtomicBool>,
@@ -287,7 +296,7 @@ fn scan_request(
                 Ok(plans)
             });
             let result = outcome.unwrap_or_else(|_| Err(Error::Journal("scanner panicked".into())));
-            if let Err(e) = tx.send(Message::Planned(result, conflict, start)) {
+            if let Err(e) = tx.send(Message::Planned(result, conflict, operation, start)) {
                 eprintln!("VartaCopy: scan result undelivered: {e}");
             }
         });
@@ -346,7 +355,7 @@ fn actor(
     let mut planning: Option<thread::JoinHandle<()>> = None;
     let mut transfer: Option<thread::JoinHandle<()>> = None;
     let mut active_id = None;
-    let mut cancelled = false;
+    let mut stop_request = None;
     loop {
         if shutdown.load(Ordering::Acquire) {
             automatic = false;
@@ -371,6 +380,7 @@ fn actor(
                         destination,
                         conflict,
                         reparse,
+                        operation,
                         start,
                     }) => {
                         scan_request(
@@ -378,6 +388,7 @@ fn actor(
                             destination,
                             conflict,
                             reparse,
+                            operation,
                             start,
                             &mut planning,
                             scan_cancel,
@@ -391,6 +402,7 @@ fn actor(
                         destination,
                         conflict,
                         reparse,
+                        operation,
                         start,
                     }) => {
                         scan_request(
@@ -398,6 +410,7 @@ fn actor(
                             destination,
                             conflict,
                             reparse,
+                            operation,
                             start,
                             &mut planning,
                             scan_cancel,
@@ -406,7 +419,7 @@ fn actor(
                             &sender,
                         )?;
                     }
-                    Message::Planned(result, conflict, start) => {
+                    Message::Planned(result, conflict, operation, start) => {
                         if let Some(handle) = planning.take() {
                             handle
                                 .join()
@@ -436,7 +449,7 @@ fn actor(
                             }
                         }
                         // A queued acknowledgement is visible only after this durable transaction.
-                        journal.enqueue_many(&plans, conflict)?;
+                        journal.enqueue_many_with_operation(&plans, conflict, operation)?;
                         automatic |= start;
                         refresh(&journal, state)?;
                     }
@@ -483,6 +496,7 @@ fn actor(
                     Message::Command(Command::Pause(id)) => {
                         automatic = false;
                         if active_id == Some(id) {
+                            stop_request = Some(StopRequest::Pause);
                             if let Some(control) = active_control
                                 .lock()
                                 .map_err(|_| Error::Journal("transfer control poisoned".into()))?
@@ -502,7 +516,7 @@ fn actor(
                     }
                     Message::Command(Command::Cancel(id)) => {
                         if active_id == Some(id) {
-                            cancelled = true;
+                            stop_request = Some(StopRequest::Cancel);
                             if let Some(control) = active_control
                                 .lock()
                                 .map_err(|_| Error::Journal("transfer control poisoned".into()))?
@@ -520,7 +534,7 @@ fn actor(
                             refresh(&journal, state)?;
                         }
                     }
-                    Message::Command(Command::Move { id, earlier }) => {
+                    Message::Command(Command::Reorder { id, earlier }) => {
                         journal.move_queued(id, earlier)?;
                         refresh(&journal, state)?;
                     }
@@ -542,9 +556,20 @@ fn actor(
                         edit(state, |s| s.active = None)?;
                         match result {
                             Ok(mut report) => {
-                                if cancelled && report.status == "paused" {
-                                    report.status = "cancelled".into();
-                                    journal.set_job_status(id,"cancelled",Some("Stopped; owned partial files are retained for recovery"))?;
+                                let normalized = match (stop_request, report.status.as_str()) {
+                                    (Some(StopRequest::Pause), "cancelled") => Some((
+                                        "paused",
+                                        "Paused by user; verified outputs and remaining sources are retained for resume",
+                                    )),
+                                    (Some(StopRequest::Cancel), "paused") => Some((
+                                        "cancelled",
+                                        "Stopped by user; verified outputs and remaining sources are retained for recovery",
+                                    )),
+                                    _ => None,
+                                };
+                                if let Some((status, message)) = normalized {
+                                    journal.set_job_status(id, status, Some(message))?;
+                                    report.status = status.into();
                                 }
                                 edit(state, |s| s.last_report = Some(Arc::new(report)))?;
                             }
@@ -553,7 +578,7 @@ fn actor(
                                 error(state, e);
                             }
                         }
-                        cancelled = false;
+                        stop_request = None;
                         refresh(&journal, state)?;
                     }
                 }
@@ -677,6 +702,7 @@ mod tests {
                 destination,
                 conflict: Conflict::Error,
                 reparse: ReparsePolicy::Reject,
+                operation: OperationKind::Copy,
                 start: false,
             })
             .unwrap();
@@ -923,6 +949,7 @@ mod tests {
                 destination: dest,
                 conflict: Conflict::Error,
                 reparse: ReparsePolicy::Reject,
+                operation: OperationKind::Copy,
                 start: true,
             })
             .unwrap();
@@ -971,6 +998,7 @@ mod tests {
                 destination: dest.clone(),
                 conflict: Conflict::Error,
                 reparse: ReparsePolicy::Reject,
+                operation: OperationKind::Copy,
                 start: true,
             })
             .unwrap();
@@ -985,6 +1013,7 @@ mod tests {
                 destination: dest.clone(),
                 conflict: Conflict::Error,
                 reparse: ReparsePolicy::Reject,
+                operation: OperationKind::Copy,
                 start: true,
             })
             .unwrap();
@@ -996,6 +1025,237 @@ mod tests {
         assert!(done.errors.is_empty(), "{:?}", done.errors);
         assert_eq!(fs::read(dest.join("a")).unwrap(), b"one");
         assert_eq!(fs::read(dest.join("b")).unwrap(), b"two");
+        client.shutdown();
+        wait(&client, |s| s.closed);
+    }
+
+    #[test]
+    fn move_planning_reorder_and_restart_preserve_operation_alongside_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("jobs.sqlite");
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let a = root.path().join("move-a");
+        let b = root.path().join("move-b");
+        let copy = root.path().join("copy");
+        for source in [&a, &b, &copy] {
+            fs::write(source, b"durable operation").unwrap();
+        }
+        let client = Client::start(path.clone()).unwrap();
+        wait(&client, |s| s.ready);
+        client
+            .send(Command::Submit {
+                source: a.clone(),
+                destination: dest.clone(),
+                conflict: Conflict::Error,
+                reparse: ReparsePolicy::Reject,
+                operation: OperationKind::Move,
+                start: false,
+            })
+            .unwrap();
+        wait(&client, |s| !s.planning && s.queue.len() == 1);
+        client
+            .send(Command::SubmitMany {
+                sources: vec![b.clone()],
+                destination: dest.clone(),
+                conflict: Conflict::Error,
+                reparse: ReparsePolicy::Reject,
+                operation: OperationKind::Move,
+                start: false,
+            })
+            .unwrap();
+        wait(&client, |s| !s.planning && s.queue.len() == 2);
+        submit(&client, copy.clone(), dest.clone());
+        let queued = wait(&client, |s| !s.planning && s.queue.len() == 3);
+        assert_eq!(
+            queued.queue.iter().map(|j| j.operation).collect::<Vec<_>>(),
+            [
+                OperationKind::Move,
+                OperationKind::Move,
+                OperationKind::Copy
+            ]
+        );
+        let copy_id = queued.queue[2].id;
+        client
+            .send(Command::Reorder {
+                id: copy_id,
+                earlier: true,
+            })
+            .unwrap();
+        wait(&client, |s| s.queue[1].id == copy_id);
+        client.shutdown();
+        wait(&client, |s| s.closed);
+        drop(client);
+        let client = Client::start(path).unwrap();
+        let restored = wait(&client, |s| s.ready);
+        assert_eq!(
+            restored
+                .queue
+                .iter()
+                .map(|j| j.operation)
+                .collect::<Vec<_>>(),
+            [
+                OperationKind::Move,
+                OperationKind::Copy,
+                OperationKind::Move
+            ]
+        );
+        client.send(Command::RunQueue(true)).unwrap();
+        let done = wait(&client, |s| {
+            !s.automatic && s.active.is_none() && s.history.len() == 3 && s.queue.is_empty()
+        });
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        for job in &done.history {
+            assert_eq!(
+                fs::read(dest.join(job.source.file_name().unwrap())).unwrap(),
+                b"durable operation"
+            );
+            match (job.operation, job.status.as_str()) {
+                (OperationKind::Move, "completed") => assert!(!job.source.exists()),
+                (OperationKind::Move, "partial") => assert!(job.source.exists()),
+                (OperationKind::Copy, "completed") => assert!(job.source.exists()),
+                _ => panic!("unexpected durable outcome: {job:?}"),
+            }
+        }
+        client.shutdown();
+        wait(&client, |s| s.closed);
+    }
+
+    #[test]
+    fn cleanup_stop_intent_distinguishes_user_pause_cancel_and_shutdown_and_resumes() {
+        for (request, expected) in [
+            ("pause", "paused"),
+            ("cancel", "cancelled"),
+            ("shutdown", "cancelled"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("move");
+            let dest = root.path().join("dest");
+            let path = root.path().join("jobs.sqlite");
+            fs::create_dir(&dest).unwrap();
+            fs::write(&source, b"stopped move").unwrap();
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (go_tx, go_rx) = mpsc::sync_channel(1);
+            let go_rx = Mutex::new(go_rx);
+            let once = AtomicBool::new(false);
+            let hook: ProgressHook = Arc::new(move |event| {
+                if event.phase == recovery::Phase::CleanupIntent
+                    && !once.swap(true, Ordering::SeqCst)
+                {
+                    ready_tx.send(()).unwrap();
+                    go_rx.lock().unwrap().recv().unwrap();
+                }
+            });
+            let client = Client::start_with_hook(path.clone(), Some(hook)).unwrap();
+            wait(&client, |s| s.ready);
+            client
+                .send(Command::Submit {
+                    source: source.clone(),
+                    destination: dest.clone(),
+                    conflict: Conflict::Error,
+                    reparse: ReparsePolicy::Reject,
+                    operation: OperationKind::Move,
+                    start: true,
+                })
+                .unwrap();
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let id = client.snapshot().unwrap().active.unwrap().id;
+            match request {
+                "pause" => client.send(Command::Pause(id)).unwrap(),
+                "cancel" => client.send(Command::Cancel(id)).unwrap(),
+                "shutdown" => client.shutdown(),
+                _ => unreachable!(),
+            }
+            if request != "shutdown" {
+                wait(&client, |s| {
+                    s.active.as_ref().is_some_and(|a| a.request == request)
+                });
+            }
+            go_tx.send(()).unwrap();
+            let done = wait(&client, |s| {
+                s.active.is_none() && s.history.iter().any(|j| j.id == id && j.status == expected)
+            });
+            let report = done.last_report.unwrap();
+            assert_eq!(report.status, expected, "{request}");
+            assert_eq!(report.entries_pending, 1, "{request}");
+            assert_eq!(fs::read(&source).unwrap(), b"stopped move");
+            assert_eq!(fs::read(dest.join("move")).unwrap(), b"stopped move");
+            client.shutdown();
+            wait(&client, |s| s.closed);
+            drop(client);
+            {
+                let journal = Journal::open(&path).unwrap();
+                assert_eq!(journal.job(id).unwrap().status, expected, "{request}");
+                assert_eq!(journal.details(id, 32, 0).unwrap().entries_pending, 1);
+            }
+            let client = Client::start(path).unwrap();
+            wait(&client, |s| s.ready);
+            client.send(Command::Resume(id)).unwrap();
+            let resumed = wait(&client, |s| {
+                s.active.is_none()
+                    && s.history
+                        .iter()
+                        .any(|j| j.id == id && j.status == "completed")
+            });
+            assert!(resumed.errors.is_empty(), "{request}: {:?}", resumed.errors);
+            assert!(!source.exists(), "{request}");
+            assert_eq!(fs::read(dest.join("move")).unwrap(), b"stopped move");
+            client.shutdown();
+            wait(&client, |s| s.closed);
+        }
+    }
+
+    #[test]
+    fn explicit_resume_of_partial_move_finishes_cleanup_after_source_lock_is_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("move-locked");
+        let destination = root.path().join("dest");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, b"verified partial move").unwrap();
+        // Permit source reads and copy verification, but deny cleanup DELETE access.
+        let source_lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&source)
+            .unwrap();
+        let client = Client::start(root.path().join("jobs.sqlite")).unwrap();
+        wait(&client, |s| s.ready);
+        client
+            .send(Command::Submit {
+                source: source.clone(),
+                destination: destination.clone(),
+                conflict: Conflict::Error,
+                reparse: ReparsePolicy::Reject,
+                operation: OperationKind::Move,
+                start: true,
+            })
+            .unwrap();
+        let partial = wait(&client, |s| {
+            s.active.is_none() && s.history.first().is_some_and(|j| j.status == "partial")
+        });
+        let id = partial.history[0].id;
+        assert_eq!(partial.last_report.unwrap().entries_pending, 1);
+        assert_eq!(fs::read(&source).unwrap(), b"verified partial move");
+        assert_eq!(
+            fs::read(destination.join("move-locked")).unwrap(),
+            b"verified partial move"
+        );
+        drop(source_lock);
+        client.send(Command::Resume(id)).unwrap();
+        let completed = wait(&client, |s| {
+            s.active.is_none()
+                && s.history
+                    .first()
+                    .is_some_and(|j| j.id == id && j.status == "completed")
+        });
+        assert!(completed.errors.is_empty(), "{:?}", completed.errors);
+        assert_eq!(completed.last_report.unwrap().entries_pending, 0);
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destination.join("move-locked")).unwrap(),
+            b"verified partial move"
+        );
         client.shutdown();
         wait(&client, |s| s.closed);
     }

@@ -304,7 +304,7 @@ fn migrates_version_one_atomically_and_recovers_running_jobs() {
         journal.set_job_status(id, "running", None).unwrap();
         journal
             .db
-            .execute_batch("ALTER TABLE jobs DROP COLUMN queue_position; PRAGMA user_version=1;")
+            .execute_batch("DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; ALTER TABLE jobs DROP COLUMN queue_position; PRAGMA user_version=1;")
             .unwrap();
         journal.flush().unwrap();
     }
@@ -324,6 +324,30 @@ fn migrates_version_one_atomically_and_recovers_running_jobs() {
     journal.move_queued(id, false).unwrap();
     assert_eq!(journal.queue(1, 0).unwrap()[0].id, second);
     assert!(journal.queue(257, 0).is_err());
+}
+
+#[test]
+fn migrates_version_two_jobs_to_copy_and_persists_move() {
+    let (root, plan) = fixture();
+    let path = root.path().join("v2.sqlite");
+    let id;
+    {
+        let mut journal = Journal::open(&path).unwrap();
+        id = journal.enqueue(&plan, Conflict::Error).unwrap();
+        journal.db.execute_batch("DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; PRAGMA user_version=2;").unwrap();
+        journal.flush().unwrap();
+    }
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.job(id).unwrap().operation, OperationKind::Copy);
+    let moved = journal
+        .enqueue_with_operation(&plan, Conflict::KeepBoth, OperationKind::Move)
+        .unwrap();
+    journal.flush().unwrap();
+    drop(journal);
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.job(moved).unwrap().operation, OperationKind::Move);
+    assert_eq!(journal.job(id).unwrap().operation, OperationKind::Copy);
+    assert!(journal.cleanup_state(moved, 0).unwrap().is_none());
 }
 
 #[test]
