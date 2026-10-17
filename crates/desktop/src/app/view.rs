@@ -150,6 +150,10 @@ impl App {
         }
     }
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
+        if self.compact {
+            self.compact_toolbar(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             let new = ui
                 .add_enabled(
@@ -181,6 +185,13 @@ impl App {
             {
                 self.command(Command::RunQueue(!self.state.automatic));
             }
+            let compact = ui.button("Компактний вигляд");
+            if std::mem::take(&mut self.mode_focus_pending) {
+                compact.request_focus();
+            }
+            if compact.clicked() {
+                self.set_compact(true);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button("Меню", |ui| {
                     if ui.button("Черга та історія…").clicked() {
@@ -204,6 +215,10 @@ impl App {
     }
     pub(super) fn operation(&mut self, ui: &mut egui::Ui, job: &Job) {
         let active = self.state.active.clone().filter(|a| a.id == job.id);
+        if self.compact {
+            self.compact_summary(ui, job, active.as_ref());
+            return;
+        }
         ui.add(
             egui::Label::new(
                 RichText::new(format!(
@@ -216,7 +231,7 @@ impl App {
             )
             .truncate(),
         );
-        if ui.available_height() >= 330.0 {
+        if self.compact || ui.available_height() >= 330.0 {
             path_line(ui, "З:", &job.source);
             path_line(
                 ui,
@@ -237,17 +252,20 @@ impl App {
             } else {
                 ui.label("Підготовка відновлення…");
             }
+            if let Some(path) = a.current_source.as_ref() {
+                path_line(ui, "Файл:", path);
+            }
             let (fraction, text) = a
                 .progress
                 .as_ref()
-                .filter(|p| p.total > 0)
+                .filter(|p| p.total > 0 && p.stream_index.is_some())
                 .map(|p| {
                     (
                         (p.bytes as f64 / p.total as f64).clamp(0.0, 1.0) as f32,
                         format!("Поточний потік: {} / {}", bytes(p.bytes), bytes(p.total)),
                     )
                 })
-                .unwrap_or((0.0, "Обробка елементів…".into()));
+                .unwrap_or((0.0, "Розмір поточного потоку: —".into()));
             ui.add(
                 egui::ProgressBar::new(fraction)
                     .desired_width(ui.available_width())
@@ -259,6 +277,7 @@ impl App {
                 ui.label(RichText::new(job_counts(d)).weak());
             }
         }
+        self.transfer_graph(ui, job, active.as_ref());
         if let Some(e) = &job.last_error
             && ui
                 .add(
@@ -270,7 +289,17 @@ impl App {
         {
             self.details_open = true;
         }
-        ui.horizontal(|ui| {
+        if !self.compact {
+            self.operation_controls(ui, job, active.as_ref());
+        }
+    }
+    pub(super) fn operation_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        job: &Job,
+        active: Option<&crate::worker::Active>,
+    ) {
+        ui.horizontal_wrapped(|ui| {
             if let Some(a) = active.as_ref() {
                 ui.add_enabled_ui(a.request.is_empty(), |ui| {
                     if ui.button("Пауза").clicked() {

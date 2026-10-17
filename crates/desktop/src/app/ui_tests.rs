@@ -49,6 +49,13 @@ fn update(app: &mut App, condition: impl Fn(&State) -> bool) {
     }
 }
 fn render(app: &mut App, size: [f32; 2], key: Option<egui::Key>) -> Vec<(NodeId, Node)> {
+    render_with_commands(app, size, key).0
+}
+fn render_with_commands(
+    app: &mut App,
+    size: [f32; 2],
+    key: Option<egui::Key>,
+) -> (Vec<(NodeId, Node)>, Vec<egui::ViewportCommand>) {
     let input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -78,8 +85,138 @@ fn render(app: &mut App, size: [f32; 2], key: Option<egui::Key>) -> Vec<(NodeId,
         .take()
         .unwrap()
         .nodes;
+    let commands = output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map(|v| v.commands.clone())
+        .unwrap_or_default();
     output.drop_without_applying_deltas();
-    nodes
+    (nodes, commands)
+}
+
+#[test]
+fn compact_transfer_controls_graph_paths_and_user_only_resize_are_accessible() {
+    let (root, mut app) = fixture();
+    let job = app.state.history[0].clone();
+    let event = vartacopy_core::recovery::Progress {
+        job_id: job.id,
+        entry: 1,
+        phase: Phase::BlockWritten,
+        bytes: 1024,
+        total: 8192,
+        fresh_written_delta: 1024,
+        stream_index: Some(0),
+    };
+    let mut meter = crate::telemetry::Meter::new(42);
+    meter.observe(Duration::from_secs(1), &event);
+    app.state.active = Some(crate::worker::Active {
+        id: job.id,
+        job: job.clone(),
+        entry_count: job.entry_count,
+        progress: Some(event),
+        request: "",
+        run_started: Instant::now() - Duration::from_secs(1),
+        telemetry: meter.snapshot(),
+        current_source: Some(root.path().join("source/file-000")),
+    });
+    app.set_compact(true);
+    let (_, commands) = render_with_commands(&mut app, [760.0, 300.0], None);
+    assert!(commands.iter().any(|command| matches!(command, egui::ViewportCommand::MinInnerSize(size) if size.x == 560.0 && size.y == 280.0)));
+    for size in [[560.0, 280.0], [760.0, 300.0]] {
+        let (nodes, commands) = render_with_commands(&mut app, size, None);
+        assert!(!commands.iter().any(|c| matches!(
+            c,
+            egui::ViewportCommand::InnerSize(_) | egui::ViewportCommand::MinInnerSize(_)
+        )));
+        for label in ["Пауза", "Зупинити", "Деталі", "Черга", "Повний вигляд"]
+        {
+            let (_, node) = nodes
+                .iter()
+                .find(|(_, n)| n.label() == Some(label))
+                .unwrap();
+            let bounds = node.bounds().unwrap();
+            assert!(
+                bounds.x0 >= 0.0
+                    && bounds.x1 <= f64::from(size[0])
+                    && bounds.y0 >= 0.0
+                    && bounds.y1 <= f64::from(size[1]),
+                "{label}: {bounds:?}"
+            );
+        }
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == Role::Image
+                && node
+                    .label()
+                    .is_some_and(|s| s.contains("Історія швидкості запису"))
+        }));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.value()
+                .is_some_and(|s| s.starts_with("Швидкість запису:"))
+        }));
+        assert!(!nodes.iter().any(|(_, n)| n.role() == Role::Grid));
+    }
+    render(&mut app, [760.0, 300.0], Some(egui::Key::F6));
+    assert!(app.jobs_open);
+    render(&mut app, [540.0, 640.0], Some(egui::Key::F6));
+    assert!(app.transfer_details);
+    app.transfer_details = false;
+    let finished = app.state.active.take().unwrap();
+    app.state.last_transfer = Some(finished.clone());
+    let nodes = render(&mut app, [760.0, 300.0], None);
+    assert!(
+        nodes
+            .iter()
+            .any(|(_, n)| n.value() == Some("Швидкість запису: — МіБ/с"))
+    );
+    assert!(nodes.iter().any(|(_, n)| {
+        n.value()
+            .is_some_and(|value| value.starts_with("За запуск:"))
+    }));
+    let mut older = job.clone();
+    older.id = 999;
+    app.selected = Some(older.id);
+    app.state.details = None;
+    app.state.history = vec![older];
+    app.state.active = Some(finished.clone());
+    let nodes = render(&mut app, [760.0, 300.0], None);
+    assert!(
+        nodes
+            .iter()
+            .any(|(_, n)| n.value() == Some("Історія швидкості цього запуску недоступна"))
+    );
+    assert!(!nodes.iter().any(|(_, n)| {
+        n.value()
+            .is_some_and(|value| value.starts_with("За запуск:"))
+    }));
+    app.state.active = Some(finished);
+    app.state.history = vec![job.clone()];
+    app.selected = Some(job.id);
+    app.context.all_styles_mut(|style| {
+        for font in style.text_styles.values_mut() {
+            font.size *= 1.5;
+        }
+    });
+    let nodes = render(&mut app, [560.0, 440.0], None);
+    for label in ["Пауза", "Зупинити", "Повний вигляд"] {
+        let (_, node) = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(label))
+            .unwrap();
+        assert!(
+            node.bounds().unwrap().y1 <= 440.0,
+            "large-font {label}: {:?}",
+            node.bounds()
+        );
+    }
+    app.set_compact(false);
+    let (_, commands) = render_with_commands(&mut app, [980.0, 640.0], None);
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::MinInnerSize(size) if size.x == 760.0))
+    );
+    app.client.shutdown();
+    update(&mut app, |s| s.closed);
 }
 
 #[test]

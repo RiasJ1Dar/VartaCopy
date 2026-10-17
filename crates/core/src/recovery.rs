@@ -37,13 +37,20 @@ pub enum Phase {
     CleanupCommitted,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Progress {
     pub job_id: i64,
     pub entry: usize,
     pub phase: Phase,
     pub bytes: u64,
     pub total: u64,
+    /// Successfully written bytes in this event, never reused/read-back bytes.
+    /// This counts application writes, not a promise of durable media flush.
+    #[serde(default)]
+    pub fresh_written_delta: u64,
+    /// Index in the entry's recorded stream manifest for stream-local events.
+    #[serde(default)]
+    pub stream_index: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +94,8 @@ fn notify(
         phase,
         bytes,
         total,
+        fresh_written_delta: 0,
+        stream_index: None,
     })
 }
 
@@ -163,13 +172,17 @@ fn verify_recorded(
                 ));
             }
             bytes += chunk.length as u64;
-            notify(
+            notify_stream(
                 observer,
-                job,
-                entry.ordinal,
+                &StreamTask {
+                    job,
+                    ordinal: entry.ordinal,
+                    stream_index,
+                    size: stream.size,
+                },
                 Phase::Checking,
                 bytes,
-                stream.size,
+                0,
             )?;
         }
         if bytes != stream.size {
@@ -243,11 +256,29 @@ fn reconcile_published(
 }
 
 /// Validate and reuse complete recorded blocks; truncate only the owned uncommitted tail.
+#[derive(Clone, Copy)]
 struct StreamTask {
     job: i64,
     ordinal: usize,
     stream_index: usize,
     size: u64,
+}
+fn notify_stream(
+    observer: &mut Observer<'_>,
+    task: &StreamTask,
+    phase: Phase,
+    bytes: u64,
+    fresh_written_delta: u64,
+) -> Result<()> {
+    observer(Progress {
+        job_id: task.job,
+        entry: task.ordinal,
+        phase,
+        bytes,
+        total: task.size,
+        fresh_written_delta,
+        stream_index: Some(task.stream_index),
+    })
 }
 fn transfer_stream(
     journal: &mut Journal,
@@ -286,7 +317,7 @@ fn transfer_stream(
             ));
         }
         offset += chunk.length as u64;
-        notify(observer, job, ordinal, Phase::Checking, offset, size)?;
+        notify_stream(observer, &task, Phase::Checking, offset, 0)?;
     }
     let resumed = offset;
     output.set_len(offset)?;
@@ -295,22 +326,20 @@ fn transfer_stream(
         let length = (size - offset).min(CHUNK_BYTES as u64) as usize;
         input.read_exact(&mut source[..length])?;
         output.write_all(&source[..length])?;
-        notify(
+        notify_stream(
             observer,
-            job,
-            ordinal,
+            &task,
             Phase::BlockWritten,
             offset + length as u64,
-            size,
+            length as u64,
         )?;
         output.sync_all()?;
-        notify(
+        notify_stream(
             observer,
-            job,
-            ordinal,
+            &task,
             Phase::BlockFlushed,
             offset + length as u64,
-            size,
+            0,
         )?;
         journal.checkpoint(
             job,
@@ -323,14 +352,7 @@ fn transfer_stream(
             },
         )?;
         offset += length as u64;
-        notify(
-            observer,
-            job,
-            ordinal,
-            Phase::CheckpointCommitted,
-            offset,
-            size,
-        )?;
+        notify_stream(observer, &task, Phase::CheckpointCommitted, offset, 0)?;
     }
     // Independent full readback. Prefix validation alone never marks the final stream verified.
     input.seek(SeekFrom::Start(0))?;
@@ -347,7 +369,7 @@ fn transfer_stream(
             ));
         }
         checked += length as u64;
-        notify(observer, job, ordinal, Phase::Checking, checked, size)?;
+        notify_stream(observer, &task, Phase::Checking, checked, 0)?;
     }
     Ok(resumed)
 }

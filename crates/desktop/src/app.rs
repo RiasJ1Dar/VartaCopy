@@ -1,6 +1,7 @@
 mod dialogs;
 mod navigation;
 mod system_style;
+mod transfer_panel;
 #[cfg(test)]
 mod ui_tests;
 mod view;
@@ -68,6 +69,10 @@ pub struct App {
     conflict: usize,
     skip_links: bool,
     history: bool,
+    compact: bool,
+    transfer_details: bool,
+    expanded_size: Option<egui::Vec2>,
+    mode_focus_pending: bool,
     selected: Option<i64>,
     last_active: Option<i64>,
     newest: Option<i64>,
@@ -186,6 +191,10 @@ impl App {
             conflict: 0,
             skip_links: false,
             history: false,
+            compact: false,
+            transfer_details: false,
+            expanded_size: None,
+            mode_focus_pending: false,
             selected: None,
             last_active: None,
             newest: None,
@@ -501,21 +510,67 @@ impl eframe::App for App {
         }
     }
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if root.available_width() >= 680.0 {
+        if !self.compact && root.available_width() >= 680.0 {
             self.jobs_open = false;
         }
-        egui::Panel::top("toolbar").show(root, |ui| self.toolbar(ui));
-        egui::Panel::bottom("status").show(root, |ui| self.footer(ui));
-        if root.available_width() >= 680.0 {
+        let mut toolbar = egui::Panel::top("toolbar");
+        if self.compact {
+            toolbar = toolbar
+                .exact_size(transfer_panel::compact_bar_height(
+                    root,
+                    &["Повний вигляд", "Деталі", "Черга", "Нова…"],
+                ))
+                .frame(
+                    egui::Frame::side_top_panel(root.style())
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
+                );
+        }
+        toolbar.show(root, |ui| self.toolbar(ui));
+        if !self.compact
+            || self.closing
+            || self.state.planning
+            || !self.state.ready
+            || self.banner.is_some()
+            || !self.state.errors.is_empty()
+            || self.state.notice.is_some()
+        {
+            egui::Panel::bottom("status").show(root, |ui| self.footer(ui));
+        }
+        if self.compact {
+            egui::Panel::bottom("transfer_controls")
+                .exact_size(self.compact_controls_height(root))
+                .frame(
+                    egui::Frame::side_top_panel(root.style())
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
+                )
+                .show(root, |ui| {
+                    if let Some(job) = self.panel_job() {
+                        let active = self.state.active.clone().filter(|a| a.id == job.id);
+                        self.operation_controls(ui, &job, active.as_ref());
+                    }
+                });
+        }
+        if !self.compact && root.available_width() >= 680.0 {
             egui::Panel::left("jobs")
                 .default_size(190.0)
                 .size_range(180.0..=320.0)
                 .show(root, |ui| self.sidebar(ui));
         }
         egui::CentralPanel::default().show(root, |ui| {
-            if let Some(job) = self.selected_job() {
-                self.operation(ui, &job);
-                self.table(ui, &job);
+            if let Some(job) = self.panel_job() {
+                if self.compact {
+                    egui::ScrollArea::vertical()
+                        .id_salt("transfer_summary")
+                        .show(ui, |ui| {
+                            self.operation(ui, &job);
+                            if self.transfer_details {
+                                self.table(ui, &job);
+                            }
+                        });
+                } else {
+                    self.operation(ui, &job);
+                    self.table(ui, &job);
+                }
             } else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);

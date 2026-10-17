@@ -126,12 +126,15 @@ impl App {
                 self.command_focus
             }
             Pane::Jobs => {
-                self.jobs_open = self.context.content_rect().width() < 680.0;
+                self.jobs_open = self.compact || self.context.content_rect().width() < 680.0;
                 self.job_scroll = true;
                 Some(self.jobs_id())
             }
             Pane::Files => {
                 self.jobs_open = false;
+                if self.compact {
+                    self.transfer_details = true;
+                }
                 Some(self.files_id())
             }
         };

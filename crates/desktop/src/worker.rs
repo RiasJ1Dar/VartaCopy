@@ -1,4 +1,5 @@
 //! Bounded desktop actor: planning and transfer never run on the UI thread.
+use crate::telemetry::{Meter, Snapshot};
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -25,6 +26,7 @@ pub struct State {
     pub planning: bool,
     pub automatic: bool,
     pub active: Option<Active>,
+    pub last_transfer: Option<Active>,
     pub queue: Vec<Job>,
     pub history: Vec<Job>,
     pub offset: usize,
@@ -41,6 +43,9 @@ pub struct Active {
     pub entry_count: usize,
     pub progress: Option<Progress>,
     pub request: &'static str,
+    pub run_started: Instant,
+    pub telemetry: Snapshot,
+    pub current_source: Option<PathBuf>,
 }
 pub enum Command {
     Submit {
@@ -356,6 +361,7 @@ fn actor(
     let mut transfer: Option<thread::JoinHandle<()>> = None;
     let mut active_id = None;
     let mut stop_request = None;
+    let mut run_id = 0u64;
     loop {
         if shutdown.load(Ordering::Acquire) {
             automatic = false;
@@ -553,7 +559,7 @@ fn actor(
                             .lock()
                             .map_err(|_| Error::Journal("transfer control poisoned".into()))? =
                             None;
-                        edit(state, |s| s.active = None)?;
+                        edit(state, |s| s.last_transfer = s.active.take())?;
                         match result {
                             Ok(mut report) => {
                                 let normalized = match (stop_request, report.status.as_str()) {
@@ -593,6 +599,7 @@ fn actor(
         if automatic && transfer.is_none() && !shutdown.load(Ordering::Acquire) {
             if let Some(job) = journal.queue(1, 0)?.into_iter().next() {
                 let mut peer = journal.peer()?;
+                let view = journal.peer()?;
                 let control = Arc::new(Control::default());
                 *active_control
                     .lock()
@@ -603,6 +610,12 @@ fn actor(
                 let shared = state.clone();
                 let progress_hook = hook.clone();
                 let id = job.id;
+                run_id = run_id
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Journal("transfer run counter exhausted".into()))?;
+                let run_started = Instant::now();
+                let mut meter = Meter::new(run_id);
+                let source_root = job.source.clone();
                 active_id = Some(id);
                 edit(state, |s| {
                     s.active = Some(Active {
@@ -614,6 +627,9 @@ fn actor(
                         entry_count: job.entry_count,
                         progress: None,
                         request: "",
+                        run_started,
+                        telemetry: meter.snapshot(),
+                        current_source: None,
                     })
                 })?;
                 transfer = Some(
@@ -622,17 +638,32 @@ fn actor(
                         .spawn(move || {
                             let mut last_progress = Instant::now();
                             let mut last_view = Instant::now();
+                            let mut current_entry = None;
+                            let mut current_source = None;
                             let outcome =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     recovery::run(&mut peer, id, &control, &mut |event| {
-                                        if let Some(hook) = progress_hook.as_ref() {
-                                            hook(&event);
+                                        meter.observe(run_started.elapsed(), &event);
+                                        if current_entry != Some(event.entry) {
+                                            let entry = view.entry(id, event.entry)?;
+                                            current_source =
+                                                Some(if entry.relative.as_os_str().is_empty() {
+                                                    source_root.clone()
+                                                } else {
+                                                    source_root.join(entry.relative)
+                                                });
+                                            current_entry = Some(event.entry);
                                         }
                                         quiet(&shared, |s| {
                                             if let Some(a) = s.active.as_mut() {
-                                                a.progress = Some(event);
+                                                a.telemetry = meter.snapshot();
+                                                a.current_source = current_source.clone();
+                                                a.progress = Some(event.clone());
                                             }
                                         })?;
+                                        if let Some(hook) = progress_hook.as_ref() {
+                                            hook(&event);
+                                        }
                                         if last_progress.elapsed() >= Duration::from_millis(100) {
                                             (shared.wake)();
                                             last_progress = Instant::now();
@@ -1256,6 +1287,92 @@ mod tests {
             fs::read(destination.join("move-locked")).unwrap(),
             b"verified partial move"
         );
+        client.shutdown();
+        wait(&client, |s| s.closed);
+    }
+
+    #[test]
+    fn telemetry_counts_actual_file_and_ads_writes_once_and_resets_on_resume_and_recheck() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("telemetry.bin");
+        let destination = root.path().join("dest");
+        fs::create_dir(&destination).unwrap();
+        let data = vec![49; 5 * 1024 * 1024 + 23];
+        let alternate = vec![93; 173];
+        fs::write(&source, &data).unwrap();
+        fs::write(format!("{}:note", source.display()), &alternate).unwrap();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (go_tx, go_rx) = mpsc::sync_channel(1);
+        let go_rx = Mutex::new(go_rx);
+        let first = AtomicBool::new(true);
+        let hook: ProgressHook = Arc::new(move |event| {
+            if event.phase == recovery::Phase::CheckpointCommitted
+                && first.swap(false, Ordering::SeqCst)
+            {
+                ready_tx.send(()).unwrap();
+                go_rx.lock().unwrap().recv().unwrap();
+            }
+        });
+        let client = Client::start_with_hook(root.path().join("jobs.sqlite"), Some(hook)).unwrap();
+        wait(&client, |s| s.ready);
+        submit(&client, source.clone(), destination.clone());
+        let id = wait(&client, |s| s.queue.len() == 1).queue[0].id;
+        client.send(Command::RunQueue(true)).unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let active = client.snapshot().unwrap().active.unwrap();
+        assert_eq!(
+            active.telemetry.written,
+            vartacopy_core::journal::CHUNK_BYTES as u64
+        );
+        assert_eq!(
+            active.current_source.as_ref().unwrap(),
+            &source.canonicalize().unwrap()
+        );
+        let first_run = active.telemetry.run_id;
+        client.send(Command::Pause(id)).unwrap();
+        wait(&client, |s| {
+            s.active.as_ref().is_some_and(|a| a.request == "pause")
+        });
+        go_tx.send(()).unwrap();
+        wait(&client, |s| {
+            s.active.is_none() && s.history.iter().any(|j| j.id == id && j.status == "paused")
+        });
+        client.send(Command::Resume(id)).unwrap();
+        let done = wait(&client, |s| {
+            s.active.is_none()
+                && s.history
+                    .iter()
+                    .any(|j| j.id == id && j.status == "completed")
+        });
+        let last = done.last_transfer.unwrap();
+        assert!(last.telemetry.run_id > first_run);
+        assert_eq!(
+            last.telemetry.written,
+            (data.len() + alternate.len() - vartacopy_core::journal::CHUNK_BYTES) as u64
+        );
+        assert_eq!(
+            done.last_report.unwrap().resumed_bytes,
+            vartacopy_core::journal::CHUNK_BYTES as u64
+        );
+        assert_eq!(fs::read(destination.join("telemetry.bin")).unwrap(), data);
+        assert_eq!(
+            fs::read(format!(
+                "{}:note",
+                destination.join("telemetry.bin").display()
+            ))
+            .unwrap(),
+            alternate
+        );
+        let resumed_run = last.telemetry.run_id;
+        client.send(Command::Recheck(id)).unwrap();
+        let checked = wait(&client, |s| {
+            s.active.is_none()
+                && s.last_transfer
+                    .as_ref()
+                    .is_some_and(|a| a.telemetry.run_id > resumed_run)
+        });
+        assert_eq!(checked.last_transfer.unwrap().telemetry.written, 0);
+        assert!(checked.errors.is_empty(), "{:?}", checked.errors);
         client.shutdown();
         wait(&client, |s| s.closed);
     }
