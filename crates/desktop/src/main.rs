@@ -7,11 +7,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut destination = None;
     let mut operation = None;
     let mut request_id = None;
+    let mut transfer_stdin = false;
     while let Some(flag) = args.next() {
         if flag == "--journal" && path.is_none() {
             path = Some(PathBuf::from(
                 args.next().ok_or("--journal requires a path")?,
             ));
+        } else if flag == "--transfer-stdin" && !transfer_stdin {
+            transfer_stdin = true;
         } else if flag == "--source" {
             sources.push(PathBuf::from(
                 args.next().ok_or("--source requires a path")?,
@@ -51,23 +54,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => path,
         None => vartacopy_core::journal::default_path()?,
     };
-    let transfer = match destination {
-        Some(destination) => Some(vartacopy_shell_windows::transfer::TransferRequest {
-            id: match request_id {
-                Some(id) => id,
-                None => vartacopy_shell_windows::transfer::new_transfer_id()?,
-            },
-            operation: operation
-                .unwrap_or(vartacopy_shell_windows::transfer::TransferOperation::Copy),
-            origin: vartacopy_shell_windows::transfer::TransferOrigin::AppForm,
-            sources: sources.clone(),
-            destination,
-        }),
-        None => {
-            if operation.is_some() || request_id.is_some() {
-                return Err("--operation and --request-id require --destination".into());
+    if transfer_stdin
+        && (!sources.is_empty()
+            || destination.is_some()
+            || operation.is_some()
+            || request_id.is_some())
+    {
+        return Err("--transfer-stdin cannot be combined with transfer arguments".into());
+    }
+    let transfer = if transfer_stdin {
+        Some(vartacopy_shell_windows::transfer::read_transfer(
+            std::io::stdin().lock(),
+        )?)
+    } else {
+        match destination {
+            Some(destination) => Some(vartacopy_shell_windows::transfer::TransferRequest {
+                id: match request_id {
+                    Some(id) => id,
+                    None => vartacopy_shell_windows::transfer::new_transfer_id()?,
+                },
+                operation: operation
+                    .unwrap_or(vartacopy_shell_windows::transfer::TransferOperation::Copy),
+                origin: vartacopy_shell_windows::transfer::TransferOrigin::AppForm,
+                sources: sources.clone(),
+                destination,
+            }),
+            None => {
+                if operation.is_some() || request_id.is_some() {
+                    return Err("--operation and --request-id require --destination".into());
+                }
+                None
             }
-            None
         }
     };
     let elected = match &transfer {

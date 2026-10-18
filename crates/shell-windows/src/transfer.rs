@@ -3,7 +3,7 @@ use crate::{MAX_REQUEST_BYTES, MAX_SOURCES};
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsString,
-    io,
+    io::{self, Read},
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
 };
@@ -25,6 +25,7 @@ pub enum TransferOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferOrigin {
+    Explorer,
     RightDrag,
     ContextPaste,
     AppDrop,
@@ -110,6 +111,16 @@ pub fn decode_transfer(bytes: &[u8]) -> io::Result<TransferRequest> {
     };
     validate_request(&request)?;
     Ok(request)
+}
+
+/// Read one complete request from a private, EOF-terminated pipe. The limit
+/// includes all wire bytes; do not accept a valid prefix followed by more data.
+pub fn read_transfer(reader: impl io::Read) -> io::Result<TransferRequest> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    decode_transfer(&bytes)
 }
 
 fn validate_request(request: &TransferRequest) -> io::Result<()> {
@@ -200,12 +211,37 @@ mod tests {
                 TransferOrigin::ContextPaste,
                 TransferOrigin::AppDrop,
                 TransferOrigin::AppPaste,
+                TransferOrigin::Explorer,
             ] {
                 r.operation = operation;
                 r.origin = origin;
                 assert_eq!(decode_transfer(&encode_transfer(&r).unwrap()).unwrap(), r);
             }
         }
+    }
+    #[test]
+    fn pipe_requires_one_complete_bounded_request_and_propagates_read_errors() {
+        let request = request();
+        let bytes = encode_transfer(&request).unwrap();
+        assert_eq!(read_transfer(bytes.as_slice()).unwrap(), request);
+        let mut concatenated = bytes.clone();
+        concatenated.extend(&bytes);
+        assert!(read_transfer(concatenated.as_slice()).is_err());
+        assert!(read_transfer(&bytes[..bytes.len() - 1]).is_err());
+        assert!(read_transfer(io::repeat(b' ')).is_err());
+        struct Broken;
+        impl io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "test read failure",
+                ))
+            }
+        }
+        assert_eq!(
+            read_transfer(Broken).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
     #[test]
     fn reject_unsafe_paths_counts_and_zero_identity() {
