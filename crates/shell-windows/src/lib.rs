@@ -1,6 +1,7 @@
 //! Small shell adapter. Requests prepare drafts; no request starts copying.
 pub mod clipboard;
 pub mod instance;
+pub mod native;
 pub mod registration;
 pub mod transfer;
 use std::{

@@ -2973,6 +2973,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "windows",
+ "windows-core",
  "windows-sys 0.61.2",
 ]
 
