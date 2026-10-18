@@ -197,12 +197,27 @@ impl Drop for Apartment {
     }
 }
 fn shell_item(path: &Path) -> windows::core::Result<IShellItem> {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let wide = parsing_name(path);
     // SAFETY: NUL-terminated native UTF-16 stays live for this synchronous call.
     unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }
 }
-fn as_io(error: windows::core::Error) -> io::Error {
-    io::Error::other(format!("Windows file operation: {error}"))
+fn parsing_name(path: &Path) -> Vec<u16> {
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // The transfer codec admits ordinary drive paths with either separator,
+    // while the Shell parsing API requires backslashes. Verbatim names retain
+    // their exact spelling; rewriting those would change their semantics.
+    if !wide.starts_with(&[92, 92, 63, 92]) {
+        for unit in &mut wide {
+            if *unit == 47 {
+                *unit = 92;
+            }
+        }
+    }
+    wide.push(0);
+    wide
+}
+fn at(stage: &'static str) -> impl FnOnce(windows::core::Error) -> io::Error {
+    move |error| io::Error::other(format!("Windows file operation ({stage}): {error}"))
 }
 
 /// Call only after an explicit engine choice and a committed native intent.
@@ -217,30 +232,31 @@ fn execute_inner(request: &TransferRequest, quiet_fixture: bool) -> io::Result<N
     // SAFETY: Initialize only this worker thread; failed initialization is not balanced.
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
         .ok()
-        .map_err(as_io)?;
+        .map_err(at("initialize STA"))?;
     let _apartment = Apartment;
     // SAFETY: Documented in-process Windows COM class, accessed only in this STA.
     let operation: IFileOperation =
-        unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }.map_err(as_io)?;
+        unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }
+            .map_err(at("create IFileOperation"))?;
     let mut flags = FOF_NOCONFIRMMKDIR | FOFX_NOCOPYHOOKS;
     if quiet_fixture {
         // Private test path only; production always retains Windows prompts.
         flags |= FOF_SILENT | FOF_NOERRORUI | FOF_NOCONFIRMATION;
     }
     // SAFETY: Valid STA interface, explicit flags; this only configures future operations.
-    unsafe { operation.SetOperationFlags(flags) }.map_err(as_io)?;
+    unsafe { operation.SetOperationFlags(flags) }.map_err(at("set operation flags"))?;
     let progress = Arc::new(Mutex::new(NativeProgress::default()));
     let sink: IFileOperationProgressSink = Sink(progress.clone()).into();
     // SAFETY: Sink is owned until Unadvise and all callbacks run inside the STA operation.
-    let cookie = unsafe { operation.Advise(&sink) }.map_err(as_io)?;
-    let destination = shell_item(&request.destination).map_err(as_io)?;
+    let cookie = unsafe { operation.Advise(&sink) }.map_err(at("attach progress sink"))?;
+    let destination = shell_item(&request.destination).map_err(at("resolve destination"))?;
     // Resolve every source before declaring or executing any mutation.
     let sources = request
         .sources
         .iter()
         .map(|p| shell_item(p))
         .collect::<windows::core::Result<Vec<_>>>()
-        .map_err(as_io)?;
+        .map_err(at("resolve sources"))?;
     for source in &sources {
         // SAFETY: STA-owned shell items remain live. Null new name preserves the source name.
         unsafe {
@@ -253,14 +269,14 @@ fn execute_inner(request: &TransferRequest, quiet_fixture: bool) -> io::Result<N
                 }
             }
         }
-        .map_err(as_io)?;
+        .map_err(at("declare Copy/Move item"))?;
     }
     // SAFETY: Executes only this explicitly constructed batch in its STA.
     let performed = unsafe { operation.PerformOperations() };
     // SAFETY: Required even when PerformOperations failed; success alone does not exclude cancellation.
     let aborted = unsafe { operation.GetAnyOperationsAborted() };
     // SAFETY: This cookie belongs to the same live operation and sink.
-    unsafe { operation.Unadvise(cookie) }.map_err(as_io)?;
+    unsafe { operation.Unadvise(cookie) }.map_err(at("detach progress sink"))?;
     Ok(NativeResult {
         perform_hresult: performed.err().map_or(0, |e| e.code().0),
         aborted: aborted.as_ref().ok().map(|b| b.as_bool()),
@@ -276,33 +292,70 @@ fn execute_inner(request: &TransferRequest, quiet_fixture: bool) -> io::Result<N
 mod tests {
     use super::*;
     use crate::transfer::TransferOrigin;
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+    fn slash_path(path: &Path, forward: bool) -> PathBuf {
+        if !forward {
+            return path.to_path_buf();
+        }
+        PathBuf::from(OsString::from_wide(
+            &path
+                .as_os_str()
+                .encode_wide()
+                .map(|u| if u == 92 { 47 } else { u })
+                .collect::<Vec<_>>(),
+        ))
+    }
     #[test]
     fn windows_engine_copies_and_moves_own_unicode_fixtures_without_clipboard() {
         // No visible UI, collisions or user data. Each call uses a new STA thread.
         for operation in [TransferOperation::Copy, TransferOperation::Move] {
-            let root = tempfile::tempdir().unwrap();
-            let source = root.path().join("власні дані.txt");
-            let destination = root.path().join("призначення");
-            std::fs::write(&source, b"native fixture").unwrap();
-            std::fs::create_dir(&destination).unwrap();
-            let request = TransferRequest {
-                id: [1; 16],
-                operation,
-                origin: TransferOrigin::AppPaste,
-                sources: vec![source.clone()],
-                destination: destination.clone(),
-            };
-            let result = std::thread::spawn(move || execute_inner(&request, true))
-                .join()
-                .unwrap()
-                .unwrap();
-            assert!(result.reported_complete(), "{result:?}");
-            assert_eq!(
-                std::fs::read(destination.join("власні дані.txt")).unwrap(),
-                b"native fixture"
-            );
-            assert_eq!(source.exists(), operation == TransferOperation::Copy);
+            for forward in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let source = root.path().join("власні дані.txt");
+                let destination = root.path().join("призначення");
+                std::fs::write(&source, b"native fixture").unwrap();
+                std::fs::write(root.path().join("власні дані.txt:notes"), b"native ADS").unwrap();
+                let tree = root.path().join("дерево");
+                std::fs::create_dir_all(tree.join("порожня")).unwrap();
+                std::fs::write(tree.join("дочірній.txt"), b"native tree").unwrap();
+                std::fs::create_dir(&destination).unwrap();
+                let request = TransferRequest {
+                    id: [1; 16],
+                    operation,
+                    origin: TransferOrigin::AppPaste,
+                    sources: vec![slash_path(&source, forward), slash_path(&tree, forward)],
+                    destination: slash_path(&destination, forward),
+                };
+                let result = std::thread::spawn(move || execute_inner(&request, true))
+                    .join()
+                    .unwrap()
+                    .unwrap();
+                assert!(result.reported_complete(), "{result:?}");
+                assert_eq!(
+                    std::fs::read(destination.join("власні дані.txt")).unwrap(),
+                    b"native fixture"
+                );
+                assert_eq!(source.exists(), operation == TransferOperation::Copy);
+                assert_eq!(tree.exists(), operation == TransferOperation::Copy);
+                assert_eq!(
+                    std::fs::read(destination.join("власні дані.txt:notes")).unwrap(),
+                    b"native ADS"
+                );
+                assert_eq!(
+                    std::fs::read(destination.join("дерево/дочірній.txt")).unwrap(),
+                    b"native tree"
+                );
+                assert!(destination.join("дерево/порожня").is_dir());
+            }
         }
+    }
+    #[test]
+    fn shell_parsing_preserves_verbatim_utf16_spelling() {
+        let units = vec![92, 92, 63, 92, 68, 58, 92, 0xd800, 47, 120];
+        let path = PathBuf::from(OsString::from_wide(&units));
+        let mut expected = units;
+        expected.push(0);
+        assert_eq!(parsing_name(&path), expected);
     }
     #[test]
     fn incomplete_or_unknown_native_results_are_not_reported_complete() {
