@@ -29,6 +29,7 @@ pub enum TransferOrigin {
     ContextPaste,
     AppDrop,
     AppPaste,
+    AppForm,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

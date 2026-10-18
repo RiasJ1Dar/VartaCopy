@@ -317,10 +317,31 @@ mod tests {
                     perform_hresult: perform,
                     aborted,
                     aborted_hresult: query,
-                    progress: NativeProgress::default()
+                    progress: NativeProgress {
+                        finished_hresult: Some(0),
+                        item_callbacks: 1,
+                        ..Default::default()
+                    }
                 }
                 .reported_complete()
             );
         }
+        let mut result = NativeResult {
+            perform_hresult: 0,
+            aborted: Some(false),
+            aborted_hresult: 0,
+            progress: NativeProgress {
+                finished_hresult: Some(0),
+                item_callbacks: 1,
+                ..Default::default()
+            },
+        };
+        assert!(result.reported_complete());
+        result.progress.non_success_items = 1;
+        result
+            .progress
+            .first_non_success_codes
+            .push(windows::Win32::UI::Shell::COPYENGINE_S_USER_IGNORED.0);
+        assert!(!result.reported_complete());
     }
 }

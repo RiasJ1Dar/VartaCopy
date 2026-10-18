@@ -602,6 +602,10 @@ impl App {
     pub(super) fn footer(&mut self, ui: &mut egui::Ui) {
         if self.closing {
             ui.label("Зберігаю стан і закриваю…");
+        } else if self.state.dispatching {
+            ui.label(
+                "Передаю запит обраному обробнику… Для Explorer скасування — у системному діалозі.",
+            );
         } else if self.state.planning {
             ui.label("Сканування джерела… Завдання ще не збережено.");
         } else if let Some(message) = self.banner.as_ref().or_else(|| self.state.errors.back()) {

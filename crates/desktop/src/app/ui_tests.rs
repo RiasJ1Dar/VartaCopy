@@ -95,6 +95,50 @@ fn render_with_commands(
 }
 
 #[test]
+fn chooser_cancel_has_focus_closes_with_escape_and_never_starts_a_job() {
+    let (root, mut app) = fixture();
+    app.offer_transfer(vartacopy_shell_windows::transfer::TransferRequest {
+        id: [9; 16],
+        operation: vartacopy_shell_windows::transfer::TransferOperation::Move,
+        origin: vartacopy_shell_windows::transfer::TransferOrigin::AppForm,
+        sources: vec![root.path().join("source")],
+        destination: root.path().join("dest"),
+    })
+    .unwrap();
+    assert!(!app.main_keys());
+    for size in [[760.0, 300.0], [380.0, 240.0]] {
+        let nodes = render(&mut app, size, None);
+        let cancel = nodes
+            .iter()
+            .find(|(_, n)| n.role() == Role::Button && n.label() == Some("Скасувати"))
+            .unwrap();
+        let rect = cancel.1.bounds().unwrap();
+        assert!(
+            rect.x0 >= 0.0
+                && rect.x1 <= size[0] as f64
+                && rect.y0 >= 0.0
+                && rect.y1 <= size[1] as f64,
+            "{rect:?}"
+        );
+    }
+    render(&mut app, [380.0, 240.0], Some(egui::Key::Escape));
+    assert!(app.chooser.is_none());
+    assert!(root.path().join("source").exists());
+    assert!(!root.path().join("dest/source").exists());
+    assert!(!app.client.snapshot().unwrap().dispatching);
+    app.client.shutdown();
+    update(&mut app, |s| s.closed);
+    drop(app);
+    let journal = Journal::open(&root.path().join("jobs.sqlite")).unwrap();
+    assert_eq!(
+        journal.jobs(32, 0).unwrap().len(),
+        1,
+        "only the preexisting fixture job"
+    );
+    assert!(journal.dispatch_receipt([9; 16]).unwrap().is_none());
+}
+
+#[test]
 fn compact_transfer_controls_graph_paths_and_user_only_resize_are_accessible() {
     let (root, mut app) = fixture();
     let job = app.state.history[0].clone();

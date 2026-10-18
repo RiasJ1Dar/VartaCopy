@@ -67,6 +67,7 @@ impl App {
     }
     pub(super) fn main_keys(&self) -> bool {
         !(self.new_operation
+            || self.chooser.is_some()
             || self.file_open
             || self.settings_open
             || self.details_open
@@ -74,6 +75,9 @@ impl App {
             || self.picker.is_some())
     }
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.chooser.is_some() {
+            return;
+        }
         if !self.new_operation
             && self.picker.is_none()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))

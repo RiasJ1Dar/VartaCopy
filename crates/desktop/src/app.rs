@@ -1,3 +1,4 @@
+mod chooser;
 mod dialogs;
 mod navigation;
 mod system_style;
@@ -100,6 +101,9 @@ pub struct App {
     contrast: Option<system_style::Palette>,
     settings_watch: Option<system_style::Watch>,
     shell: Option<mpsc::Receiver<Vec<PathBuf>>>,
+    transfers: Option<mpsc::Receiver<vartacopy_shell_windows::transfer::TransferRequest>>,
+    chooser: Option<vartacopy_shell_windows::transfer::TransferRequest>,
+    chooser_focus: bool,
     shell_action: Option<mpsc::Receiver<std::io::Result<String>>>,
     banner: Option<String>,
     picker: Option<mpsc::Receiver<(Picker, Option<PathBuf>)>>,
@@ -222,6 +226,9 @@ impl App {
             contrast,
             settings_watch,
             shell: None,
+            transfers: None,
+            chooser: None,
+            chooser_focus: false,
             shell_action: None,
             banner: None,
             picker: None,
@@ -245,6 +252,12 @@ impl App {
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("native window required"))?
                 .shell(marker)?,
+        );
+        self.transfers = Some(
+            self.settings_watch
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("native window required"))?
+                .transfers()?,
         );
         if !sources.is_empty() {
             self.add_sources(sources)?;
@@ -376,6 +389,23 @@ impl App {
 }
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.chooser.is_none()
+            && let Some(inbox) = &self.transfers
+        {
+            match inbox.try_recv() {
+                Ok(request) => {
+                    if let Err(error) = self.offer_transfer(request) {
+                        self.banner = Some(error.to_string());
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.transfers = None;
+                    self.banner = Some("Канал запитів передачі закрито".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(inbox) = &self.shell {
             match inbox.try_recv() {
                 Ok(paths) => {
@@ -481,6 +511,7 @@ impl eframe::App for App {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N))
             && self.state.ready
+            && self.chooser.is_none()
             && !self.closing
         {
             self.open_form();
@@ -492,10 +523,19 @@ impl eframe::App for App {
                 .map(|f| f.path().to_path_buf())
                 .collect::<Vec<_>>()
         });
-        if !dropped.is_empty()
-            && let Err(e) = self.add_sources(dropped)
-        {
-            self.banner = Some(e.to_string());
+        if !dropped.is_empty() {
+            let result = if !self.destination.text.trim().is_empty() {
+                self.offer_paths(
+                    dropped,
+                    vartacopy_shell_windows::transfer::TransferOrigin::AppDrop,
+                    None,
+                )
+            } else {
+                self.add_sources(dropped)
+            };
+            if let Err(error) = result {
+                self.banner = Some(error.to_string());
+            }
         }
         self.shortcuts(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -529,6 +569,7 @@ impl eframe::App for App {
         if !self.compact
             || self.closing
             || self.state.planning
+            || self.state.dispatching
             || !self.state.ready
             || self.banner.is_some()
             || !self.state.errors.is_empty()

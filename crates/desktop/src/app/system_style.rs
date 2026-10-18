@@ -125,6 +125,7 @@ struct Data {
     changed: AtomicBool,
     destroyed: AtomicBool,
     inbox: Option<mpsc::SyncSender<Vec<PathBuf>>>,
+    transfers: Option<mpsc::SyncSender<vartacopy_shell_windows::transfer::TransferRequest>>,
 }
 /// Callback registration and destruction are restricted to the owning UI thread.
 pub(super) struct Watch {
@@ -140,6 +141,7 @@ impl Watch {
             changed: AtomicBool::new(true),
             destroyed: AtomicBool::new(false),
             inbox: None,
+            transfers: None,
         });
         let ptr = (&*data as *const Data) as usize;
         // SAFETY: Called on the HWND's UI thread. Box allocation remains stable until callback removal.
@@ -172,6 +174,16 @@ impl Watch {
         self.data
             .as_ref()
             .is_some_and(|d| d.changed.swap(false, Ordering::AcqRel))
+    }
+    pub fn transfers(
+        &mut self,
+    ) -> io::Result<mpsc::Receiver<vartacopy_shell_windows::transfer::TransferRequest>> {
+        let (tx, rx) = mpsc::sync_channel(8);
+        self.data
+            .as_mut()
+            .ok_or_else(|| io::Error::other("window callback unavailable"))?
+            .transfers = Some(tx);
+        Ok(rx)
     }
 }
 impl Drop for Watch {
@@ -211,8 +223,10 @@ unsafe extern "system" fn changed(
             }
             // SAFETY: WM_COPYDATA supplies a Windows-marshaled COPYDATASTRUCT for the duration of this call.
             let request = unsafe { &*(lparam as *const COPYDATASTRUCT) };
-            if request.dwData != COPYDATA_MAGIC
-                || request.cbData as usize > MAX_REQUEST_BYTES
+            if !matches!(
+                request.dwData,
+                COPYDATA_MAGIC | vartacopy_shell_windows::transfer::COPYDATA_TRANSFER_MAGIC
+            ) || request.cbData as usize > MAX_REQUEST_BYTES
                 || request.lpData.is_null()
             {
                 return false;
@@ -221,6 +235,26 @@ unsafe extern "system" fn changed(
             let bytes = unsafe {
                 std::slice::from_raw_parts(request.lpData as *const u8, request.cbData as usize)
             };
+            if request.dwData == vartacopy_shell_windows::transfer::COPYDATA_TRANSFER_MAGIC {
+                return match vartacopy_shell_windows::transfer::decode_transfer(bytes) {
+                    Ok(request) => {
+                        if data
+                            .transfers
+                            .as_ref()
+                            .is_some_and(|tx| tx.try_send(request).is_ok())
+                        {
+                            data.ctx.request_repaint();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("VartaCopy: rejected transfer intent: {error}");
+                        false
+                    }
+                };
+            }
             match decode(bytes) {
                 Ok(paths) => {
                     if let Some(inbox) = &data.inbox {
@@ -376,6 +410,7 @@ mod tests {
         assert!(!window.is_null());
         let mut watch = Watch::attach(window, egui::Context::default()).unwrap();
         let inbox = watch.shell(primary.marker()).unwrap();
+        let transfers = watch.transfers().unwrap();
         let selected = vec![
             root.path().join("дані з пробілом"),
             root.path().join("second"),
@@ -416,6 +451,17 @@ mod tests {
         );
         assert_eq!(inbox.try_recv().unwrap(), selected);
         assert!(inbox.try_recv().is_err());
+        for _ in 0..8 {
+            let request = transfers.try_recv().unwrap();
+            assert_eq!(request.id, [8; 16]);
+            assert_eq!(request.sources, selected);
+            assert_eq!(
+                request.operation,
+                vartacopy_shell_windows::transfer::TransferOperation::Move
+            );
+            assert_eq!(request.destination, root.path().join("native target"));
+        }
+        assert!(transfers.try_recv().is_err());
         drop(watch);
         // SAFETY: Destroy our hidden test window after removing its endpoint and callback.
         assert_ne!(unsafe { DestroyWindow(window) }, 0);
@@ -432,5 +478,23 @@ mod tests {
             PathBuf::from(std::env::var_os("VARTACOPY_TEST_SECOND").expect("probe second source")),
         ];
         assert!(Instance::enter(&journal, &paths).unwrap().is_none());
+        let request = vartacopy_shell_windows::transfer::TransferRequest {
+            id: [8; 16],
+            operation: vartacopy_shell_windows::transfer::TransferOperation::Move,
+            origin: vartacopy_shell_windows::transfer::TransferOrigin::ContextPaste,
+            sources: paths,
+            destination: journal.parent().unwrap().join("native target"),
+        };
+        for _ in 0..8 {
+            assert!(
+                Instance::enter_transfer(&journal, &request)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            Instance::enter_transfer(&journal, &request).is_err(),
+            "bounded full inbox must reject, never imply execution"
+        );
     }
 }

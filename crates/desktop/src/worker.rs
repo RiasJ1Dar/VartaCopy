@@ -24,6 +24,7 @@ pub struct State {
     pub ready: bool,
     pub closed: bool,
     pub planning: bool,
+    pub dispatching: bool,
     pub automatic: bool,
     pub active: Option<Active>,
     pub last_transfer: Option<Active>,
@@ -48,6 +49,11 @@ pub struct Active {
     pub current_source: Option<PathBuf>,
 }
 pub enum Command {
+    Dispatch {
+        request: vartacopy_shell_windows::transfer::TransferRequest,
+        engine: vartacopy_core::journal::DispatchEngine,
+        conflict: Conflict,
+    },
     Submit {
         source: PathBuf,
         destination: PathBuf,
@@ -89,6 +95,7 @@ pub enum Command {
     ClearErrors,
 }
 enum Message {
+    Dispatched(Result<(String, bool)>),
     Wake,
     ViewTick,
     Command(Command),
@@ -359,6 +366,13 @@ fn actor(
     let mut automatic = false;
     let mut planning: Option<thread::JoinHandle<()>> = None;
     let mut transfer: Option<thread::JoinHandle<()>> = None;
+    let mut dispatch: Option<thread::JoinHandle<()>> = None;
+    let unresolved = journal.unresolved_native_dispatches(32, 0)?;
+    if !unresolved.receipts.is_empty() {
+        edit(state, |s| {
+            s.notice=Some("У журналі є незавершені запити Explorer. Перевірте їхні файли; автоматичного повтору не буде.".into())
+        })?;
+    }
     let mut active_id = None;
     let mut stop_request = None;
     let mut run_id = 0u64;
@@ -373,13 +387,64 @@ fn actor(
             {
                 control.cancel();
             }
-            if transfer.is_none() && planning.is_none() {
+            if transfer.is_none() && planning.is_none() && dispatch.is_none() {
                 break;
             }
         }
         if let Ok(message) = receiver.recv() {
             let result: Result<()> = (|| {
                 match message {
+                    Message::Command(Command::Dispatch {
+                        request,
+                        engine,
+                        conflict,
+                    }) => {
+                        if dispatch.is_some()
+                            || planning.is_some()
+                            || transfer.is_some()
+                            || shutdown.load(Ordering::Acquire)
+                        {
+                            return Err(Error::Journal(
+                                "Pause the current operation before choosing another engine".into(),
+                            ));
+                        }
+                        let mut peer = journal.peer()?;
+                        let tx = sender.clone();
+                        let cancel = scan_cancel.clone();
+                        cancel.store(false, Ordering::Release);
+                        let handle = thread::Builder::new()
+                            .name("vartacopy-dispatch".into())
+                            .spawn(move || {
+                                let outcome =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        crate::dispatch::run(
+                                            &mut peer, &request, engine, conflict, &cancel,
+                                        )
+                                    }));
+                                let result = outcome.unwrap_or_else(|_| {
+                                    Err(Error::Journal(
+                                        "dispatch panicked; inspect journal before retrying".into(),
+                                    ))
+                                });
+                                if let Err(error) = tx.send(Message::Dispatched(result)) {
+                                    eprintln!("VartaCopy: dispatch result undelivered: {error}");
+                                }
+                            })?;
+                        dispatch = Some(handle);
+                        edit(state, |s| s.dispatching = true)?;
+                    }
+                    Message::Dispatched(result) => {
+                        if let Some(handle) = dispatch.take() {
+                            handle
+                                .join()
+                                .map_err(|_| Error::Journal("dispatch worker panicked".into()))?;
+                        }
+                        edit(state, |s| s.dispatching = false)?;
+                        let (notice, start) = result?;
+                        automatic |= start;
+                        edit(state, |s| s.notice = Some(notice))?;
+                        refresh(&journal, state)?;
+                    }
                     Message::Wake => {}
                     Message::Command(Command::Submit {
                         source,
@@ -389,6 +454,9 @@ fn actor(
                         operation,
                         start,
                     }) => {
+                        if dispatch.is_some() {
+                            return Err(Error::Journal("engine dispatch is active".into()));
+                        }
                         scan_request(
                             vec![source],
                             destination,
@@ -411,6 +479,9 @@ fn actor(
                         operation,
                         start,
                     }) => {
+                        if dispatch.is_some() {
+                            return Err(Error::Journal("engine dispatch is active".into()));
+                        }
                         scan_request(
                             sources,
                             destination,
@@ -596,7 +667,11 @@ fn actor(
         } else {
             break;
         }
-        if automatic && transfer.is_none() && !shutdown.load(Ordering::Acquire) {
+        if automatic
+            && transfer.is_none()
+            && dispatch.is_none()
+            && !shutdown.load(Ordering::Acquire)
+        {
             if let Some(job) = journal.queue(1, 0)?.into_iter().next() {
                 let mut peer = journal.peer()?;
                 let view = journal.peer()?;
@@ -714,6 +789,58 @@ fn actor(
 mod tests {
     use super::*;
     use std::{fs, sync::atomic::AtomicUsize, time::Instant};
+    #[test]
+    fn dispatch_choice_runs_varta_once_and_replay_does_not_rescan_or_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("dispatch.txt");
+        let destination = root.path().join("target");
+        fs::write(&source, b"actor dispatch fixture").unwrap();
+        fs::create_dir(&destination).unwrap();
+        let client = Client::start(root.path().join("jobs.sqlite")).unwrap();
+        wait(&client, |s| s.ready);
+        let request = vartacopy_shell_windows::transfer::TransferRequest {
+            id: [7; 16],
+            operation: vartacopy_shell_windows::transfer::TransferOperation::Copy,
+            origin: vartacopy_shell_windows::transfer::TransferOrigin::AppForm,
+            sources: vec![source.clone()],
+            destination: destination.clone(),
+        };
+        client
+            .send(Command::Dispatch {
+                request: request.clone(),
+                engine: vartacopy_core::journal::DispatchEngine::VartaCopy,
+                conflict: Conflict::Error,
+            })
+            .unwrap();
+        wait(&client, |s| {
+            s.history.first().is_some_and(|j| j.status == "completed")
+                && !s.dispatching
+                && s.active.is_none()
+        });
+        assert_eq!(
+            fs::read(destination.join("dispatch.txt")).unwrap(),
+            b"actor dispatch fixture"
+        );
+        fs::remove_file(&source).unwrap();
+        client
+            .send(Command::Dispatch {
+                request,
+                engine: vartacopy_core::journal::DispatchEngine::VartaCopy,
+                conflict: Conflict::Error,
+            })
+            .unwrap();
+        let state = wait(&client, |s| {
+            s.notice
+                .as_ref()
+                .is_some_and(|n| n.contains("Повторного запуску"))
+                && !s.dispatching
+        });
+        assert_eq!(state.history.len(), 1);
+        assert!(state.errors.is_empty());
+        assert!(state.active.is_none());
+        client.shutdown();
+        wait(&client, |s| s.closed);
+    }
     #[track_caller]
     fn wait(client: &Client, condition: impl Fn(&State) -> bool) -> State {
         let deadline = Instant::now() + Duration::from_secs(15);

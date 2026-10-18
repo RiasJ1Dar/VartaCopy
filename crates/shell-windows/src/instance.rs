@@ -58,6 +58,20 @@ fn logon_id() -> io::Result<String> {
 impl Instance {
     /// Elect one GUI for this journal and logon. Secondary launches deliver a draft then exit.
     pub fn enter(journal: &Path, paths: &[PathBuf]) -> io::Result<Option<Self>> {
+        Self::enter_message(journal, COPYDATA_MAGIC, &encode(paths)?)
+    }
+    /// Forward a complete intent without selecting an engine or starting work.
+    pub fn enter_transfer(
+        journal: &Path,
+        request: &crate::transfer::TransferRequest,
+    ) -> io::Result<Option<Self>> {
+        Self::enter_message(
+            journal,
+            crate::transfer::COPYDATA_TRANSFER_MAGIC,
+            &crate::transfer::encode_transfer(request)?,
+        )
+    }
+    fn enter_message(journal: &Path, magic: usize, bytes: &[u8]) -> io::Result<Option<Self>> {
         let absolute = std::path::absolute(journal)?;
         let parent = absolute
             .parent()
@@ -67,7 +81,7 @@ impl Instance {
             .file_name()
             .ok_or_else(|| io::Error::other("journal has no filename"))?;
         let normalized = parent.join(name);
-        let bytes = normalized
+        let journal_key_bytes = normalized
             .as_os_str()
             .encode_wide()
             .flat_map(|c| {
@@ -83,7 +97,7 @@ impl Instance {
         let key = format!(
             "VartaCopy.{}.{}",
             logon_id()?,
-            blake3::hash(&bytes).to_hex()
+            blake3::hash(&journal_key_bytes).to_hex()
         );
         let marker = wide(&key);
         // SAFETY: NUL terminated name; default token DACL, mutex is scoped to this logon/session and journal.
@@ -113,7 +127,7 @@ impl Instance {
             if let Some(e) = error {
                 return Err(e);
             }
-            forward(&marker, paths)?;
+            forward(&marker, magic, bytes)?;
             Ok(None)
         }
     }
@@ -155,8 +169,7 @@ unsafe extern "system" fn find(window: HWND, data: LPARAM) -> i32 {
         1
     }
 }
-fn forward(marker: &[u16], paths: &[PathBuf]) -> io::Result<()> {
-    let bytes = encode(paths)?;
+fn forward(marker: &[u16], magic: usize, bytes: &[u8]) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let mut search = Search {
@@ -173,7 +186,7 @@ fn forward(marker: &[u16], paths: &[PathBuf]) -> io::Result<()> {
                 AllowSetForegroundWindow(pid);
             }
             let data = COPYDATASTRUCT {
-                dwData: COPYDATA_MAGIC,
+                dwData: magic,
                 cbData: bytes.len() as u32,
                 lpData: bytes.as_ptr() as _,
             };

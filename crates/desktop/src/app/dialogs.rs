@@ -1,7 +1,7 @@
 use super::*;
 impl App {
     fn form(&mut self) {
-        if !self.new_operation {
+        if !self.new_operation || self.chooser.is_some() {
             return;
         }
         let ctx = self.context.clone();
@@ -52,7 +52,7 @@ impl App {
                             }
                         });
                     }
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.add_enabled_ui(self.picker.is_none(), |ui| {
                             if ui.button("Обрати файл…").clicked() {
                                 self.pick(Picker::File);
@@ -60,6 +60,7 @@ impl App {
                             if ui.button("Обрати каталог…").clicked() {
                                 self.pick(Picker::Folder);
                             }
+                            if ui.button("Вставити файли…").clicked(){self.paste_files();}
                         });
                     });
                     let label = ui.label("Призначення — наявний каталог");
@@ -94,6 +95,10 @@ impl App {
                             "Пропускати посилання (частковий результат)",
                         );
                     });
+                    if ui.add_enabled(
+                        self.state.ready && !self.state.dispatching && !self.source.text.trim().is_empty() && !self.destination.text.trim().is_empty(),
+                        egui::Button::new("Обрати Explorer або VartaCopy…")
+                    ).clicked(){self.choose_form_engine();}
                     ui.label(
                         RichText::new(match self.operation {
                             OperationKind::Copy => "Копія створюється всередині призначення. Перевірка BLAKE3 увімкнена.",
@@ -105,6 +110,7 @@ impl App {
                 });
             let enabled = self.state.ready
                 && !self.state.planning
+                && !self.state.dispatching
                 && !self.closing
                 && self.picker.is_none()
                 && !self.source.text.trim().is_empty()
@@ -134,6 +140,7 @@ impl App {
     }
     pub(super) fn dialogs(&mut self) {
         self.form();
+        self.engine_chooser();
         let ctx = self.context.clone();
         if self.jobs_open {
             let mut open = true;
