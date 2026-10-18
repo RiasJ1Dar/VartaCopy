@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/platform-windows", "crates/cli", "crates/desktop", "crates/shell-windows", "crates/explorer-command"]
+members = ["crates/core", "crates/platform-windows", "crates/cli", "crates/desktop", "crates/shell-windows", "crates/explorer-command", "crates/explorer-drop-probe"]
 resolver = "2"
 
 [workspace.package]

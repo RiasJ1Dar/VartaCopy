@@ -2957,6 +2957,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vartacopy-explorer-drop-probe"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "vartacopy-platform-windows"
 version = "0.1.0-alpha.1"
 dependencies = [
