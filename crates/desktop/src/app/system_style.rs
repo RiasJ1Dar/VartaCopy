@@ -456,11 +456,12 @@ mod tests {
         );
         assert_eq!(inbox.try_recv().unwrap(), selected);
         assert!(inbox.try_recv().is_err());
-        for _ in 0..8 {
-            let vartacopy_shell_windows::transfer::TransferDelivery::Choose(request) =
-                transfers.try_recv().unwrap()
-            else {
-                panic!("ordinary IPC must retain engine choice")
+        for i in 0..8 {
+            use vartacopy_shell_windows::transfer::TransferDelivery;
+            let request = match (i, transfers.try_recv().unwrap()) {
+                (0..=3, TransferDelivery::Choose(request)) => request,
+                (4..=7, TransferDelivery::SelectedVarta(request)) => request,
+                _ => panic!("IPC must preserve the explicitly selected delivery mode"),
             };
             assert_eq!(request.id, [8; 16]);
             assert_eq!(request.sources, selected);
@@ -494,9 +495,20 @@ mod tests {
             sources: paths,
             destination: journal.parent().unwrap().join("native target"),
         };
-        for _ in 0..8 {
+        for _ in 0..4 {
             assert!(
                 Instance::enter_transfer(&journal, &request)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let selected = vartacopy_shell_windows::transfer::TransferRequest {
+            origin: vartacopy_shell_windows::transfer::TransferOrigin::Explorer,
+            ..request.clone()
+        };
+        for _ in 0..4 {
+            assert!(
+                Instance::enter_selected_transfer(&journal, &selected)
                     .unwrap()
                     .is_none()
             );

@@ -2960,8 +2960,10 @@ dependencies = [
 name = "vartacopy-explorer-drop-probe"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "serde",
  "serde_json",
  "tempfile",
+ "vartacopy-shell-windows",
  "windows",
  "windows-core",
 ]

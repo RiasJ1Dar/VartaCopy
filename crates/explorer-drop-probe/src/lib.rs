@@ -1,7 +1,12 @@
-//! Passive, opt-in Explorer callback probe. Never adds commands, selects a
-//! default, reads the clipboard, launches a process or performs a transfer.
+//! Explorer transfer selection and an independent, opt-in passive callback probe.
 #![cfg(windows)]
 #![allow(non_snake_case)]
+mod choice;
+mod config;
+mod controls;
+mod delivery;
+mod handler;
+mod selection;
 
 use std::{
     ffi::c_void,
@@ -40,10 +45,13 @@ use windows::{
 
 // Independent identity, exclusively for the opt-in diagnostic probe.
 pub const PROBE_CLSID: GUID = GUID::from_u128(0x328db05e_95e2_4427_9e48_d9f11f57e96c);
+pub const TRANSFER_CLSID: GUID = GUID::from_u128(0x91dd2708_74c6_4498_87b6_09420a94f66d);
 const MAX_LOG_BYTES: u64 = 256 * 1024;
 static OBJECTS: AtomicUsize = AtomicUsize::new(0);
 static LOCKS: AtomicUsize = AtomicUsize::new(0);
 static LOG_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static TEST_COM_LOCK: Mutex<()> = Mutex::new(());
 
 struct Lifetime;
 impl Lifetime {
@@ -213,6 +221,7 @@ impl IContextMenu_Impl for Probe_Impl {
 #[implement(IClassFactory)]
 struct Factory {
     _lifetime: Lifetime,
+    probe: bool,
 }
 impl IClassFactory_Impl for Factory_Impl {
     fn CreateInstance(
@@ -230,7 +239,11 @@ impl IClassFactory_Impl for Factory_Impl {
             if outer.is_some() {
                 return Err(CLASS_E_NOAGGREGATION.into());
             }
-            let object: IShellExtInit = Probe::new().into();
+            let object: IShellExtInit = if self.probe {
+                Probe::new().into()
+            } else {
+                handler::TransferHandler::new().into()
+            };
             // SAFETY: iid/out are readable/writable COM call parameters; query supplies one owned reference.
             unsafe { object.query(iid, out).ok() }
         })
@@ -264,12 +277,18 @@ pub unsafe extern "system" fn DllGetClassObject(
         // SAFETY: Caller supplies initialized GUIDs and writable output storage by the documented COM ABI.
         unsafe {
             *out = std::ptr::null_mut();
-            if *clsid != PROBE_CLSID {
+            if *clsid != PROBE_CLSID && *clsid != TRANSFER_CLSID {
                 return Err(CLASS_E_CLASSNOTAVAILABLE.into());
             }
         }
+        // SAFETY: clsid was validated above and remains borrowed for this COM call.
+        let probe = unsafe { *clsid == PROBE_CLSID };
+        if probe {
+            record("class_factory", serde_json::json!({}))?;
+        }
         let factory: IClassFactory = Factory {
             _lifetime: Lifetime::new(),
+            probe,
         }
         .into();
         // SAFETY: Validated ABI parameters; query transfers a reference for the requested supported interface.
@@ -298,6 +317,7 @@ mod tests {
 
     #[test]
     fn probe_com_identity_lifetime_and_callbacks_never_mutate_the_menu() {
+        let _guard = TEST_COM_LOCK.lock().unwrap();
         // SAFETY: All COM out parameters point to initialized local storage. The
         // temporary menu is owned here and destroyed after callbacks release it.
         unsafe {
@@ -331,6 +351,27 @@ mod tests {
                     .code(),
                 E_NOTIMPL
             );
+            DestroyMenu(popup).unwrap();
+            drop(menu);
+            drop(init);
+            drop(factory);
+            assert_eq!(DllCanUnloadNow(), S_OK);
+            assert_eq!(
+                DllGetClassObject(&TRANSFER_CLSID, &IClassFactory::IID, &mut raw),
+                S_OK
+            );
+            let factory = IClassFactory::from_raw(raw);
+            let init: IShellExtInit = factory.CreateInstance(None).unwrap();
+            let menu: IContextMenu = init.cast().unwrap();
+            assert_eq!(
+                init.cast::<IUnknown>().unwrap(),
+                menu.cast::<IUnknown>().unwrap()
+            );
+            assert!(init.Initialize(None, None, None).is_err());
+            let popup = CreatePopupMenu().unwrap();
+            assert_eq!(menu.QueryContextMenu(popup, 0, 100, 200, 0), S_OK);
+            assert_eq!(GetMenuItemCount(Some(popup)), 0);
+            assert!(menu.InvokeCommand(std::ptr::null()).is_err());
             DestroyMenu(popup).unwrap();
             drop(menu);
             drop(init);
