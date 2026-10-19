@@ -5,6 +5,16 @@ use std::{
     os::windows::ffi::OsStringExt,
     path::{Component, Path, PathBuf, Prefix},
 };
+use windows::{
+    Win32::{
+        Foundation::HMODULE,
+        System::LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            GetModuleFileNameW, GetModuleHandleExW,
+        },
+    },
+    core::PCWSTR,
+};
 
 pub const MAX_CONFIG_BYTES: usize = 512 * 1024;
 #[derive(Deserialize)]
@@ -14,21 +24,37 @@ struct Wire {
     enabled: bool,
     gui: Vec<u16>,
     journal: Option<Vec<u16>>,
+    #[serde(default)]
+    diagnostics: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Config {
     pub gui: PathBuf,
     pub journal: Option<PathBuf>,
+    pub diagnostics: bool,
 }
 pub fn location() -> io::Result<PathBuf> {
-    let root = PathBuf::from(
-        std::env::var_os("LOCALAPPDATA")
-            .ok_or_else(|| io::Error::other("LOCALAPPDATA is not set"))?,
-    );
-    if !root.is_absolute() {
-        return Err(io::Error::other("LOCALAPPDATA is not absolute"));
+    let mut module = HMODULE::default();
+    // SAFETY: FROM_ADDRESS interprets our function pointer as a module address, not text.
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(location as *const () as *const u16),
+            &mut module,
+        )
+        .map_err(io::Error::other)?;
     }
-    Ok(root.join("VartaCopy/explorer-transfer.json"))
+    let mut path = vec![0; 32768];
+    // SAFETY: The live module handle and writable output slice are valid.
+    let count = unsafe { GetModuleFileNameW(Some(module), &mut path) } as usize;
+    if count == 0 || count >= path.len() {
+        return Err(io::Error::other("Cannot locate the shell extension image"));
+    }
+    let image = PathBuf::from(OsString::from_wide(&path[..count]));
+    let root = image
+        .parent()
+        .ok_or_else(|| io::Error::other("Shell image has no parent"))?;
+    Ok(root.join("explorer-transfer.json"))
 }
 fn native(units: Vec<u16>) -> io::Result<PathBuf> {
     if units.is_empty() || units.len() > 32767 || units.contains(&0) {
@@ -73,6 +99,7 @@ pub fn decode(reader: impl Read) -> io::Result<Option<Config>> {
     Ok(Some(Config {
         gui,
         journal: wire.journal.map(native).transpose()?,
+        diagnostics: wire.diagnostics,
     }))
 }
 pub fn read() -> io::Result<Option<Config>> {
@@ -96,6 +123,10 @@ mod tests {
     use super::*;
     #[test]
     fn configuration_is_bounded_and_accepts_only_the_own_gui_and_local_paths() {
+        assert_eq!(
+            location().unwrap().parent(),
+            std::env::current_exe().unwrap().parent()
+        );
         let wire = |path: &str| {
             serde_json::json!({"version":1,"enabled":true,"gui":path.encode_utf16().collect::<Vec<_>>(),"journal":null}).to_string()
         };

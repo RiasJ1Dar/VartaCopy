@@ -1,5 +1,9 @@
 //! Acquire owned native paths while the caller's data object and PIDL are valid.
-use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+use std::{
+    ffi::OsString,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::PathBuf,
+};
 use vartacopy_shell_windows::{
     MAX_REQUEST_BYTES, MAX_SOURCES,
     transfer::{
@@ -87,14 +91,18 @@ fn hdrop(data: &IDataObject, budget: &mut usize) -> Result<Vec<PathBuf>> {
 }
 /// # Safety
 /// `folder` must be the caller-owned absolute PIDL supplied to Initialize.
-pub unsafe fn capture(folder: *const ITEMIDLIST, data: &IDataObject) -> Result<TransferRequest> {
+pub unsafe fn destination(folder: *const ITEMIDLIST) -> Result<PathBuf> {
     if folder.is_null() {
         return Err(E_INVALIDARG.into());
     }
     let mut budget = 0;
     // SAFETY: The caller guarantees the PIDL is valid for this callback.
     let target: IShellItem = unsafe { SHCreateItemFromIDList(folder)? };
-    let destination = path(&target, &mut budget)?;
+    path(&target, &mut budget)
+}
+pub fn capture(destination: PathBuf, data: &IDataObject) -> Result<TransferRequest> {
+    let mut budget = 0;
+    account(destination.as_os_str().encode_wide().count(), &mut budget)?;
     // SAFETY: The caller lends a valid IDataObject on this same apartment.
     let sources = match unsafe { SHCreateShellItemArrayFromDataObject::<_, IShellItemArray>(data) }
     {
@@ -182,9 +190,9 @@ mod tests {
                 None,
             )
             .unwrap();
-            let captured = capture(pidl, &data);
+            let target = super::destination(pidl);
             CoTaskMemFree(Some(pidl.cast()));
-            let captured = captured.unwrap();
+            let captured = capture(target.unwrap(), &data).unwrap();
             assert_eq!(captured.sources.len(), 1);
             assert_eq!(
                 captured.sources[0].canonicalize().unwrap(),
@@ -199,7 +207,7 @@ mod tests {
                 paths[0].canonicalize().unwrap(),
                 source.canonicalize().unwrap()
             );
-            assert!(capture(std::ptr::null(), &data).is_err());
+            assert!(super::destination(std::ptr::null()).is_err());
         }
         assert_eq!(std::fs::read(&source).unwrap(), b"capture fixture");
         assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);

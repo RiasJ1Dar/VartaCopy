@@ -108,6 +108,28 @@ fn record(event: &str, detail: serde_json::Value) -> Result<()> {
     })
 }
 
+fn trace(event: &str, detail: serde_json::Value) {
+    match config::read() {
+        Ok(Some(config)) if config.diagnostics => {
+            let write = || -> io::Result<()> {
+                let path = config::location()?.with_file_name("explorer-transfer-trace.jsonl");
+                // SAFETY: Both identifiers are process-local scalar queries.
+                let (pid, tid) = unsafe { (GetCurrentProcessId(), GetCurrentThreadId()) };
+                append_record(
+                    &path,
+                    &serde_json::json!({"version":1,"event":event,"pid":pid,"tid":tid,
+                    "unix_ms":SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?.as_millis(),"detail":detail}),
+                )
+            };
+            if let Err(error) = write() {
+                eprintln!("VartaCopy shell trace failed: {error}");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("VartaCopy shell trace configuration failed: {error}"),
+    }
+}
+
 #[derive(Default)]
 struct Selection {
     roots: Option<u32>,
@@ -285,6 +307,8 @@ pub unsafe extern "system" fn DllGetClassObject(
         let probe = unsafe { *clsid == PROBE_CLSID };
         if probe {
             record("class_factory", serde_json::json!({}))?;
+        } else {
+            trace("transfer_class_factory", serde_json::json!({}));
         }
         let factory: IClassFactory = Factory {
             _lifetime: Lifetime::new(),

@@ -9,6 +9,8 @@ import argparse
 import ctypes
 import json
 import os
+import msvcrt
+import tempfile
 from pathlib import Path
 import winreg
 
@@ -46,15 +48,39 @@ def native_units(path: Path) -> list[int]:
     return units
 
 
-def configuration(gui: Path, journal: Path | None) -> bytes:
+def configuration(gui: Path, journal: Path | None, diagnostics: bool = False) -> bytes:
     if gui.name.lower() != "vartacopy-gui.exe" or not gui.is_file():
         raise ValueError("--gui must name an existing vartacopy-gui.exe")
     payload = {"version": 1, "enabled": True, "gui": native_units(gui),
                "journal": native_units(journal) if journal else None}
+    if diagnostics:
+        payload["diagnostics"] = True
     result = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     if len(result) > 512 * 1024:
         raise ValueError("Shell configuration is oversized")
     return result
+
+
+def physical_path(path: Path) -> str:
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    final = kernel.GetFinalPathNameByHandleW
+    final.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong]
+    final.restype = ctypes.c_ulong
+    with path.open("rb") as file:
+        buffer = ctypes.create_unicode_buffer(32768)
+        count = final(msvcrt.get_osfhandle(file.fileno()), buffer, len(buffer), 0)
+        if not count or count >= len(buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return buffer.value
+
+
+def require_unredirected(path: Path) -> str:
+    actual = physical_path(path)
+    # resolve() follows GetFinalPathNameByHandle and would hide the redirection itself.
+    spelling = os.path.abspath(path)
+    if actual.removeprefix("\\\\?\\").casefold() != spelling.removeprefix("\\\\?\\").casefold():
+        raise ValueError(f"Configuration is redirected to {actual}; run this tool from an unpackaged terminal")
+    return actual
 
 
 def values(key: str) -> dict[str, str] | None:
@@ -114,12 +140,13 @@ def notify() -> None:
 def main() -> int:
     global HIVE
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("status", "install", "uninstall"))
+    parser.add_argument("action", choices=("status", "install", "uninstall", "configure"))
     parser.add_argument("--scope", choices=("user", "machine"), default="user")
     parser.add_argument("--handler", choices=("probe", "transfer"), default="probe")
     parser.add_argument("--dll", required=True, type=Path)
     parser.add_argument("--gui", type=Path, help="Transfer handler only: absolute path to vartacopy-gui.exe")
     parser.add_argument("--journal", type=Path, help="Optional separate acceptance-test journal")
+    parser.add_argument("--diagnostics", action="store_true", help="Opt-in bounded callback metadata trace, without paths or file contents")
     parser.add_argument("--record", required=True, type=Path)
     args = parser.parse_args()
     select_handler(args.handler)
@@ -131,10 +158,8 @@ def main() -> int:
         parser.error("--record must be a new absolute file")
     if args.handler == "transfer" and args.gui is None and args.action != "status":
         parser.error("Transfer install/uninstall requires --gui to verify configuration ownership")
-    config_path = Path(os.environ["LOCALAPPDATA"]) / "VartaCopy" / "explorer-transfer.json"
-    if not config_path.is_absolute():
-        parser.error("LOCALAPPDATA must be absolute")
-    config_bytes = configuration(args.gui, args.journal) if args.gui else None
+    config_path = dll.parent / "explorer-transfer.json"
+    config_bytes = configuration(args.gui, args.journal, args.diagnostics) if args.gui else None
     config_created = False
     keys = expected(dll)
     before = snapshot(keys)
@@ -143,7 +168,32 @@ def main() -> int:
     approval_created = False
     report = {"scope": args.scope, "handler": args.handler, "action": args.action, "dll": str(dll), "before": before, "created": changes, "approval_before":approval_before}
     try:
-        if args.action == "install":
+        if args.action == "configure":
+            if args.handler != "transfer":
+                raise ValueError("Only the transfer handler has configuration")
+            owned = [configuration(args.gui, args.journal, diagnostics) for diagnostics in (False, True)]
+            if config_path.exists():
+                require_unredirected(config_path)
+                if config_path.read_bytes() not in owned:
+                    raise ValueError("Configuration ownership differs; refusing to replace it")
+                with tempfile.NamedTemporaryFile(dir=config_path.parent, prefix="explorer-transfer-", suffix=".tmp", delete=False) as file:
+                    temporary = Path(file.name)
+                    file.write(config_bytes)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, config_path)
+            else:
+                if before != keys or approval_before != APPROVAL_LABEL:
+                    raise ValueError("Cannot create settings without matching owned registration")
+                with config_path.open("xb") as file:
+                    config_created = True
+                    file.write(config_bytes)
+                    file.flush()
+                    os.fsync(file.fileno())
+            if config_path.read_bytes() != config_bytes:
+                raise RuntimeError("Configuration readback differs")
+            report["configuration_physical_path"] = require_unredirected(config_path)
+        elif args.action == "install":
             if any(value is not None for value in before.values()) or approval_before is not None:
                 raise ValueError("Probe registration already exists; inspect it before changing anything")
             try:
@@ -158,6 +208,7 @@ def main() -> int:
                     except FileExistsError:
                         if config_path.read_bytes() != config_bytes:
                             raise ValueError("Existing transfer configuration differs; refusing to replace it")
+                    report["configuration_physical_path"] = require_unredirected(config_path)
                 for key, content in keys.items():
                     with winreg.CreateKeyEx(HIVE, key, 0, winreg.KEY_WRITE | VIEW) as handle:
                         changes.append(key)

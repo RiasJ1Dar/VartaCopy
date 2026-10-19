@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import explorer_drop_probe as installer
 
@@ -43,6 +44,14 @@ class TransferInstallation(unittest.TestCase):
             wrong.write_bytes(b"fixture")
             with self.assertRaises(ValueError):
                 installer.configuration(wrong, None)
+
+    def test_install_guard_refuses_a_virtualized_configuration(self):
+        path = Path(r"C:\Users\example\AppData\Local\VartaCopy\explorer-transfer.json")
+        with patch.object(installer, "physical_path", return_value=r"\\?\C:\Users\example\AppData\Local\Packages\Host\LocalCache\Local\VartaCopy\explorer-transfer.json"):
+            with self.assertRaisesRegex(ValueError, "redirected"):
+                installer.require_unredirected(path)
+        with patch.object(installer, "physical_path", return_value="\\\\?\\" + str(path)):
+            self.assertTrue(installer.require_unredirected(path).startswith("\\\\?\\"))
 
 
 if __name__ == "__main__":
