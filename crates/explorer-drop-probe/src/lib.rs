@@ -1,7 +1,8 @@
 //! Explorer transfer selection and an independent, opt-in passive callback probe.
 #![cfg(windows)]
 #![allow(non_snake_case)]
-mod choice;
+pub mod choice;
+mod choice_dialog;
 mod config;
 mod controls;
 mod delivery;

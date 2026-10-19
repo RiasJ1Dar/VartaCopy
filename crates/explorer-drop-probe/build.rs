@@ -13,5 +13,11 @@ fn main() {
             "cargo:rustc-cdylib-link-arg=/MANIFESTINPUT:{}",
             manifest.display()
         );
+        // The visual-only preview also needs resource 2 for its contrast-theme fallback.
+        println!("cargo:rustc-link-arg-examples=/MANIFEST:EMBED,ID=2");
+        println!(
+            "cargo:rustc-link-arg-examples=/MANIFESTINPUT:{}",
+            manifest.display()
+        );
     }
 }

@@ -23,6 +23,12 @@ pub enum Choice {
     Cancel,
 }
 pub fn show(request: &TransferRequest) -> Result<Choice> {
+    if !super::choice_dialog::high_contrast()? {
+        return super::choice_dialog::show(request);
+    }
+    show_system(request)
+}
+fn show_system(request: &TransferRequest) -> Result<Choice> {
     let mut lines = vec![format!("Джерел: {}", request.sources.len())];
     for source in request.sources.iter().take(3) {
         lines.push(source.display().to_string());
