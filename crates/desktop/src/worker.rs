@@ -401,7 +401,8 @@ fn actor(
                     }) => {
                         if dispatch.is_some()
                             || planning.is_some()
-                            || transfer.is_some()
+                            || (transfer.is_some()
+                                && engine == vartacopy_core::journal::DispatchEngine::Explorer)
                             || shutdown.load(Ordering::Acquire)
                         {
                             return Err(Error::Journal(
@@ -931,6 +932,89 @@ mod tests {
             fs::read(source).unwrap()
         );
         assert_eq!(fs::read(dest.join("second")).unwrap(), b"second");
+        client.shutdown();
+        wait(&client, |s| s.closed);
+    }
+    #[test]
+    fn selected_varta_dispatch_queues_while_a_previous_copy_is_running() {
+        use vartacopy_shell_windows::transfer::{
+            TransferOperation, TransferOrigin, TransferRequest,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let first = root.path().join("first");
+        fs::write(&first, vec![11; 5 * 1024 * 1024]).unwrap();
+        let second = root.path().join("second");
+        fs::write(&second, b"queued shell request").unwrap();
+        let second = second.canonicalize().unwrap();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (go_tx, go_rx) = mpsc::sync_channel(1);
+        let go_rx = Mutex::new(go_rx);
+        let once = AtomicBool::new(false);
+        let hook: ProgressHook = Arc::new(move |event| {
+            if event.phase == recovery::Phase::CheckpointCommitted
+                && !once.swap(true, Ordering::SeqCst)
+            {
+                ready_tx.send(()).unwrap();
+                go_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap();
+            }
+        });
+        let client = Client::start_with_hook(root.path().join("jobs.sqlite"), Some(hook)).unwrap();
+        // Drop this guard before Client even if an assertion fails while the copy is held.
+        struct Release(Option<mpsc::SyncSender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take()
+                    && let Err(error) = tx.send(())
+                {
+                    eprintln!("test release failed: {error}");
+                }
+            }
+        }
+        let release = Release(Some(go_tx));
+        wait(&client, |s| s.ready);
+        submit(&client, first.clone(), dest.clone());
+        wait(&client, |s| !s.planning && s.queue.len() == 1);
+        client.send(Command::RunQueue(true)).unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        client
+            .send(Command::Dispatch {
+                request: TransferRequest {
+                    id: [77; 16],
+                    operation: TransferOperation::Copy,
+                    origin: TransferOrigin::Explorer,
+                    sources: vec![second.clone()],
+                    destination: dest.clone(),
+                },
+                engine: vartacopy_core::journal::DispatchEngine::VartaCopy,
+                conflict: Conflict::Error,
+            })
+            .unwrap();
+        let queued = wait(&client, |s| {
+            !s.dispatching && s.queue.iter().any(|j| j.source == second)
+        });
+        assert!(queued.active.is_some());
+        assert!(!dest.join("second").exists());
+        drop(release);
+        let done = wait(&client, |s| {
+            s.active.is_none()
+                && s.history.len() == 2
+                && s.history.iter().all(|j| j.status == "completed")
+        });
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(
+            fs::read(dest.join("first")).unwrap(),
+            fs::read(first).unwrap()
+        );
+        assert_eq!(
+            fs::read(dest.join("second")).unwrap(),
+            b"queued shell request"
+        );
         client.shutdown();
         wait(&client, |s| s.closed);
     }

@@ -71,6 +71,18 @@ impl Instance {
             &crate::transfer::encode_transfer(request)?,
         )
     }
+    pub fn enter_selected_transfer(
+        journal: &Path,
+        request: &crate::transfer::TransferRequest,
+    ) -> io::Result<Option<Self>> {
+        let bytes = crate::transfer::encode_transfer(request)?;
+        crate::transfer::decode_delivery(crate::transfer::COPYDATA_SELECTED_VARTA_MAGIC, &bytes)?;
+        Self::enter_message(
+            journal,
+            crate::transfer::COPYDATA_SELECTED_VARTA_MAGIC,
+            &bytes,
+        )
+    }
     fn enter_message(journal: &Path, magic: usize, bytes: &[u8]) -> io::Result<Option<Self>> {
         let absolute = std::path::absolute(journal)?;
         let parent = absolute

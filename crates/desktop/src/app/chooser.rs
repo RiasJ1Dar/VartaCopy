@@ -5,6 +5,43 @@ use vartacopy_shell_windows::transfer::{
 };
 
 impl App {
+    pub fn receive_transfer(
+        &mut self,
+        delivery: vartacopy_shell_windows::transfer::TransferDelivery,
+    ) -> std::io::Result<()> {
+        use vartacopy_shell_windows::transfer::TransferDelivery;
+        match delivery {
+            TransferDelivery::Choose(request) => self.offer_transfer(request),
+            TransferDelivery::SelectedVarta(request) => {
+                encode_transfer(&request)?;
+                if request.origin != TransferOrigin::Explorer || self.pending_varta.is_some() {
+                    return Err(std::io::Error::other(
+                        "Недопустимий або зайнятий канал вибору Провідника",
+                    ));
+                }
+                self.pending_varta = Some(request);
+                self.context.request_repaint();
+                Ok(())
+            }
+        }
+    }
+    pub(super) fn dispatch_pending_varta(&mut self) {
+        if self.state.ready
+            && !self.state.planning
+            && !self.state.dispatching
+            && !self.closing
+            && self.chooser.is_none()
+            && let Some(request) = self.pending_varta.clone()
+            && self.command(Command::Dispatch {
+                request,
+                engine: DispatchEngine::VartaCopy,
+                conflict: Conflict::Error,
+            })
+        {
+            self.pending_varta = None;
+            self.close_form();
+        }
+    }
     pub fn offer_transfer(&mut self, request: TransferRequest) -> std::io::Result<()> {
         encode_transfer(&request)?;
         if self.chooser.is_some() {

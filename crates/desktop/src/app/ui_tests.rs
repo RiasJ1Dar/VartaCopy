@@ -36,6 +36,61 @@ fn fixture() -> (tempfile::TempDir, App) {
     update(&mut app, |s| s.ready && s.files.is_some());
     (root, app)
 }
+#[test]
+fn selected_shell_request_waits_for_dispatch_and_never_opens_another_chooser() {
+    use vartacopy_shell_windows::transfer::{
+        TransferDelivery, TransferOperation, TransferOrigin, TransferRequest,
+    };
+    let (root, mut app) = fixture();
+    let source = root.path().join("shell-choice.txt");
+    fs::write(&source, b"explicit shell choice").unwrap();
+    let source = source.canonicalize().unwrap();
+    let request = TransferRequest {
+        id: [0x89; 16],
+        operation: TransferOperation::Copy,
+        origin: TransferOrigin::Explorer,
+        sources: vec![source.clone()],
+        destination: root.path().join("dest"),
+    };
+    app.receive_transfer(TransferDelivery::SelectedVarta(request.clone()))
+        .unwrap();
+    assert!(app.chooser.is_none());
+    app.state.dispatching = true;
+    app.dispatch_pending_varta();
+    assert!(app.pending_varta.is_some());
+    app.state.dispatching = false;
+    app.dispatch_pending_varta();
+    assert!(app.pending_varta.is_none());
+    update(&mut app, |s| {
+        s.history
+            .iter()
+            .any(|j| j.source == source && j.status == "completed")
+            && !s.dispatching
+    });
+    assert_eq!(
+        fs::read(root.path().join("dest/shell-choice.txt")).unwrap(),
+        b"explicit shell choice"
+    );
+    fs::remove_file(&source).unwrap();
+    app.receive_transfer(TransferDelivery::SelectedVarta(request))
+        .unwrap();
+    app.dispatch_pending_varta();
+    update(&mut app, |s| {
+        !s.dispatching
+            && s.notice
+                .as_ref()
+                .is_some_and(|n| n.contains("Повторного запуску"))
+    });
+    assert_eq!(
+        app.state
+            .history
+            .iter()
+            .filter(|j| j.source == source)
+            .count(),
+        1
+    );
+    assert!(app.chooser.is_none());
+}
 fn update(app: &mut App, condition: impl Fn(&State) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

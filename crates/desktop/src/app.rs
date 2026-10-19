@@ -101,7 +101,8 @@ pub struct App {
     contrast: Option<system_style::Palette>,
     settings_watch: Option<system_style::Watch>,
     shell: Option<mpsc::Receiver<Vec<PathBuf>>>,
-    transfers: Option<mpsc::Receiver<vartacopy_shell_windows::transfer::TransferRequest>>,
+    transfers: Option<mpsc::Receiver<vartacopy_shell_windows::transfer::TransferDelivery>>,
+    pending_varta: Option<vartacopy_shell_windows::transfer::TransferRequest>,
     chooser: Option<vartacopy_shell_windows::transfer::TransferRequest>,
     chooser_focus: bool,
     shell_action: Option<mpsc::Receiver<std::io::Result<String>>>,
@@ -227,6 +228,7 @@ impl App {
             settings_watch,
             shell: None,
             transfers: None,
+            pending_varta: None,
             chooser: None,
             chooser_focus: false,
             shell_action: None,
@@ -390,11 +392,12 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.chooser.is_none()
+            && self.pending_varta.is_none()
             && let Some(inbox) = &self.transfers
         {
             match inbox.try_recv() {
                 Ok(request) => {
-                    if let Err(error) = self.offer_transfer(request) {
+                    if let Err(error) = self.receive_transfer(request) {
                         self.banner = Some(error.to_string());
                     }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -459,6 +462,7 @@ impl eframe::App for App {
             Ok(state) => self.state = state,
             Err(e) => self.banner = Some(e.to_string()),
         }
+        self.dispatch_pending_varta();
         if let Some(receiver) = self.picker.as_ref() {
             match receiver.try_recv() {
                 Ok((kind, Some(path))) => {

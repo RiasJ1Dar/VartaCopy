@@ -8,6 +8,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut operation = None;
     let mut request_id = None;
     let mut transfer_stdin = false;
+    let mut selected_varta = false;
     while let Some(flag) = args.next() {
         if flag == "--journal" && path.is_none() {
             path = Some(PathBuf::from(
@@ -15,6 +16,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ));
         } else if flag == "--transfer-stdin" && !transfer_stdin {
             transfer_stdin = true;
+        } else if flag == "--enqueue-transfer-stdin" && !transfer_stdin {
+            transfer_stdin = true;
+            selected_varta = true;
         } else if flag == "--source" {
             sources.push(PathBuf::from(
                 args.next().ok_or("--source requires a path")?,
@@ -88,6 +92,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let elected = match &transfer {
+        Some(request) if selected_varta => {
+            vartacopy_shell_windows::instance::Instance::enter_selected_transfer(&path, request)?
+        }
         Some(request) => {
             vartacopy_shell_windows::instance::Instance::enter_transfer(&path, request)?
         }
@@ -118,7 +125,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )?;
             if let Some(request) = transfer {
-                app.offer_transfer(request)?;
+                app.receive_transfer(if selected_varta {
+                    vartacopy_shell_windows::transfer::TransferDelivery::SelectedVarta(request)
+                } else {
+                    vartacopy_shell_windows::transfer::TransferDelivery::Choose(request)
+                })?;
             }
             Ok(Box::new(app))
         }),

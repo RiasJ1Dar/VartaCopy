@@ -12,6 +12,7 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 
 pub const COPYDATA_TRANSFER_MAGIC: usize = 0x56435232;
+pub const COPYDATA_SELECTED_VARTA_MAGIC: usize = 0x56435233;
 pub const TRANSFER_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_PATH_UNITS: usize = 32767;
 
@@ -40,6 +41,25 @@ pub struct TransferRequest {
     pub origin: TransferOrigin,
     pub sources: Vec<PathBuf>,
     pub destination: PathBuf,
+}
+
+/// A selected VartaCopy delivery follows an explicit choice in the shell UI.
+/// The distinct message type prevents an ordinary draft from starting work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransferDelivery {
+    Choose(TransferRequest),
+    SelectedVarta(TransferRequest),
+}
+
+pub fn decode_delivery(magic: usize, bytes: &[u8]) -> io::Result<TransferDelivery> {
+    let request = decode_transfer(bytes)?;
+    match magic {
+        COPYDATA_TRANSFER_MAGIC => Ok(TransferDelivery::Choose(request)),
+        COPYDATA_SELECTED_VARTA_MAGIC if request.origin == TransferOrigin::Explorer => {
+            Ok(TransferDelivery::SelectedVarta(request))
+        }
+        _ => Err(invalid("unsupported transfer delivery or origin")),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -218,6 +238,27 @@ mod tests {
                 assert_eq!(decode_transfer(&encode_transfer(&r).unwrap()).unwrap(), r);
             }
         }
+    }
+    #[test]
+    fn selected_delivery_requires_its_own_message_type_and_explorer_origin() {
+        let mut r = request();
+        let bytes = encode_transfer(&r).unwrap();
+        assert_eq!(
+            decode_delivery(COPYDATA_TRANSFER_MAGIC, &bytes).unwrap(),
+            TransferDelivery::Choose(r.clone())
+        );
+        assert!(decode_delivery(COPYDATA_SELECTED_VARTA_MAGIC, &bytes).is_err());
+        r.origin = TransferOrigin::Explorer;
+        let bytes = encode_transfer(&r).unwrap();
+        assert_eq!(
+            decode_delivery(COPYDATA_SELECTED_VARTA_MAGIC, &bytes).unwrap(),
+            TransferDelivery::SelectedVarta(r.clone())
+        );
+        assert_eq!(
+            decode_delivery(COPYDATA_TRANSFER_MAGIC, &bytes).unwrap(),
+            TransferDelivery::Choose(r)
+        );
+        assert!(decode_delivery(0, &bytes).is_err());
     }
     #[test]
     fn pipe_requires_one_complete_bounded_request_and_propagates_read_errors() {

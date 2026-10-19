@@ -125,7 +125,7 @@ struct Data {
     changed: AtomicBool,
     destroyed: AtomicBool,
     inbox: Option<mpsc::SyncSender<Vec<PathBuf>>>,
-    transfers: Option<mpsc::SyncSender<vartacopy_shell_windows::transfer::TransferRequest>>,
+    transfers: Option<mpsc::SyncSender<vartacopy_shell_windows::transfer::TransferDelivery>>,
 }
 /// Callback registration and destruction are restricted to the owning UI thread.
 pub(super) struct Watch {
@@ -177,7 +177,7 @@ impl Watch {
     }
     pub fn transfers(
         &mut self,
-    ) -> io::Result<mpsc::Receiver<vartacopy_shell_windows::transfer::TransferRequest>> {
+    ) -> io::Result<mpsc::Receiver<vartacopy_shell_windows::transfer::TransferDelivery>> {
         let (tx, rx) = mpsc::sync_channel(8);
         self.data
             .as_mut()
@@ -225,7 +225,9 @@ unsafe extern "system" fn changed(
             let request = unsafe { &*(lparam as *const COPYDATASTRUCT) };
             if !matches!(
                 request.dwData,
-                COPYDATA_MAGIC | vartacopy_shell_windows::transfer::COPYDATA_TRANSFER_MAGIC
+                COPYDATA_MAGIC
+                    | vartacopy_shell_windows::transfer::COPYDATA_TRANSFER_MAGIC
+                    | vartacopy_shell_windows::transfer::COPYDATA_SELECTED_VARTA_MAGIC
             ) || request.cbData as usize > MAX_REQUEST_BYTES
                 || request.lpData.is_null()
             {
@@ -235,8 +237,11 @@ unsafe extern "system" fn changed(
             let bytes = unsafe {
                 std::slice::from_raw_parts(request.lpData as *const u8, request.cbData as usize)
             };
-            if request.dwData == vartacopy_shell_windows::transfer::COPYDATA_TRANSFER_MAGIC {
-                return match vartacopy_shell_windows::transfer::decode_transfer(bytes) {
+            if request.dwData != COPYDATA_MAGIC {
+                return match vartacopy_shell_windows::transfer::decode_delivery(
+                    request.dwData,
+                    bytes,
+                ) {
                     Ok(request) => {
                         if data
                             .transfers
@@ -452,7 +457,11 @@ mod tests {
         assert_eq!(inbox.try_recv().unwrap(), selected);
         assert!(inbox.try_recv().is_err());
         for _ in 0..8 {
-            let request = transfers.try_recv().unwrap();
+            let vartacopy_shell_windows::transfer::TransferDelivery::Choose(request) =
+                transfers.try_recv().unwrap()
+            else {
+                panic!("ordinary IPC must retain engine choice")
+            };
             assert_eq!(request.id, [8; 16]);
             assert_eq!(request.sources, selected);
             assert_eq!(
