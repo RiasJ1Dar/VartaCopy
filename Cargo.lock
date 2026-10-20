@@ -2909,7 +2909,7 @@ dependencies = [
 
 [[package]]
 name = "vartacopy-cli"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "clap",
  "ctrlc",
@@ -2922,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "vartacopy-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "blake3",
  "rusqlite",
@@ -2935,7 +2935,7 @@ dependencies = [
 
 [[package]]
 name = "vartacopy-desktop"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "eframe",
  "raw-window-handle",
@@ -2949,7 +2949,7 @@ dependencies = [
 
 [[package]]
 name = "vartacopy-explorer-command"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -2958,7 +2958,7 @@ dependencies = [
 
 [[package]]
 name = "vartacopy-explorer-drop-probe"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2970,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "vartacopy-platform-windows"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "tempfile",
@@ -2979,7 +2979,7 @@ dependencies = [
 
 [[package]]
 name = "vartacopy-shell-windows"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "blake3",
  "serde",

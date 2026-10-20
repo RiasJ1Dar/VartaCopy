@@ -42,6 +42,11 @@ def verify(archive: Path) -> dict:
             raise ValueError("Unrecognized portable package format/target")
         files = manifest["files"]
         required = {"vartacopy.exe", "vartacopy-gui.exe", "README.txt", "THIRD-PARTY.json"}
+        integrations = manifest.get("integrations", [])
+        if not isinstance(integrations, list) or any(item != "explorer-transfer" for item in integrations):
+            raise ValueError("Unrecognized package integration")
+        if "explorer-transfer" in integrations:
+            required.update({"vartacopy_transfer.dll", "tools/explorer_drop_probe.py", "EXPLORER.txt"})
         paths = [file["path"] for file in files]
         if len(paths) != len(set(paths)) or not required.issubset(paths):
             raise ValueError("Duplicate manifest path or missing required file")
@@ -160,7 +165,7 @@ def build() -> dict:
     if sys.platform != "win32":
         raise ValueError("Build this package on Windows with the MSVC Rust toolchain")
     # Explicit target and binary names prevent a case-insensitive CLI/GUI collision.
-    subprocess.run(["cargo", "build", "--locked", "--release", "--target", TARGET, "--bin", "vartacopy", "--bin", "vartacopy-gui"], cwd=ROOT, check=True)
+    subprocess.run(["cargo", "build", "--locked", "--release", "--target", TARGET, "--workspace"], cwd=ROOT, check=True)
     metadata = json.loads(command("cargo", "metadata", "--no-deps", "--format-version", "1"))
     package = next(p for p in metadata["packages"] if p["name"] == "vartacopy-desktop")
     version = package["version"]
@@ -172,10 +177,13 @@ def build() -> dict:
     output.mkdir(parents=True, exist_ok=False)
     binary_root = ROOT / "target" / TARGET / "release"
     imports = {}
-    for name in ("vartacopy.exe", "vartacopy-gui.exe"):
+    for name in ("vartacopy.exe", "vartacopy-gui.exe", "vartacopy_transfer.dll"):
         imports[name] = portable_imports(binary_root / name)
         shutil.copyfile(binary_root / name, output / name)
     shutil.copyfile(ROOT / "LICENSE.txt", output / "LICENSE.txt")
+    (output / "tools").mkdir()
+    shutil.copyfile(ROOT / "tools" / "explorer_drop_probe.py", output / "tools" / "explorer_drop_probe.py")
+    shutil.copyfile(ROOT / "packaging" / "explorer-transfer.rst", output / "EXPLORER.txt")
     notices = dependencies(output)
     (output / "README.txt").write_text(f"""VartaCopy {version} — Windows x64, попередня версія
 
@@ -200,7 +208,17 @@ Windows 11: «Показати додаткові параметри». Інте
 підтвердити копіювання у формі. Реєстрація лише для поточного користувача.
 Щоб прибрати: «Прибрати меню VartaCopy»; зробіть це перед видаленням portable.
 CLI: vartacopy.exe explorer install / status / remove.
-Стандартні Ctrl+C/Ctrl+V не змінюються. Повторний запуск відкриває спільне вікно.
+Це додаткове меню саме не змінює Ctrl+C/Ctrl+V. Повторний запуск відкриває спільне вікно.
+
+Вибір Explorer/VartaCopy при Ctrl+V і перетягуванні: окремий експериментальний
+модуль vartacopy_transfer.dll. Встановлення добровільне й описане в EXPLORER.txt;
+для реєстрації потрібен Python3.11+, для машинної реєстрації — адміністратор.
+Звичайний запуск GUI цього не потребує. Вікно вибору темне; системний
+High Contrast використовує стандартний діалог Windows. Для VartaCopy існуюче
+ім’я є помилкою; скасування не запускає передачу.
+
+«Компактний вигляд» показує передачу з графіком швидкості; повна черга
+та подробиці доступні в основному вікні. Дію Copy/Move вибирайте перед запуском.
 
 Журнал: %LOCALAPPDATA%\\VartaCopy\\jobs.sqlite3, на локальному фіксованому диску.
 Інший журнал: vartacopy-gui.exe --journal D:\\VartaCopy\\jobs.sqlite3
@@ -208,10 +226,16 @@ CLI: vartacopy.exe explorer install / status / remove.
 Після аварії відкрийте історію та відновіть перервану операцію.
 Програма перевіряє раніше записані блоки; це може тривати певний час.
 «Зупинити» залишає власні проміжні дані для можливого відновлення.
-Джерело не видаляється. Існуючі файли не перезаписуються; каталоги не об’єднуються.
+Copy зберігає джерело. Move видаляє його після перевіреного копіювання
+й окремої звірки ідентичності/вмісту/ADS. Для захисту видалення потрібна
+локальна NTFS з доступним TxF. Якщо захист недоступний або стан змінився,
+джерело зберігається, результат є незавершеним. Відсутність старого імені
+після аварії сама не доводить завершення Move. Існуючі файли не перезаписуються;
+каталоги не об’єднуються.
 
 CLI, приклади:
   vartacopy.exe copy "D:\\Джерело" "D:\\Копії" --json
+  vartacopy.exe move "D:\\Джерело" "D:\\Архів" --json
   vartacopy.exe copy "D:\\Джерело" "D:\\Копії" --enqueue --on-conflict keep-both
   vartacopy.exe queue --run --json
   vartacopy.exe jobs --json
@@ -225,8 +249,9 @@ CLI, приклади:
 Hardlinks копіюються як незалежні файли. ADS каталогів блокують операцію.
 ACL та власник успадковуються від призначення; повна тотожність метаданих
 не заявляється. Основні перевірки виконано на локальній NTFS, Windows x64.
-Move, overwrite, повні ACL/owner/audit, сучасне меню Windows 11, filters та
-повна матриця USB/SMB/DPI ще розробляються. Це не реліз1.0.
+Overwrite, повні ACL/owner/audit, filters та повна матриця USB/SMB/DPI
+ще розробляються. Сучасне меню Windows11 зі sparse MSIX є окремим модулем
+із вимогою довіреного підпису; такий пакет не входить у цей ZIP. Це не реліз1.0.
 
 manifest.json містить SHA-256 кожного файла пакета та revision вихідного коду.
 THIRD-PARTY.json містить інвентар залежностей; тексти з їхніх пакетів — у licenses/.
@@ -237,14 +262,20 @@ THIRD-PARTY.json містить інвентар залежностей; тек�
             with path.open("rb") as stream:
                 sha = digest(stream)
             files.append({"path": path.relative_to(output).as_posix(), "bytes": path.stat().st_size, "sha256": sha})
-    manifest = {"format": "vartacopy-portable", "version": version, "target": TARGET, "revision": revision, "source_dirty": dirty, "rustc": command("rustc", "--version"), "dependencies": len(notices), "imports": imports, "files": files}
+    manifest = {"format": "vartacopy-portable", "version": version, "target": TARGET, "revision": revision, "source_dirty": dirty, "integrations": ["explorer-transfer"], "rustc": command("rustc", "--version"), "dependencies": len(notices), "imports": imports, "files": files}
     (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     archive = output.parent / (label + ".zip")
     with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
         for path in sorted(output.rglob("*")):
             if path.is_file():
                 bundle.write(path, (Path(label) / path.relative_to(output)).as_posix())
-    return verify(archive)
+    result = verify(archive)
+    with archive.open("rb") as stream:
+        archive_sha256 = digest(stream)
+    checksum = archive.with_suffix(archive.suffix + ".sha256")
+    with checksum.open("x", encoding="ascii") as stream:
+        stream.write(f"{archive_sha256}  {archive.name}\n")
+    return {**result, "version": version, "sha256": archive_sha256, "checksum": str(checksum)}
 
 
 def main() -> None:
