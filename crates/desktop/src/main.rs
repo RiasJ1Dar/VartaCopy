@@ -103,6 +103,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let Some(instance) = elected else {
         return Ok(());
     };
+    let _presence = vartacopy_shell_windows::setup::Presence::new()?;
     let marker = instance.marker().to_vec();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

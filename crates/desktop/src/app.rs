@@ -1,5 +1,6 @@
 mod chooser;
 mod dialogs;
+mod integration_panel;
 mod navigation;
 mod system_style;
 mod transfer_panel;
@@ -106,6 +107,7 @@ pub struct App {
     chooser: Option<vartacopy_shell_windows::transfer::TransferRequest>,
     chooser_focus: bool,
     shell_action: Option<mpsc::Receiver<std::io::Result<String>>>,
+    integration: integration_panel::Panel,
     banner: Option<String>,
     picker: Option<mpsc::Receiver<(Picker, Option<PathBuf>)>>,
     closing: bool,
@@ -232,6 +234,7 @@ impl App {
             chooser: None,
             chooser_focus: false,
             shell_action: None,
+            integration: integration_panel::Panel::default(),
             banner: None,
             picker: None,
             closing: false,
@@ -391,6 +394,9 @@ impl App {
 }
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(message) = self.integration.poll() {
+            self.banner = Some(message);
+        }
         if self.chooser.is_none()
             && self.pending_varta.is_none()
             && let Some(inbox) = &self.transfers

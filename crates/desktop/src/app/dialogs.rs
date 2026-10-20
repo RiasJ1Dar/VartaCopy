@@ -363,6 +363,10 @@ impl App {
                 ));
                 ui.separator();
                 ui.label(format!("Журнал: {}", self.journal.display()));
+                ui.separator();
+                self.integration.show(ui,!self.closing);
+                ui.separator();
+                ui.strong("Додаткова команда в контекстному меню");
                 ui.label("Меню Провідника для поточного користувача. Після перенесення програми додайте меню з нового розташування.");
                 ui.add_enabled_ui(self.shell_action.is_none(),|ui| {ui.horizontal_wrapped(|ui| {
                     if ui.button("Додати меню Провідника").clicked() {self.shell_registration(true);}

@@ -394,6 +394,7 @@ fn install_with_hook(
     Ok(())
 }
 pub fn install(installation: &Installation) -> io::Result<Status> {
+    let _guard = crate::setup::configuration_lock()?;
     install_at(installation, HKEY_LOCAL_MACHINE, String::new())?;
     notify();
     status(installation)
@@ -443,6 +444,7 @@ fn remove_with_hook(
     update.commit()
 }
 pub fn remove(installation: &Installation) -> io::Result<Status> {
+    let _guard = crate::setup::configuration_lock()?;
     remove_at(installation, HKEY_LOCAL_MACHINE, String::new())?;
     notify();
     status(installation)
