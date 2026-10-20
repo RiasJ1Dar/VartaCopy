@@ -10,6 +10,35 @@ use windows_sys::Win32::{
     UI::{Shell::*, WindowsAndMessaging::SW_HIDE},
 };
 pub const PRESENCE_MUTEX: &str = r"Local\VartaCopy.Running";
+pub const INSTALLER_MUTEX: &str = r"Global\VartaCopy.Installer.v1";
+fn wait_for_installer(name: &str, timeout: std::time::Duration) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // SAFETY: Open an existing named object only; no mutex ownership is acquired.
+        let handle = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide(name).as_ptr()) };
+        if handle.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                return Ok(());
+            }
+            if error.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
+                return Err(error);
+            }
+        } else {
+            // SAFETY: The read-only probe handle is uniquely owned and no longer needed.
+            if unsafe { CloseHandle(handle) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Виконується встановлення VartaCopy. Дочекайтеся завершення й запустіть програму знову.",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
 pub(crate) struct KernelMutex {
     handle: HANDLE,
     acquired: bool,
@@ -71,6 +100,7 @@ pub struct Presence {
 }
 impl Presence {
     pub fn new() -> io::Result<Self> {
+        wait_for_installer(INSTALLER_MUTEX, std::time::Duration::from_secs(15))?;
         Ok(Self {
             _mutex: KernelMutex::open(PRESENCE_MUTEX, None)?,
         })
@@ -236,5 +266,18 @@ mod tests {
         let presence_name = format!("{name}.presence");
         let _a = KernelMutex::open(&presence_name, None).unwrap();
         let _b = KernelMutex::open(&presence_name, None).unwrap();
+    }
+    #[test]
+    fn startup_waits_until_the_installer_has_released_its_presence() {
+        let name = format!(r"Local\VartaCopy.Installer.Tests.{}", std::process::id());
+        let guard = KernelMutex::open(&name, None).unwrap();
+        assert_eq!(
+            wait_for_installer(&name, std::time::Duration::from_millis(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(guard);
+        wait_for_installer(&name, std::time::Duration::from_millis(1)).unwrap();
     }
 }

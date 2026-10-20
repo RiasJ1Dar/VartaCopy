@@ -43,10 +43,12 @@ def verify(archive: Path) -> dict:
         files = manifest["files"]
         required = {"vartacopy.exe", "vartacopy-gui.exe", "README.txt", "THIRD-PARTY.json"}
         integrations = manifest.get("integrations", [])
-        if not isinstance(integrations, list) or any(item != "explorer-transfer" for item in integrations):
+        if not isinstance(integrations, list) or any(item not in {"explorer-transfer", "explorer-transfer-native"} for item in integrations):
             raise ValueError("Unrecognized package integration")
         if "explorer-transfer" in integrations:
             required.update({"vartacopy_transfer.dll", "tools/explorer_drop_probe.py", "EXPLORER.txt"})
+        if "explorer-transfer-native" in integrations:
+            required.update({"vartacopy_transfer.dll", "EXPLORER.txt"})
         paths = [file["path"] for file in files]
         if len(paths) != len(set(paths)) or not required.issubset(paths):
             raise ValueError("Duplicate manifest path or missing required file")
@@ -181,8 +183,6 @@ def build() -> dict:
         imports[name] = portable_imports(binary_root / name)
         shutil.copyfile(binary_root / name, output / name)
     shutil.copyfile(ROOT / "LICENSE.txt", output / "LICENSE.txt")
-    (output / "tools").mkdir()
-    shutil.copyfile(ROOT / "tools" / "explorer_drop_probe.py", output / "tools" / "explorer_drop_probe.py")
     shutil.copyfile(ROOT / "packaging" / "explorer-transfer.rst", output / "EXPLORER.txt")
     notices = dependencies(output)
     (output / "README.txt").write_text(f"""VartaCopy {version} — Windows x64, попередня версія
@@ -212,7 +212,9 @@ CLI: vartacopy.exe explorer install / status / remove.
 
 Вибір Explorer/VartaCopy при Ctrl+V і перетягуванні: окремий експериментальний
 модуль vartacopy_transfer.dll. Встановлення добровільне й описане в EXPLORER.txt;
-для реєстрації потрібен Python3.11+, для машинної реєстрації — адміністратор.
+для реєстрації відкрийте «Вигляд і правила…» → «Інтеграція передачі Провідника».
+Натисніть «Увімкнути вибір» і підтвердьте UAC. Python не потрібен.
+Для видалення натисніть «Вимкнути вибір» до перенесення portable-каталогу.
 Звичайний запуск GUI цього не потребує. Вікно вибору темне; системний
 High Contrast використовує стандартний діалог Windows. Для VartaCopy існуюче
 ім’я є помилкою; скасування не запускає передачу.
@@ -262,7 +264,7 @@ THIRD-PARTY.json містить інвентар залежностей; тек�
             with path.open("rb") as stream:
                 sha = digest(stream)
             files.append({"path": path.relative_to(output).as_posix(), "bytes": path.stat().st_size, "sha256": sha})
-    manifest = {"format": "vartacopy-portable", "version": version, "target": TARGET, "revision": revision, "source_dirty": dirty, "integrations": ["explorer-transfer"], "rustc": command("rustc", "--version"), "dependencies": len(notices), "imports": imports, "files": files}
+    manifest = {"format": "vartacopy-portable", "version": version, "target": TARGET, "revision": revision, "source_dirty": dirty, "integrations": ["explorer-transfer-native"], "rustc": command("rustc", "--version"), "dependencies": len(notices), "imports": imports, "files": files}
     (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     archive = output.parent / (label + ".zip")
     with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
