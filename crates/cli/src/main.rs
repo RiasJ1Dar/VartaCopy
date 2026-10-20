@@ -29,6 +29,19 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage the machine-wide Explorer transfer chooser (install/remove require elevation).
+    Integration {
+        #[arg(value_enum)]
+        action: IntegrationAction,
+        /// GUI executable; defaults to vartacopy-gui.exe next to this CLI.
+        #[arg(long)]
+        gui: Option<PathBuf>,
+        /// Transfer DLL; defaults to vartacopy_transfer.dll next to the GUI.
+        #[arg(long)]
+        dll: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Install, remove, or inspect per-user Explorer context menu integration.
     Explorer {
         #[arg(value_enum)]
@@ -174,6 +187,13 @@ enum Direction {
     Up,
     Down,
 }
+#[derive(Clone, Copy, ValueEnum)]
+enum IntegrationAction {
+    Check,
+    Install,
+    Remove,
+    Status,
+}
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Policy {
@@ -209,6 +229,29 @@ fn run(
     control: &Control,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     match args.command {
+        Command::Integration {
+            action,
+            gui,
+            dll,
+            json,
+        } => {
+            use vartacopy_shell_windows::transfer_registration::{
+                self as integration, Installation,
+            };
+            let gui = gui.unwrap_or(std::env::current_exe()?.with_file_name("vartacopy-gui.exe"));
+            let installation = match dll {
+                Some(dll) => Installation::new(&gui, &dll)?,
+                None => Installation::beside(&gui)?,
+            };
+            let result = match action {
+                IntegrationAction::Check => integration::preflight(&installation)?,
+                IntegrationAction::Install => integration::install(&installation)?,
+                IntegrationAction::Remove => integration::remove(&installation)?,
+                IntegrationAction::Status => integration::status(&installation)?,
+            };
+            emit(&result, json)?;
+            Ok(0)
+        }
         Command::Explorer { action, gui } => {
             let gui = match gui {
                 Some(path) => path,
@@ -447,6 +490,7 @@ fn main() -> ExitCode {
             ..
         }
         | Command::Verify { json, .. }
+        | Command::Integration { json, .. }
         | Command::Jobs { json, .. }
         | Command::Resume { json, .. }
         | Command::Show { json, .. }

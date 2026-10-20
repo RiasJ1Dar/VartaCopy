@@ -4,6 +4,7 @@ pub mod instance;
 pub mod native;
 pub mod registration;
 pub mod transfer;
+pub mod transfer_registration;
 use std::{
     ffi::OsString,
     io,
