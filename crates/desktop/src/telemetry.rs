@@ -120,16 +120,18 @@ impl Meter {
             at: now,
             written: self.snapshot.written,
         };
-        let len = self.snapshot.samples.len();
-        if len > 1 && now.saturating_sub(self.snapshot.samples[len - 2].at) < SAMPLE_INTERVAL {
-            *self.snapshot.samples.back_mut().unwrap() = sample;
-        } else {
+        // Keep completed observations fixed. Replacing a point and then
+        // appending immediately after its previous interval boundary created
+        // near-zero time deltas (and fictitious GiB/s graph spikes).
+        // The live written counter still includes every write between samples.
+        if now.saturating_sub(self.snapshot.samples.back().unwrap().at) >= SAMPLE_INTERVAL {
             self.snapshot.samples.push_back(sample);
             if self.snapshot.samples.len() > HISTORY_LIMIT {
                 self.snapshot.samples.pop_front();
             }
         }
     }
+
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.clone()
     }
@@ -138,6 +140,32 @@ impl Meter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn writes_on_both_sides_of_a_sample_boundary_cannot_create_a_millisecond_spike() {
+        let mut meter = Meter::new(1);
+        let mib = 1024 * 1024;
+        for milliseconds in [250, 251, 500, 501] {
+            meter.observe(
+                Duration::from_millis(milliseconds),
+                &event(Phase::BlockWritten, mib, 0, mib),
+            );
+        }
+        let snapshot = meter.snapshot();
+        assert_eq!(snapshot.written, 4 * mib);
+        assert!(
+            snapshot
+                .samples
+                .iter()
+                .zip(snapshot.samples.iter().skip(1))
+                .all(|(previous, next)| next.at - previous.at >= SAMPLE_INTERVAL)
+        );
+        assert!(
+            snapshot
+                .graph_at(Duration::from_millis(501))
+                .iter()
+                .all(|(_, rate)| *rate <= (2 * mib) as f64 / SAMPLE_INTERVAL.as_secs_f64())
+        );
+    }
     fn event(phase: Phase, delta: u64, stream: usize, bytes: u64) -> Progress {
         Progress {
             job_id: 1,
