@@ -297,7 +297,8 @@ impl App {
                             if let Some(e) = &self.banner {
                                 ui.colored_label(ui.visuals().error_fg_color, e);
                             }
-                            for e in &self.state.errors {
+                            // Latest failure first, including when the bounded log rotates.
+                            for e in self.state.errors.iter().rev() {
                                 ui.colored_label(ui.visuals().error_fg_color, e);
                                 ui.separator();
                             }

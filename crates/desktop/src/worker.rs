@@ -412,6 +412,7 @@ fn actor(
                         let mut peer = journal.peer()?;
                         let tx = sender.clone();
                         let cancel = scan_cancel.clone();
+                        let diagnostic_path = path.clone();
                         cancel.store(false, Ordering::Release);
                         let handle = thread::Builder::new()
                             .name("vartacopy-dispatch".into())
@@ -422,11 +423,22 @@ fn actor(
                                             &mut peer, &request, engine, conflict, &cancel,
                                         )
                                     }));
-                                let result = outcome.unwrap_or_else(|_| {
-                                    Err(Error::Journal(
-                                        "dispatch panicked; inspect journal before retrying".into(),
-                                    ))
-                                });
+                                let result = outcome
+                                    .unwrap_or_else(|_| {
+                                        Err(Error::Journal(
+                                            "dispatch panicked; inspect journal before retrying"
+                                                .into(),
+                                        ))
+                                    })
+                                    .map_err(|error| {
+                                        crate::transfer_failure::describe(
+                                            &peer,
+                                            &diagnostic_path,
+                                            &request,
+                                            engine,
+                                            error,
+                                        )
+                                    });
                                 if let Err(error) = tx.send(Message::Dispatched(result)) {
                                     eprintln!("VartaCopy: dispatch result undelivered: {error}");
                                 }
@@ -790,6 +802,58 @@ fn actor(
 mod tests {
     use super::*;
     use std::{fs, sync::atomic::AtomicUsize, time::Instant};
+    #[test]
+    fn failed_dispatch_preflight_preserves_sources_and_records_request_without_success_job() {
+        use vartacopy_shell_windows::transfer::{
+            TransferOperation, TransferOrigin, TransferRequest,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("jobs.sqlite");
+        let source = root.path().join("дані-😀.txt");
+        fs::write(&source, b"untouched source").unwrap();
+        let destination = root.path().join("destination-file");
+        fs::write(&destination, b"not a directory").unwrap();
+        let client = Client::start(path.clone()).unwrap();
+        wait(&client, |s| s.ready);
+        client
+            .send(Command::Dispatch {
+                request: TransferRequest {
+                    id: [51; 16],
+                    operation: TransferOperation::Move,
+                    origin: TransferOrigin::Explorer,
+                    sources: vec![source.clone()],
+                    destination: destination.clone(),
+                },
+                engine: vartacopy_core::journal::DispatchEngine::VartaCopy,
+                conflict: Conflict::Error,
+            })
+            .unwrap();
+        let failed = wait(&client, |s| !s.dispatching && !s.errors.is_empty());
+        assert!(
+            failed
+                .errors
+                .back()
+                .unwrap()
+                .contains("Переміщення не розпочато")
+        );
+        assert!(failed.errors.back().unwrap().contains("Звіт:"));
+        assert!(failed.queue.is_empty() && failed.history.is_empty());
+        assert!(failed.active.is_none());
+        assert_eq!(fs::read(&source).unwrap(), b"untouched source");
+        assert_eq!(fs::read(&destination).unwrap(), b"not a directory");
+        client.shutdown();
+        wait(&client, |s| s.closed);
+        drop(client);
+        let journal = Journal::open(&path).unwrap();
+        assert!(journal.dispatch_receipt([51; 16]).unwrap().is_none());
+        assert!(journal.jobs(10, 0).unwrap().is_empty());
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(path.with_file_name("jobs.sqlite.last-transfer-error.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["acceptance"], "not_accepted");
+        assert_eq!(report["request"]["id"], serde_json::json!(vec![51; 16]));
+    }
     #[test]
     fn dispatch_choice_runs_varta_once_and_replay_does_not_rescan_or_restart() {
         let root = tempfile::tempdir().unwrap();

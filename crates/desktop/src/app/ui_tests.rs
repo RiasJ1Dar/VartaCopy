@@ -37,6 +37,32 @@ fn fixture() -> (tempfile::TempDir, App) {
     (root, app)
 }
 #[test]
+fn new_worker_error_opens_readable_messages_once_without_changing_selected_job() {
+    let (_root, mut app) = fixture();
+    let selected = app.selected;
+    let mut state = app.state.clone();
+    state.errors.push_back(
+        "Копіювання не розпочато; запит не додано до черги. Причина: os error 87.".into(),
+    );
+    app.accept_snapshot(state.clone());
+    assert!(app.messages_open);
+    assert_eq!(app.selected, selected);
+    let nodes = render(&mut app, [800.0, 600.0], None);
+    assert!(nodes.iter().any(|(_, n)| n.label() == Some("Повідомлення")));
+    assert!(nodes.iter().any(|(_, n)| {
+        n.label()
+            .is_some_and(|s| s.contains("Копіювання не розпочато"))
+    }));
+    app.messages_open = false;
+    app.accept_snapshot(state.clone());
+    assert!(!app.messages_open); // Dismissing the window is respected on subsequent snapshots.
+    state.errors.push_back("Інша помилка".into());
+    app.accept_snapshot(state);
+    assert!(app.messages_open);
+    app.begin_close();
+    update(&mut app, |s| s.closed);
+}
+#[test]
 fn tray_exit_uses_durable_shutdown_and_hide_requires_an_available_icon() {
     let (_root, mut app) = fixture();
     let before = app

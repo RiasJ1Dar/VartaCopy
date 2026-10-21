@@ -117,6 +117,12 @@ pub struct App {
     context: egui::Context,
 }
 impl App {
+    fn accept_snapshot(&mut self, state: State) {
+        if !state.errors.is_empty() && state.errors != self.state.errors && !self.closing {
+            self.messages_open = true;
+        }
+        self.state = state;
+    }
     pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf) -> std::io::Result<Self> {
         let ctx = &cc.egui_ctx;
         ctx.enable_accesskit();
@@ -509,7 +515,7 @@ impl eframe::App for App {
             }
         }
         match self.client.snapshot() {
-            Ok(state) => self.state = state,
+            Ok(state) => self.accept_snapshot(state),
             Err(e) => self.banner = Some(e.to_string()),
         }
         self.dispatch_pending_varta();
