@@ -111,6 +111,7 @@ pub struct App {
     shell_action: Option<mpsc::Receiver<std::io::Result<String>>>,
     integration: integration_panel::Panel,
     banner: Option<String>,
+    logged_banner: Option<String>,
     picker: Option<mpsc::Receiver<(Picker, Option<PathBuf>)>>,
     closing: bool,
     journal: PathBuf,
@@ -250,6 +251,7 @@ impl App {
             shell_action: None,
             integration: integration_panel::Panel::default(),
             banner: tray_error,
+            logged_banner: None,
             picker: None,
             closing: false,
             journal: path,
@@ -550,6 +552,12 @@ impl eframe::App for App {
         }
         if self.file_open && self.file_details.is_none() {
             self.inspect_file();
+        }
+        if self.banner != self.logged_banner {
+            if let Some(message) = &self.banner {
+                self.client.diagnostic_message(message);
+            }
+            self.logged_banner = self.banner.clone();
         }
         let newest = self.state.history.first().map(|j| j.id);
         if newest != self.newest {

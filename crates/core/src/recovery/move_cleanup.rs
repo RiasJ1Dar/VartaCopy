@@ -215,6 +215,11 @@ fn persist_failure(
     error: Error,
     report: &mut RunReport,
 ) -> Error {
+    diagnostics::failure(
+        "job.cleanup_error",
+        &error,
+        serde_json::json!({"job_id":job.id,"entry":entry.ordinal,"source":diagnostics::path(&source_path(job,entry)),"target":entry.target.as_deref().map(diagnostics::path)}),
+    );
     if matches!(error, Error::Cancelled) {
         return error;
     }

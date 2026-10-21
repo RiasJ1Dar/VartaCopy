@@ -1,5 +1,9 @@
 //! A bounded, non-following scanner. Plans select entries; they are not filesystem snapshots.
-use crate::{Error, Result, check_cancel, source_file, validate_path};
+use crate::{
+    Error, Result, check_cancel,
+    diagnostics::{self, io as dio},
+    source_file, validate_path,
+};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fs::{self, File, ReadDir};
@@ -217,7 +221,7 @@ fn inspect(
         problem: None,
         snapshot: None,
     };
-    let initial = fs::symlink_metadata(&path)?;
+    let initial = dio("symlink_metadata", &path, fs::symlink_metadata(&path))?;
     if platform::is_reparse(&initial) {
         entry.kind = EntryKind::Reparse;
         entry.problem = Some("reparse point was not followed".into());
@@ -225,11 +229,21 @@ fn inspect(
     }
     let directory = initial.is_dir();
     let file = if directory {
-        platform::open_directory(&path, false)?
+        dio(
+            "open_directory",
+            &path,
+            platform::open_directory(&path, false),
+        )?
     } else {
-        source_file(&path)?
+        source_file(&path).inspect_err(|error| {
+            diagnostics::failure(
+                "scan.open_source",
+                error,
+                serde_json::json!({"path":diagnostics::path(&path)}),
+            )
+        })?
     };
-    let metadata = file.metadata()?;
+    let metadata = dio("metadata", &path, file.metadata())?;
     if metadata.file_attributes() & 0x4000 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -237,7 +251,11 @@ fn inspect(
         )
         .into());
     }
-    let streams = platform::streams(&path)?;
+    let streams = dio(
+        "FindFirstStreamW/FindNextStreamW",
+        &path,
+        platform::streams(&path),
+    )?;
     if directory && !streams.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -257,14 +275,18 @@ fn inspect(
     })?;
     entry.streams = streams.len();
     entry.snapshot = Some(Snapshot {
-        identity: platform::identity(&file)?,
+        identity: dio(
+            "GetFileInformationByHandleEx(FileIdInfo)",
+            &path,
+            platform::identity(&file),
+        )?,
         modified: metadata.last_write_time(),
         length: metadata.len(),
         attributes: metadata.file_attributes(),
         streams,
     });
     let frame = if directory {
-        Some((file, fs::read_dir(&path)?))
+        Some((file, dio("read_dir", &path, fs::read_dir(&path))?))
     } else {
         None
     };
@@ -272,6 +294,11 @@ fn inspect(
 }
 
 fn unsupported(relative: PathBuf, depth: usize, error: Error) -> PlannedEntry {
+    diagnostics::failure(
+        "scan.unsupported_entry",
+        &error,
+        serde_json::json!({"relative":diagnostics::path(&relative),"depth":depth}),
+    );
     PlannedEntry {
         relative,
         depth,
@@ -355,6 +382,10 @@ pub fn scan(
     options: ScanOptions,
     cancel: &AtomicBool,
 ) -> Result<OperationPlan> {
+    diagnostics::event(
+        "scan.start",
+        serde_json::json!({"source":diagnostics::path(source),"destination":diagnostics::path(destination_dir),"reparse":options.reparse,"limits":options.limits}),
+    );
     check_cancel(cancel)?;
     let limits = options.limits;
     if limits.max_entries == 0
@@ -369,23 +400,64 @@ pub fn scan(
     validate_path(destination_dir)?;
     let source = std::path::absolute(source)?;
     let destination_dir = std::path::absolute(destination_dir)?;
-    let _source_parents = platform::guard_parents(&source)?;
-    let _dest_parents = platform::guard_parents(&destination_dir.join(".vartacopy-guard"))?;
-    let metadata = fs::symlink_metadata(&source)?;
+    let _source_parents = dio(
+        "guard_source_parents",
+        &source,
+        platform::guard_parents(&source),
+    )?;
+    let _dest_parents = dio(
+        "guard_destination_parents",
+        &destination_dir,
+        platform::guard_parents(&destination_dir.join(".vartacopy-guard")),
+    )?;
+    let metadata = dio("symlink_metadata", &source, fs::symlink_metadata(&source))?;
     let root_guard = if metadata.is_dir() {
-        platform::open_directory(&source, false)?
+        dio(
+            "open_source_directory",
+            &source,
+            platform::open_directory(&source, false),
+        )?
     } else {
-        source_file(&source)?
+        source_file(&source).inspect_err(|e| {
+            diagnostics::failure(
+                "scan.open_source",
+                e,
+                serde_json::json!({"source":diagnostics::path(&source)}),
+            )
+        })?
     };
-    let destination_guard = platform::open_directory(&destination_dir, false)?;
-    let source = source.canonicalize()?;
-    let destination_dir = destination_dir.canonicalize()?;
-    let source_identity = platform::identity(&root_guard)?;
+    let destination_guard = dio(
+        "open_destination_directory",
+        &destination_dir,
+        platform::open_directory(&destination_dir, false),
+    )?;
+    diagnostics::volume("source", &root_guard, &source);
+    diagnostics::volume("destination", &destination_guard, &destination_dir);
+    let source = dio("canonicalize_source", &source, source.canonicalize())?;
+    let destination_dir = dio(
+        "canonicalize_destination",
+        &destination_dir,
+        destination_dir.canonicalize(),
+    )?;
+    let source_identity = dio(
+        "GetFileInformationByHandleEx(FileIdInfo):source",
+        &source,
+        platform::identity(&root_guard),
+    )?;
     if metadata.is_dir() {
         // Identity, not spelling/case, detects a destination inside the source.
         for ancestor in destination_dir.ancestors() {
-            let guard = platform::open_directory(ancestor, false)?;
-            if platform::identity(&guard)? == source_identity {
+            let guard = dio(
+                "open_overlap_ancestor",
+                ancestor,
+                platform::open_directory(ancestor, false),
+            )?;
+            if dio(
+                "GetFileInformationByHandleEx(FileIdInfo):ancestor",
+                ancestor,
+                platform::identity(&guard),
+            )? == source_identity
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "source/destination overlap: destination is inside source",
@@ -417,7 +489,11 @@ pub fn scan(
         metadata_policy: "file data + ADS + basic times/flags; directory times/flags after children; inherited ACL/owner; directory ADS refused",
         accounted_plan_bytes: 0,
         entries: Vec::new(),
-        destination_parent_identity: platform::identity(&destination_guard)?,
+        destination_parent_identity: dio(
+            "GetFileInformationByHandleEx(FileIdInfo):destination",
+            &destination_dir,
+            platform::identity(&destination_guard),
+        )?,
     };
     let mut stack = Vec::new();
     let mut identities = HashMap::new();
@@ -442,6 +518,11 @@ pub fn scan(
         let child = match next {
             Ok(child) => child,
             Err(error) => {
+                diagnostics::failure(
+                    "scan.enumeration_error",
+                    &error,
+                    serde_json::json!({"source":diagnostics::path(&plan.source),"relative":diagnostics::path(&frame.relative)}),
+                );
                 let index = frame.entry;
                 let problem = format!("directory enumeration failed: {error}");
                 budget.charge(problem.len())?;
@@ -486,5 +567,9 @@ pub fn scan(
     {
         plan.status = "blocked";
     }
+    diagnostics::event(
+        "scan.finished",
+        serde_json::json!({"status":plan.status,"source":diagnostics::path(&plan.source),"destination":diagnostics::path(&plan.destination),"totals":plan.totals,"plan_bytes":plan.accounted_plan_bytes}),
+    );
     Ok(plan)
 }

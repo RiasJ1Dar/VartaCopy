@@ -106,6 +106,14 @@ pub(crate) fn describe(
     engine: DispatchEngine,
     error: Error,
 ) -> Error {
+    vartacopy_core::diagnostics::failure(
+        "dispatch.failed",
+        &error,
+        serde_json::json!({
+        "request_id":request.id,"engine":engine,"operation":request.operation,
+        "sources":vartacopy_core::diagnostics::paths(&request.sources),
+        "destination":vartacopy_core::diagnostics::path(&request.destination)}),
+    );
     let (acceptance, receipt_error) = match journal.dispatch_receipt(request.id) {
         Ok(None) => ("not_accepted", None),
         Ok(Some(_)) => ("accepted", None),

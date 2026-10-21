@@ -469,6 +469,7 @@ fn transfer(
 }
 
 fn main() -> ExitCode {
+    vartacopy_core::diagnostics::install_panic_hook();
     let args = Args::parse();
     let cancel = Arc::new(AtomicBool::new(false));
     let signal = cancel.clone();
@@ -501,7 +502,82 @@ fn main() -> ExitCode {
         | Command::Cancel { json, .. }
         | Command::Order { json, .. } => *json,
     };
-    match run(args, &cancel, &control) {
+    let diagnostics_enabled = matches!(
+        &args.command,
+        Command::Copy(TransferArgs { dry_run: false, .. })
+            | Command::Move(TransferArgs { dry_run: false, .. })
+            | Command::Enqueue {
+                transfer: TransferArgs { dry_run: false, .. },
+                ..
+            }
+            | Command::Resume { .. }
+            | Command::Queue { run: true, .. }
+    );
+    let diagnostic = if diagnostics_enabled {
+        let path = args
+            .journal
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(journal::default_path);
+        match path.and_then(|p| {
+            vartacopy_core::diagnostics::Session::open(&p, "cli").map_err(Error::from)
+        }) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                eprintln!("vartacopy: detailed diagnostics unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _diagnostic_scope = vartacopy_core::diagnostics::enter(diagnostic.clone());
+    match &args.command {
+        Command::Copy(options)
+        | Command::Move(options)
+        | Command::Enqueue {
+            transfer: options, ..
+        } => {
+            let operation = match &args.command {
+                Command::Move(_) => "move",
+                Command::Enqueue {
+                    operation: Operation::Move,
+                    ..
+                } => "enqueue_move",
+                Command::Enqueue { .. } => "enqueue_copy",
+                _ => "copy",
+            };
+            vartacopy_core::diagnostics::event(
+                "cli.transfer_request",
+                serde_json::json!({"operation":operation,
+                "source":vartacopy_core::diagnostics::path(&options.source),"destination":vartacopy_core::diagnostics::path(&options.destination),
+                "enqueue":options.enqueue,"dry_run":options.dry_run}),
+            );
+        }
+        Command::Resume { job_id, .. } => {
+            vartacopy_core::diagnostics::event("cli.resume", serde_json::json!({"job_id":job_id}))
+        }
+        Command::Queue { run: true, .. } => {
+            vartacopy_core::diagnostics::event("cli.run_queue", serde_json::json!({}))
+        }
+        _ => {}
+    }
+    let result = run(args, &cancel, &control);
+    match &result {
+        Ok(code) => vartacopy_core::diagnostics::durable(
+            "cli.finished",
+            serde_json::json!({"exit_code":code}),
+        ),
+        Err(error) => vartacopy_core::diagnostics::failure(
+            "cli.failed",
+            error.as_ref(),
+            serde_json::json!({}),
+        ),
+    }
+    if let Some(failure) = diagnostic.as_ref().and_then(|s| s.failure()) {
+        eprintln!("vartacopy: diagnostic logging stopped: {failure}");
+    }
+    match result {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             let cancelled = error

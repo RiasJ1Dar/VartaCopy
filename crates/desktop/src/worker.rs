@@ -14,6 +14,7 @@ use std::{
 use vartacopy_core::{
     Conflict, Error, Result,
     control::Control,
+    diagnostics,
     journal::{EntryPage, Job, JobDetails, Journal, OperationKind},
     planner::{self, OperationPlan, ReparsePolicy, ScanOptions},
     recovery::{self, Progress, RunReport},
@@ -95,6 +96,7 @@ pub enum Command {
     ClearErrors,
 }
 enum Message {
+    Diagnostic(String),
     Dispatched(Result<(String, bool)>),
     Wake,
     ViewTick,
@@ -134,6 +136,7 @@ fn edit<T>(state: &Shared, f: impl FnOnce(&mut State) -> T) -> Result<T> {
 }
 fn error(state: &Shared, message: impl ToString) {
     let message: String = message.to_string().chars().take(8192).collect();
+    diagnostics::event("gui.error", serde_json::json!({"message":message}));
     if let Err(failure) = edit(state, |s| {
         if s.errors.len() == 32 {
             s.errors.pop_front();
@@ -145,6 +148,14 @@ fn error(state: &Shared, message: impl ToString) {
 }
 type ProgressHook = Arc<dyn Fn(&Progress) + Send + Sync>;
 impl Client {
+    pub fn diagnostic_message(&self, message: &str) {
+        if let Err(error) = self
+            .sender
+            .try_send(Message::Diagnostic(message.chars().take(8192).collect()))
+        {
+            eprintln!("VartaCopy GUI diagnostic was not queued: {error}; {message}");
+        }
+    }
     pub fn start(path: PathBuf) -> std::io::Result<Self> {
         Self::start_with_notify(path, Arc::new(|| {}))
     }
@@ -181,6 +192,14 @@ impl Client {
         thread::Builder::new()
             .name("vartacopy-queue".into())
             .spawn(move || {
+                let diagnostic = match diagnostics::Session::open(&path, "gui") {
+                    Ok(session) => Some(session),
+                    Err(e) => {
+                        error(&state, format!("Детальна діагностика недоступна: {e}"));
+                        None
+                    }
+                };
+                let _diagnostic_scope = diagnostics::enter(diagnostic.clone());
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     actor(
                         path,
@@ -195,7 +214,10 @@ impl Client {
                 }));
                 match outcome {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => error(&state, e),
+                    Ok(Err(e)) => {
+                        diagnostics::failure("gui.actor_failed", &e, serde_json::json!({}));
+                        error(&state, e)
+                    }
                     Err(_) => error(
                         &state,
                         "Queue worker panicked; saved jobs can be recovered after restart",
@@ -212,6 +234,14 @@ impl Client {
                         format!("cannot stop transfer after actor exit: {e}"),
                     ),
                 }
+                diagnostics::durable("session.end", serde_json::json!({"component":"gui-worker"}));
+                if let Some(failure) = diagnostic.as_ref().and_then(|s| s.failure()) {
+                    error(&state, format!("Запис діагностики припинився: {failure}"));
+                }
+                // `closed` also promises that the journal and diagnostic writer can be
+                // reopened immediately, even if the final UI notification blocks.
+                drop(_diagnostic_scope);
+                drop(diagnostic);
                 if let Err(e) = edit(&state, |s| {
                     s.closed = true;
                     s.ready = false;
@@ -282,9 +312,12 @@ fn scan_request(
     edit(state, |s| s.planning = true)?;
     let tx = sender.clone();
     let cancel = scan_cancel.clone();
+    let diagnostic = diagnostics::current();
     let handle = thread::Builder::new()
         .name("vartacopy-scan".into())
         .spawn(move || {
+            let _diagnostic_scope=diagnostics::enter(diagnostic);
+            diagnostics::event("gui.scan_request",serde_json::json!({"sources":diagnostics::paths(&sources),"destination":diagnostics::path(&destination),"operation":operation,"conflict":conflict,"reparse":reparse,"start":start}));
             let outcome = std::panic::catch_unwind(|| {
                 let mut plans = Vec::with_capacity(sources.len());
                 let mut remaining = planner::ScanLimits::default();
@@ -308,6 +341,7 @@ fn scan_request(
                 Ok(plans)
             });
             let result = outcome.unwrap_or_else(|_| Err(Error::Journal("scanner panicked".into())));
+            if let Err(e)=&result {diagnostics::failure("gui.scan_failed",e,serde_json::json!({}));}
             if let Err(e) = tx.send(Message::Planned(result, conflict, operation, start)) {
                 eprintln!("VartaCopy: scan result undelivered: {e}");
             }
@@ -376,6 +410,7 @@ fn actor(
     let mut active_id = None;
     let mut stop_request = None;
     let mut run_id = 0u64;
+    let mut logging_failure_reported = false;
     loop {
         if shutdown.load(Ordering::Acquire) {
             automatic = false;
@@ -394,6 +429,9 @@ fn actor(
         if let Ok(message) = receiver.recv() {
             let result: Result<()> = (|| {
                 match message {
+                    Message::Diagnostic(message) => {
+                        diagnostics::event("gui.banner", serde_json::json!({"message":message}))
+                    }
                     Message::Command(Command::Dispatch {
                         request,
                         engine,
@@ -413,10 +451,12 @@ fn actor(
                         let tx = sender.clone();
                         let cancel = scan_cancel.clone();
                         let diagnostic_path = path.clone();
+                        let diagnostic = diagnostics::current();
                         cancel.store(false, Ordering::Release);
                         let handle = thread::Builder::new()
                             .name("vartacopy-dispatch".into())
                             .spawn(move || {
+                                let _diagnostic_scope = diagnostics::enter(diagnostic);
                                 let outcome =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                         crate::dispatch::run(
@@ -539,7 +579,12 @@ fn actor(
                             }
                         }
                         // A queued acknowledgement is visible only after this durable transaction.
-                        journal.enqueue_many_with_operation(&plans, conflict, operation)?;
+                        let ids =
+                            journal.enqueue_many_with_operation(&plans, conflict, operation)?;
+                        diagnostics::durable(
+                            "gui.enqueued",
+                            serde_json::json!({"job_ids":ids,"operation":operation,"conflict":conflict}),
+                        );
                         automatic |= start;
                         refresh(&journal, state)?;
                     }
@@ -576,6 +621,7 @@ fn actor(
                     }
                     Message::Command(Command::RunQueue(value)) => automatic = value,
                     Message::Command(Command::Resume(id)) => {
+                        diagnostics::event("gui.resume", serde_json::json!({"job_id":id}));
                         if active_id == Some(id) {
                             return Err(Error::Journal("job is already active".into()));
                         }
@@ -584,6 +630,7 @@ fn actor(
                         refresh(&journal, state)?;
                     }
                     Message::Command(Command::Pause(id)) => {
+                        diagnostics::event("gui.pause", serde_json::json!({"job_id":id}));
                         automatic = false;
                         if active_id == Some(id) {
                             stop_request = Some(StopRequest::Pause);
@@ -605,6 +652,7 @@ fn actor(
                         }
                     }
                     Message::Command(Command::Cancel(id)) => {
+                        diagnostics::event("gui.cancel", serde_json::json!({"job_id":id}));
                         if active_id == Some(id) {
                             stop_request = Some(StopRequest::Cancel);
                             if let Some(control) = active_control
@@ -664,6 +712,11 @@ fn actor(
                                 edit(state, |s| s.last_report = Some(Arc::new(report)))?;
                             }
                             Err(e) => {
+                                diagnostics::failure(
+                                    "gui.transfer_failed",
+                                    &e,
+                                    serde_json::json!({"job_id":id}),
+                                );
                                 journal.set_job_status(id, "interrupted", Some(&e.to_string()))?;
                                 error(state, e);
                             }
@@ -675,6 +728,11 @@ fn actor(
                 Ok(())
             })();
             if let Err(e) = result {
+                diagnostics::failure(
+                    "gui.command_failed",
+                    &e,
+                    serde_json::json!({"active_job":active_id}),
+                );
                 error(state, e);
             }
         } else {
@@ -720,10 +778,12 @@ fn actor(
                         current_source: None,
                     })
                 })?;
+                let diagnostic = diagnostics::current();
                 transfer = Some(
                     thread::Builder::new()
                         .name("vartacopy-transfer".into())
                         .spawn(move || {
+                            let _diagnostic_scope = diagnostics::enter(diagnostic);
                             let mut last_progress = Instant::now();
                             let mut last_view = Instant::now();
                             let mut current_entry = None;
@@ -793,6 +853,12 @@ fn actor(
         if quiet(state, |s| s.automatic)? != automatic {
             edit(state, |s| s.automatic = automatic)?;
         }
+        if !logging_failure_reported
+            && let Some(failure) = diagnostics::current().and_then(|s| s.failure())
+        {
+            logging_failure_reported = true;
+            error(state, format!("Запис діагностики припинився: {failure}"));
+        }
     }
     journal.flush()?;
     Ok(())
@@ -802,6 +868,112 @@ fn actor(
 mod tests {
     use super::*;
     use std::{fs, sync::atomic::AtomicUsize, time::Instant};
+    #[test]
+    fn unavailable_diagnostics_are_reported_without_blocking_a_verified_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("jobs.sqlite");
+        let log = root.path().join("jobs.sqlite.diagnostics.jsonl");
+        let source = root.path().join("source.txt");
+        let destination = root.path().join("destination");
+        fs::write(&log, b"unrelated file").unwrap();
+        fs::write(&source, b"verified fixture").unwrap();
+        fs::create_dir(&destination).unwrap();
+        let client = Client::start(path).unwrap();
+        let ready = wait(&client, |s| s.ready);
+        assert!(
+            ready
+                .errors
+                .iter()
+                .any(|e| e.contains("Детальна діагностика недоступна"))
+        );
+        client
+            .send(Command::Submit {
+                source: source.clone(),
+                destination: destination.clone(),
+                conflict: Conflict::Error,
+                reparse: ReparsePolicy::Reject,
+                operation: OperationKind::Copy,
+                start: true,
+            })
+            .unwrap();
+        wait(&client, |s| {
+            s.active.is_none() && s.history.first().is_some_and(|j| j.status == "completed")
+        });
+        client.shutdown();
+        wait(&client, |s| s.closed);
+        assert_eq!(fs::read(source).unwrap(), b"verified fixture");
+        assert_eq!(
+            fs::read(destination.join("source.txt")).unwrap(),
+            b"verified fixture"
+        );
+        assert_eq!(fs::read(log).unwrap(), b"unrelated file");
+    }
+    #[test]
+    fn closed_releases_diagnostic_handles_before_final_ui_notification_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("jobs.sqlite");
+        let slot: Arc<Mutex<Option<std::sync::Weak<Shared>>>> = Arc::new(Mutex::new(None));
+        let view = slot.clone();
+        let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Mutex::new(release_rx);
+        let client = Client::start_with_notify(
+            path.clone(),
+            Arc::new(move || {
+                let shared = view
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                if shared.is_some_and(|s| s.state.lock().unwrap().closed) {
+                    closed_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }),
+        )
+        .unwrap();
+        *slot.lock().unwrap() = Some(Arc::downgrade(&client.state));
+        wait(&client, |s| s.ready);
+        client.shutdown();
+        closed_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        let snapshot = client.snapshot().unwrap();
+        let reopened = diagnostics::Session::open(&path, "immediate-reopen");
+        release_tx.send(()).unwrap(); // Never leave the actor blocked on a failed assertion.
+        assert!(snapshot.closed);
+        assert!(
+            reopened.is_ok(),
+            "diagnostic handles survived closed: {:?}",
+            reopened.err()
+        );
+    }
+    #[test]
+    fn manual_preflight_failure_is_traced_without_a_dispatch_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("jobs.sqlite");
+        let source = root.path().join("source.txt");
+        let destination = root.path().join("not-a-directory.txt");
+        fs::write(&source, b"preserved").unwrap();
+        fs::write(&destination, b"also preserved").unwrap();
+        let client = Client::start(path.clone()).unwrap();
+        wait(&client, |s| s.ready);
+        submit(&client, source.clone(), destination.clone());
+        let failed = wait(&client, |s| !s.planning && !s.errors.is_empty());
+        assert!(failed.queue.is_empty() && failed.history.is_empty());
+        client.shutdown();
+        wait(&client, |s| s.closed);
+        drop(client);
+        let entries = fs::read_to_string(path.with_file_name("jobs.sqlite.diagnostics.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(entries.iter().any(|e| e["event"] == "gui.scan_request"));
+        assert!(entries.iter().any(|e| e["event"] == "gui.scan_failed"));
+        assert!(entries.iter().any(|e| e["event"] == "filesystem.error"
+            && e["data"]["context"]["api"] == "open_destination_directory"));
+        assert_eq!(fs::read(source).unwrap(), b"preserved");
+        assert_eq!(fs::read(destination).unwrap(), b"also preserved");
+    }
     #[test]
     fn failed_dispatch_preflight_preserves_sources_and_records_request_without_success_job() {
         use vartacopy_shell_windows::transfer::{

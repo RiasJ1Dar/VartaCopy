@@ -17,6 +17,12 @@ pub(crate) fn run(
     conflict: Conflict,
     cancel: &AtomicBool,
 ) -> Result<(String, bool)> {
+    vartacopy_core::diagnostics::event(
+        "dispatch.request",
+        serde_json::json!({"request_id":request.id,"engine":engine,
+        "operation":request.operation,"conflict":conflict,"sources":vartacopy_core::diagnostics::paths(&request.sources),
+        "destination":vartacopy_core::diagnostics::path(&request.destination)}),
+    );
     run_with(journal, request, engine, conflict, cancel, native::execute)
 }
 fn run_with(
@@ -78,7 +84,7 @@ fn run_with(
                 "dispatch cancelled before acceptance".into(),
             ));
         }
-        journal.accept_dispatch(
+        let receipt = journal.accept_dispatch(
             request.id,
             &payload,
             operation,
@@ -86,10 +92,18 @@ fn run_with(
             Some(engine),
             &plans,
         )?;
+        vartacopy_core::diagnostics::durable(
+            "dispatch.accepted",
+            serde_json::json!({"request_id":request.id,"engine":engine,"receipt":receipt}),
+        );
         return Ok(("Запит VartaCopy збережено в черзі".into(), true));
     }
     journal.accept_dispatch(request.id, &payload, operation, conflict, Some(engine), &[])?;
     journal.begin_native_dispatch(request.id)?;
+    vartacopy_core::diagnostics::durable(
+        "dispatch.native_intent",
+        serde_json::json!({"request_id":request.id}),
+    );
     // From this point any panic/lost acknowledgement is an ambiguous durable intent.
     let (result, notice) = match native(request) {
         Ok(result) => {
@@ -100,12 +114,19 @@ fn run_with(
             };
             (serde_json::to_vec(&result)?, notice.to_string())
         }
-        Err(error) => (
-            serde_json::to_vec(
-                &serde_json::json!({"error":error.to_string().chars().take(4096).collect::<String>(),"filesystem_status":"unknown"}),
-            )?,
-            format!("Спроба Windows: {error}. Автоматичного повтору не буде."),
-        ),
+        Err(error) => {
+            vartacopy_core::diagnostics::failure(
+                "dispatch.native_error",
+                &error,
+                serde_json::json!({"request_id":request.id}),
+            );
+            (
+                serde_json::to_vec(
+                    &serde_json::json!({"error":error.to_string().chars().take(4096).collect::<String>(),"filesystem_status":"unknown"}),
+                )?,
+                format!("Спроба Windows: {error}. Автоматичного повтору не буде."),
+            )
+        }
     };
     journal.finish_native_dispatch(request.id, &result)?;
     Ok((notice, false))

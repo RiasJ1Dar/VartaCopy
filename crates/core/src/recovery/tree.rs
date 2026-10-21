@@ -17,6 +17,11 @@ fn issue(
     error: Error,
     report: &mut RunReport,
 ) -> Result<()> {
+    diagnostics::failure(
+        "job.entry_error",
+        &error,
+        serde_json::json!({"job_id":job.id,"entry":entry.ordinal,"source":diagnostics::path(&source_path(job,entry)),"target":entry.target.as_deref().map(diagnostics::path)}),
+    );
     if matches!(
         error,
         Error::Database(_) | Error::Json(_) | Error::Journal(_) | Error::Cancelled

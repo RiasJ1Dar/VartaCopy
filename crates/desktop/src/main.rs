@@ -141,6 +141,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 fn main() {
+    vartacopy_core::diagnostics::install_panic_hook();
     if let Err(error) = run() {
         eprintln!("VartaCopy: {error}");
         rfd::MessageDialog::new()

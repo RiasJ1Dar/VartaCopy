@@ -187,6 +187,44 @@ pub fn link_count(file: &File) -> io::Result<u32> {
 }
 
 /// SQLite WAL storage is restricted to a local fixed volume.
+#[derive(Debug, serde::Serialize)]
+pub struct VolumeInformation {
+    pub filesystem: String,
+    pub flags: u32,
+    pub serial: u32,
+    pub maximum_component_length: u32,
+}
+/// Read only the volume behind an already opened handle; never enumerate devices.
+/// https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-getvolumeinformationbyhandlew
+pub fn volume_information(file: &File) -> io::Result<VolumeInformation> {
+    let mut name = [0u16; 261];
+    let mut flags = 0;
+    let mut serial = 0;
+    let mut maximum_component_length = 0;
+    // SAFETY: Live file handle and valid writable output buffers of advertised length.
+    if unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle() as HANDLE,
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            &mut maximum_component_length,
+            &mut flags,
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let length = name.iter().position(|c| *c == 0).unwrap_or(name.len());
+    Ok(VolumeInformation {
+        filesystem: String::from_utf16_lossy(&name[..length]),
+        flags,
+        serial,
+        maximum_component_length,
+    })
+}
 pub fn require_local_fixed_volume(path: &Path) -> io::Result<()> {
     let name = wide(path.as_os_str())?;
     let mut root = vec![0u16; 32768];

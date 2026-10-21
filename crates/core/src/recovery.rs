@@ -6,6 +6,7 @@ mod tree;
 use crate::{
     Conflict, Error, Result,
     control::Control,
+    diagnostics,
     journal::{CHUNK_BYTES, Chunk, Entry, EntryState, Job, Journal, OperationKind},
     planner::EntryKind,
 };
@@ -298,8 +299,8 @@ fn transfer_stream(
     let mut source = vec![0u8; CHUNK_BYTES];
     let mut destination = vec![0u8; CHUNK_BYTES];
     let mut offset = 0u64;
-    input.seek(SeekFrom::Start(0))?;
-    output.seek(SeekFrom::Start(0))?;
+    stream_io("source.seek", &task, 0, input.seek(SeekFrom::Start(0)))?;
+    stream_io("stage.seek", &task, 0, output.seek(SeekFrom::Start(0)))?;
     for chunk in &chunks {
         control.checkpoint()?;
         if chunk.offset != offset || offset + chunk.length as u64 > size {
@@ -307,8 +308,18 @@ fn transfer_stream(
                 "checkpoint lies outside source stream".into(),
             ));
         }
-        input.read_exact(&mut source[..chunk.length])?;
-        output.read_exact(&mut destination[..chunk.length])?;
+        stream_io(
+            "source.resume_read",
+            &task,
+            offset,
+            input.read_exact(&mut source[..chunk.length]),
+        )?;
+        stream_io(
+            "stage.resume_read",
+            &task,
+            offset,
+            output.read_exact(&mut destination[..chunk.length]),
+        )?;
         if blake3::hash(&source[..chunk.length]).as_bytes() != &chunk.hash
             || blake3::hash(&destination[..chunk.length]).as_bytes() != &chunk.hash
         {
@@ -320,12 +331,22 @@ fn transfer_stream(
         notify_stream(observer, &task, Phase::Checking, offset, 0)?;
     }
     let resumed = offset;
-    output.set_len(offset)?;
+    stream_io("stage.set_len", &task, offset, output.set_len(offset))?;
     while offset < size {
         control.checkpoint()?;
         let length = (size - offset).min(CHUNK_BYTES as u64) as usize;
-        input.read_exact(&mut source[..length])?;
-        output.write_all(&source[..length])?;
+        stream_io(
+            "source.read",
+            &task,
+            offset,
+            input.read_exact(&mut source[..length]),
+        )?;
+        stream_io(
+            "stage.write",
+            &task,
+            offset,
+            output.write_all(&source[..length]),
+        )?;
         notify_stream(
             observer,
             &task,
@@ -333,7 +354,7 @@ fn transfer_stream(
             offset + length as u64,
             length as u64,
         )?;
-        output.sync_all()?;
+        stream_io("stage.sync_all", &task, offset, output.sync_all())?;
         notify_stream(
             observer,
             &task,
@@ -355,14 +376,34 @@ fn transfer_stream(
         notify_stream(observer, &task, Phase::CheckpointCommitted, offset, 0)?;
     }
     // Independent full readback. Prefix validation alone never marks the final stream verified.
-    input.seek(SeekFrom::Start(0))?;
-    output.seek(SeekFrom::Start(0))?;
+    stream_io(
+        "source.verify_seek",
+        &task,
+        0,
+        input.seek(SeekFrom::Start(0)),
+    )?;
+    stream_io(
+        "stage.verify_seek",
+        &task,
+        0,
+        output.seek(SeekFrom::Start(0)),
+    )?;
     let mut checked = 0;
     while checked < size {
         control.checkpoint()?;
         let length = (size - checked).min(CHUNK_BYTES as u64) as usize;
-        input.read_exact(&mut source[..length])?;
-        output.read_exact(&mut destination[..length])?;
+        stream_io(
+            "source.verify_read",
+            &task,
+            checked,
+            input.read_exact(&mut source[..length]),
+        )?;
+        stream_io(
+            "stage.verify_read",
+            &task,
+            checked,
+            output.read_exact(&mut destination[..length]),
+        )?;
         if blake3::hash(&source[..length]) != blake3::hash(&destination[..length]) {
             return Err(Error::Verification(
                 "full readback differs from source".into(),
@@ -374,6 +415,18 @@ fn transfer_stream(
     Ok(resumed)
 }
 
+fn stream_io<T>(api: &str, task: &StreamTask, offset: u64, result: io::Result<T>) -> io::Result<T> {
+    if let Err(error) = &result {
+        diagnostics::failure(
+            "stream.io_error",
+            error,
+            serde_json::json!({
+        "api":api,"job_id":task.job,"entry":task.ordinal,"stream_index":task.stream_index,
+        "offset":offset,"stream_bytes":task.size}),
+        );
+    }
+    result
+}
 fn resume_file(
     journal: &mut Journal,
     job: &Job,
@@ -382,6 +435,11 @@ fn resume_file(
     control: &Control,
     observer: &mut Observer<'_>,
 ) -> Result<(bool, u64, u64)> {
+    diagnostics::event(
+        "job.entry_start",
+        serde_json::json!({"job_id":job.id,"entry":entry.ordinal,
+        "state":entry.state,"source":diagnostics::path(&source_path(job,&entry)),"target":diagnostics::path(target)}),
+    );
     control.checkpoint()?;
     if entry
         .target
@@ -591,11 +649,63 @@ pub fn run(
 ) -> Result<RunReport> {
     control.checkpoint()?;
     let job = journal.job(id)?;
+    diagnostics::durable(
+        "job.start",
+        serde_json::json!({"job_id":id,"operation":job.operation,"saved_status":job.status,
+        "source":diagnostics::path(&job.source),"destination":diagnostics::path(&job.destination),"entries":job.entry_count,"conflict":job.conflict}),
+    );
+    let mut last_sample = std::time::Instant::now();
+    let mut last_stream = None;
+    let mut traced_observer = |event: Progress| {
+        let stream = (event.entry, event.stream_index);
+        let sampled = matches!(
+            event.phase,
+            Phase::BlockWritten
+                | Phase::BlockFlushed
+                | Phase::CheckpointCommitted
+                | Phase::Checking
+        );
+        if !sampled
+            || last_stream != Some(stream)
+            || last_sample.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            let data = serde_json::json!({"progress":event});
+            if matches!(
+                event.phase,
+                Phase::PublishIntent
+                    | Phase::CleanupIntent
+                    | Phase::SourceDeletePrepared
+                    | Phase::SourceRemoved
+                    | Phase::CleanupCommitted
+            ) {
+                diagnostics::durable("job.phase", data);
+            } else {
+                diagnostics::event("job.phase", data);
+            }
+            last_sample = std::time::Instant::now();
+            last_stream = Some(stream);
+        }
+        observer(event)
+    };
+    let observer: &mut Observer<'_> = &mut traced_observer;
     let entry = journal.entry(id, 0)?;
     let parent = required(job.destination.parent(), "job destination parent missing")?;
-    let _parents = platform::guard_parents(&parent.join(".vartacopy-guard"))?;
-    let parent_guard = platform::open_directory(parent, false)?;
-    if platform::identity(&parent_guard)? != job.parent_identity {
+    let _parents = diagnostics::io(
+        "recovery.guard_destination_parents",
+        parent,
+        platform::guard_parents(&parent.join(".vartacopy-guard")),
+    )?;
+    let parent_guard = diagnostics::io(
+        "recovery.open_destination_directory",
+        parent,
+        platform::open_directory(parent, false),
+    )?;
+    if diagnostics::io(
+        "GetFileInformationByHandleEx(FileIdInfo):recovery_destination",
+        parent,
+        platform::identity(&parent_guard),
+    )? != job.parent_identity
+    {
         return Err(Error::Verification("destination parent replaced".into()));
     }
     journal.set_job_status(id, "running", None)?;
@@ -653,6 +763,11 @@ pub fn run(
     }
     match result {
         Err(error) => {
+            diagnostics::failure(
+                "job.failed",
+                &error,
+                serde_json::json!({"job_id":id,"operation":job.operation,"source":diagnostics::path(&job.source),"destination":diagnostics::path(&job.destination)}),
+            );
             report.status =
                 if job.operation == OperationKind::Move && matches!(error, Error::Cancelled) {
                     "cancelled"
@@ -702,5 +817,11 @@ pub fn run(
             ))
         })?;
     journal.flush()?;
+    diagnostics::durable(
+        "job.finished",
+        serde_json::json!({"job_id":id,"status":report.status,
+        "committed":report.entries_committed,"failed":report.entries_failed,"pending":report.entries_pending,
+        "skipped":report.entries_skipped,"verified_bytes":report.verified_bytes,"error":report.error}),
+    );
     Ok(report)
 }
