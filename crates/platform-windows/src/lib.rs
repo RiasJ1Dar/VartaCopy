@@ -492,12 +492,120 @@ pub fn identity(file: &File) -> io::Result<Identity> {
         )
     };
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // FAT identifiers from the older GetFileInformationByHandle API can
+        // change on rename. They cannot replace the persistent identity used
+        // by staging/recovery or guarded Move cleanup. Keep the native cause.
+        return Err(identity_error(error, || volume_information(file)));
     }
     Ok(Identity {
         volume_serial: info.VolumeSerialNumber,
         file_id: info.FileId.Identifier,
     })
+}
+
+#[derive(Debug)]
+struct UnsupportedIdentity {
+    filesystem: String,
+    source: io::Error,
+}
+impl std::fmt::Display for UnsupportedIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Файлова система {}: потрібний VartaCopy ідентифікатор файла (FileIdInfo) недоступний. Передавання через VartaCopy на цьому носії поки не підтримується; оберіть Explorer у вікні вибору обробника. Windows: {}",
+            self.filesystem, self.source
+        )
+    }
+}
+impl std::error::Error for UnsupportedIdentity {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn identity_error(
+    error: io::Error,
+    volume: impl FnOnce() -> io::Result<VolumeInformation>,
+) -> io::Error {
+    if matches!(error.raw_os_error(), Some(1 | 50 | 87)) {
+        match volume() {
+            Ok(volume)
+                if ["FAT", "FAT32", "exFAT"]
+                    .iter()
+                    .any(|name| volume.filesystem.eq_ignore_ascii_case(name)) =>
+            {
+                return io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    UnsupportedIdentity {
+                        filesystem: volume.filesystem,
+                        source: error,
+                    },
+                );
+            }
+            // Failure to identify the filesystem must not hide the primary
+            // native error or imply that another filesystem is unsupported.
+            Ok(_) => {}
+            Err(volume_error) => eprintln!(
+                "VartaCopy: cannot identify volume after FileIdInfo failure ({error}): {volume_error}"
+            ),
+        }
+    }
+    error
+}
+
+#[cfg(test)]
+mod identity_error_tests {
+    use super::*;
+    fn volume(name: &str) -> io::Result<VolumeInformation> {
+        Ok(VolumeInformation {
+            filesystem: name.into(),
+            flags: 0,
+            serial: 1,
+            maximum_component_length: 255,
+        })
+    }
+    #[test]
+    fn fat_identity_failure_explains_the_limit_and_retains_the_native_cause() {
+        for filesystem in ["FAT", "FAT32", "exFAT", "fat32"] {
+            for code in [1, 50, 87] {
+                let error =
+                    identity_error(io::Error::from_raw_os_error(code), || volume(filesystem));
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                assert!(error.to_string().contains(filesystem));
+                assert!(error.to_string().contains("Explorer"));
+                let mut cause: &(dyn std::error::Error + 'static) = &error;
+                loop {
+                    if let Some(native) = cause.downcast_ref::<io::Error>()
+                        && native.raw_os_error() == Some(code)
+                    {
+                        break;
+                    }
+                    cause = cause.source().expect("native error must remain in chain");
+                }
+            }
+        }
+    }
+    #[test]
+    fn unrelated_errors_and_unknown_filesystems_are_never_reclassified() {
+        for code in [1, 50, 87] {
+            for filesystem in ["NTFS", "ReFS", "unknown"] {
+                let error =
+                    identity_error(io::Error::from_raw_os_error(code), || volume(filesystem));
+                assert_eq!(error.raw_os_error(), Some(code));
+            }
+            let error = identity_error(io::Error::from_raw_os_error(code), || {
+                Err(io::Error::from_raw_os_error(5))
+            });
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+        for code in [2, 5, 21, 32, 1117] {
+            let error = identity_error(io::Error::from_raw_os_error(code), || {
+                panic!("access, missing media and I/O failures must not probe/fallback")
+            });
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
 }
 
 /// Read-only reconciliation of a missing source name. A live identity may have
