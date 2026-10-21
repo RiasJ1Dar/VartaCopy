@@ -8,13 +8,15 @@ from tools.package import TARGET, verify
 
 
 class PackageVerification(unittest.TestCase):
-    def archive(self, root, corrupt=False, extra=None, integration=False, omit=None, native=False):
+    def archive(self, root, corrupt=False, extra=None, integration=False, omit=None, native=False, icon=False):
         path = Path(root) / "fixture.zip"
         files = {"vartacopy.exe": b"cli", "vartacopy-gui.exe": b"gui", "README.txt": b"guide", "THIRD-PARTY.json": b"[]"}
         if integration:
             files.update({"vartacopy_transfer.dll": b"dll", "tools/explorer_drop_probe.py": b"helper", "EXPLORER.txt": b"instructions"})
         if native:
             files.update({"vartacopy_transfer.dll": b"dll", "EXPLORER.txt": b"instructions"})
+        if icon:
+            files["vartacopy.ico"] = b"icon"
         if omit:
             del files[omit]
         manifest = {"format": "vartacopy-portable", "target": TARGET, "revision": "test", "source_dirty": False,
@@ -23,6 +25,8 @@ class PackageVerification(unittest.TestCase):
             manifest["integrations"] = ["explorer-transfer"]
         if native:
             manifest["integrations"] = ["explorer-transfer-native"]
+        if icon:
+            manifest["assets"]=["application-icon"]
         if corrupt:
             files["vartacopy.exe"] = b"bad"
         with zipfile.ZipFile(path, "w") as bundle:
@@ -36,6 +40,13 @@ class PackageVerification(unittest.TestCase):
     def test_valid_archive(self):
         with tempfile.TemporaryDirectory() as root:
             self.assertEqual(verify(self.archive(root))["status"], "verified")
+
+    def test_declared_application_icon_is_required(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(verify(self.archive(root,icon=True))["status"],"verified")
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(ValueError,"missing required file"):
+                verify(self.archive(root,icon=True,omit="vartacopy.ico"))
 
     def test_corrupted_binary_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:

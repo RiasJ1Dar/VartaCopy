@@ -32,6 +32,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 PrivilegesRequired=admin
 WizardStyle=modern dynamic
+SetupIconFile={#PayloadDir}\vartacopy.ico
 SetupMutex=Global\VartaCopy.Installer.v1
 AppMutex=Local\VartaCopy.Running
 CloseApplications=no
@@ -77,6 +78,7 @@ Source: "{#PayloadDir}\vartacopy-gui.exe"; DestDir: "{app}"; Flags: ignoreversio
 Source: "{#PayloadDir}\README.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\EXPLORER.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\vartacopy.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\THIRD-PARTY.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; The content-addressed module is immutable, so a repair never overwrites a loaded DLL.

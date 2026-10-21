@@ -107,6 +107,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let marker = instance.marker().to_vec();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!(
+                "../../../assets/vartacopy.png"
+            ))?)
             .with_inner_size([860.0, 520.0])
             .with_min_inner_size([760.0, 480.0]),
         renderer: eframe::Renderer::Glow,

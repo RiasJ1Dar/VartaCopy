@@ -17,7 +17,10 @@ eframe = { version = "=0.36.2", default-features = false, features = ["glow", "a
 rfd = { version = "=0.17.2", default-features = false }
 serde_json.workspace = true
 raw-window-handle = "0.6"
-windows-sys = { workspace = true, features = ["Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_DataExchange"] }
+windows-sys = { workspace = true, features = ["Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Controls", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_LibraryLoader"] }
+
+[build-dependencies]
+winresource = "=0.1.31"
 
 [features]
 test-harness = ["eframe/__screenshot"]

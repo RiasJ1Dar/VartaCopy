@@ -4,6 +4,7 @@ mod integration_panel;
 mod navigation;
 mod system_style;
 mod transfer_panel;
+mod tray;
 #[cfg(test)]
 mod ui_tests;
 mod view;
@@ -101,6 +102,7 @@ pub struct App {
     base_styles: [egui::Style; 2],
     contrast: Option<system_style::Palette>,
     settings_watch: Option<system_style::Watch>,
+    tray: Option<tray::Tray>,
     shell: Option<mpsc::Receiver<Vec<PathBuf>>>,
     transfers: Option<mpsc::Receiver<vartacopy_shell_windows::transfer::TransferDelivery>>,
     pending_varta: Option<vartacopy_shell_windows::transfer::TransferRequest>,
@@ -168,7 +170,7 @@ impl App {
             (*ctx.style_of(egui::Theme::Light)).clone(),
             (*ctx.style_of(egui::Theme::Dark)).clone(),
         ];
-        let settings_watch = if cc.winit_window().is_some() {
+        let (settings_watch, tray, tray_error) = if cc.winit_window().is_some() {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             let handle = cc
                 .window_handle()
@@ -176,12 +178,17 @@ impl App {
             let RawWindowHandle::Win32(handle) = handle.as_raw() else {
                 return Err(std::io::Error::other("expected a Windows GUI handle"));
             };
-            Some(system_style::Watch::attach(
+            let watch = Some(system_style::Watch::attach(
                 handle.hwnd.get() as _,
                 ctx.clone(),
-            )?)
+            )?);
+            let (tray, error) = match tray::Tray::attach(handle.hwnd.get() as _, ctx.clone()) {
+                Ok(tray) => (Some(tray), None),
+                Err(error) => (None, Some(format!("Значок трея недоступний: {error}"))),
+            };
+            (watch, tray, error)
         } else {
-            None
+            (None, None, None)
         };
         let contrast = system_style::Palette::read()?;
         system_style::apply(ctx, &base_styles, contrast);
@@ -228,6 +235,7 @@ impl App {
             base_styles,
             contrast,
             settings_watch,
+            tray,
             shell: None,
             transfers: None,
             pending_varta: None,
@@ -235,7 +243,7 @@ impl App {
             chooser_focus: false,
             shell_action: None,
             integration: integration_panel::Panel::default(),
-            banner: None,
+            banner: tray_error,
             picker: None,
             closing: false,
             journal: path,
@@ -249,6 +257,30 @@ impl App {
                 self.banner = Some(e);
                 false
             }
+        }
+    }
+    fn begin_close(&mut self) {
+        if !self.closing {
+            self.closing = true;
+            self.client.shutdown();
+        }
+    }
+    fn tray_action(&mut self, action: tray::Action) {
+        match action {
+            tray::Action::Show => {
+                self.context
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                self.context
+                    .send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                self.context.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            tray::Action::Exit => self.begin_close(),
+        }
+    }
+    fn hide_to_tray(&mut self) {
+        if !self.closing && self.tray.as_ref().is_some_and(|t| t.available()) {
+            self.context
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
     }
     pub fn attach_shell(&mut self, marker: &[u16], sources: Vec<PathBuf>) -> std::io::Result<()> {
@@ -394,6 +426,14 @@ impl App {
 }
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(tray) = &self.tray {
+            if let Some(error) = tray.take_error() {
+                self.banner = Some(error);
+            }
+            if let Some(action) = tray.take_action() {
+                self.tray_action(action);
+            }
+        }
         if let Some(message) = self.integration.poll() {
             self.banner = Some(message);
         }
@@ -406,6 +446,8 @@ impl eframe::App for App {
                     if let Err(error) = self.receive_transfer(request) {
                         self.banner = Some(error.to_string());
                     }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -423,6 +465,8 @@ impl eframe::App for App {
                     {
                         self.banner = Some(error.to_string());
                     }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.request_repaint(); // Drain the bounded inbox, then return to event-driven idle.
                 }
@@ -549,8 +593,7 @@ impl eframe::App for App {
         }
         self.shortcuts(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.closing = true;
-            self.client.shutdown();
+            self.begin_close();
             if !self.state.closed {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }

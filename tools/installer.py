@@ -17,7 +17,7 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {"vartacopy.exe", "vartacopy-gui.exe", "vartacopy_transfer.dll",
-            "README.txt", "EXPLORER.txt", "LICENSE.txt", "THIRD-PARTY.json"}
+            "README.txt", "EXPLORER.txt", "LICENSE.txt", "THIRD-PARTY.json", "vartacopy.ico"}
 
 
 def sha256(path: Path) -> str:

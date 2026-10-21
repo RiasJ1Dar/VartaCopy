@@ -49,6 +49,11 @@ def verify(archive: Path) -> dict:
             required.update({"vartacopy_transfer.dll", "tools/explorer_drop_probe.py", "EXPLORER.txt"})
         if "explorer-transfer-native" in integrations:
             required.update({"vartacopy_transfer.dll", "EXPLORER.txt"})
+        assets=manifest.get("assets",[])
+        if not isinstance(assets,list) or any(item!="application-icon" for item in assets):
+            raise ValueError("Unrecognized package asset")
+        if "application-icon" in assets:
+            required.add("vartacopy.ico")
         paths = [file["path"] for file in files]
         if len(paths) != len(set(paths)) or not required.issubset(paths):
             raise ValueError("Duplicate manifest path or missing required file")
@@ -183,6 +188,7 @@ def build() -> dict:
         imports[name] = portable_imports(binary_root / name)
         shutil.copyfile(binary_root / name, output / name)
     shutil.copyfile(ROOT / "LICENSE.txt", output / "LICENSE.txt")
+    shutil.copyfile(ROOT / "assets" / "vartacopy.ico", output / "vartacopy.ico")
     shutil.copyfile(ROOT / "packaging" / "explorer-transfer.rst", output / "EXPLORER.txt")
     notices = dependencies(output)
     (output / "README.txt").write_text(f"""VartaCopy {version} — Windows x64, попередня версія
@@ -264,7 +270,7 @@ THIRD-PARTY.json містить інвентар залежностей; тек�
             with path.open("rb") as stream:
                 sha = digest(stream)
             files.append({"path": path.relative_to(output).as_posix(), "bytes": path.stat().st_size, "sha256": sha})
-    manifest = {"format": "vartacopy-portable", "version": version, "target": TARGET, "revision": revision, "source_dirty": dirty, "integrations": ["explorer-transfer-native"], "rustc": command("rustc", "--version"), "dependencies": len(notices), "imports": imports, "files": files}
+    manifest = {"format": "vartacopy-portable", "version": version, "target": TARGET, "revision": revision, "source_dirty": dirty, "integrations": ["explorer-transfer-native"], "assets":["application-icon"], "rustc": command("rustc", "--version"), "dependencies": len(notices), "imports": imports, "files": files}
     (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     archive = output.parent / (label + ".zip")
     with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:

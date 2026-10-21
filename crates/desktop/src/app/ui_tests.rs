@@ -37,6 +37,32 @@ fn fixture() -> (tempfile::TempDir, App) {
     (root, app)
 }
 #[test]
+fn tray_exit_uses_durable_shutdown_and_hide_requires_an_available_icon() {
+    let (_root, mut app) = fixture();
+    let before = app
+        .state
+        .history
+        .iter()
+        .map(|j| (j.id, j.status.clone()))
+        .collect::<Vec<_>>();
+    app.hide_to_tray(); // No native tray in headless mode: the window must remain reachable.
+    assert!(!app.closing);
+    app.tray_action(tray::Action::Show);
+    assert!(!app.closing);
+    app.tray_action(tray::Action::Exit);
+    app.tray_action(tray::Action::Exit); // Repeated exit is idempotent.
+    assert!(app.closing);
+    update(&mut app, |s| s.closed);
+    let saved = Journal::open(&app.journal).unwrap().jobs(50, 0).unwrap();
+    assert_eq!(
+        saved
+            .iter()
+            .map(|j| (j.id, j.status.clone()))
+            .collect::<Vec<_>>(),
+        before
+    );
+}
+#[test]
 fn selected_shell_request_waits_for_dispatch_and_never_opens_another_chooser() {
     use vartacopy_shell_windows::transfer::{
         TransferDelivery, TransferOperation, TransferOrigin, TransferRequest,

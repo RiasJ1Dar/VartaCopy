@@ -209,6 +209,16 @@ impl App {
                         self.messages_open = true;
                         ui.close();
                     }
+                    if ui
+                        .add_enabled(
+                            !self.closing && self.tray.as_ref().is_some_and(|t| t.available()),
+                            egui::Button::new("Згорнути у трей"),
+                        )
+                        .clicked()
+                    {
+                        self.hide_to_tray();
+                        ui.close();
+                    }
                 });
             });
         });
