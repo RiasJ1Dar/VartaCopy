@@ -21,6 +21,39 @@ fn fixture() -> (tempfile::TempDir, OperationPlan) {
 }
 
 #[test]
+fn fat_source_move_is_rejected_before_any_job_or_dispatch_is_accepted() {
+    let (root, mut plan) = fixture();
+    plan.entries[0].snapshot.as_mut().unwrap().identity.kind = platform::IdentityKind::FatSource;
+    let mut journal = Journal::open(&root.path().join("jobs.sqlite")).unwrap();
+    assert!(
+        journal
+            .enqueue_with_operation(&plan, Conflict::Error, OperationKind::Move)
+            .is_err()
+    );
+    assert!(
+        journal
+            .accept_dispatch(
+                [73; 16],
+                b"fat-move-fixture",
+                OperationKind::Move,
+                Conflict::Error,
+                Some(DispatchEngine::VartaCopy),
+                &[plan]
+            )
+            .is_err()
+    );
+    assert!(journal.jobs(10, 0).unwrap().is_empty());
+    assert!(journal.dispatch_receipt([73; 16]).unwrap().is_none());
+    assert_eq!(fs::read(root.path().join("source")).unwrap(), b"data");
+    assert_eq!(
+        fs::read_dir(root.path().join("destination"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn atomic_initialization_enqueue_reopen_and_pragmas() {
     let (root, plan) = fixture();
     let path = root.path().join("journal.sqlite");

@@ -32,7 +32,8 @@ pub(crate) fn windows_retry(
     for _ in 0..16 {
         let Some(current) = next else { break };
         if let Some(io) = current.downcast_ref::<io::Error>()
-            && vartacopy_platform_windows::unsupported_identity_filesystem(io).is_some()
+            && (vartacopy_platform_windows::unsupported_identity_filesystem(io).is_some()
+                || vartacopy_platform_windows::is_unsupported_fat_move(io))
         {
             return true;
         }
@@ -178,6 +179,61 @@ pub(crate) fn describe(
 mod tests {
     use super::*;
     use vartacopy_shell_windows::transfer::{TransferOrigin, TransferRequest};
+    #[test]
+    fn explicit_windows_retry_requires_known_capability_and_an_absent_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("jobs.sqlite")).unwrap();
+        let mut request = TransferRequest {
+            id: [19; 16],
+            operation: TransferOperation::Move,
+            origin: TransferOrigin::Explorer,
+            sources: vec![root.path().join("source")],
+            destination: root.path().to_path_buf(),
+        };
+        let identity = vartacopy_platform_windows::Identity {
+            volume_serial: 1,
+            file_id: [0; 16],
+            kind: vartacopy_platform_windows::IdentityKind::FatSource,
+        };
+        let error: Error = vartacopy_platform_windows::require_move_identity(&identity)
+            .unwrap_err()
+            .into();
+        assert!(windows_retry(
+            &journal,
+            &request,
+            DispatchEngine::VartaCopy,
+            &error
+        ));
+        assert!(!windows_retry(
+            &journal,
+            &request,
+            DispatchEngine::Explorer,
+            &error
+        ));
+        journal
+            .accept_dispatch(
+                request.id,
+                &encode_transfer(&request).unwrap(),
+                vartacopy_core::journal::OperationKind::Move,
+                vartacopy_core::Conflict::Error,
+                Some(DispatchEngine::Explorer),
+                &[],
+            )
+            .unwrap();
+        assert!(!windows_retry(
+            &journal,
+            &request,
+            DispatchEngine::VartaCopy,
+            &error
+        ));
+        request.id = [0; 16];
+        assert!(!windows_retry(
+            &journal,
+            &request,
+            DispatchEngine::VartaCopy,
+            &error
+        ));
+    }
     #[test]
     fn accepted_or_unreadable_receipt_never_claims_no_operation_started() {
         let root = tempfile::tempdir().unwrap();

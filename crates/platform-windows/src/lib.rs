@@ -95,11 +95,29 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::SystemServices::FILE_NAMED_STREAMS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Identity {
     pub volume_serial: u64,
     pub file_id: [u8; 16],
+    #[serde(default, skip_serializing_if = "IdentityKind::is_native")]
+    pub kind: IdentityKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityKind {
+    #[default]
+    Native128,
+    /// FAT IDs are valid only at the recorded, pinned source path. Never use
+    /// these as staging/publication ownership or as authorization for deletion.
+    FatSource,
+}
+impl IdentityKind {
+    fn is_native(&self) -> bool {
+        *self == Self::Native128
+    }
 }
 
 /// Display is lossy by design; native units preserve every Windows path code unit.
@@ -291,6 +309,7 @@ impl CleanupOwner {
         directory: bool,
         delete: bool,
     ) -> io::Result<Self> {
+        require_move_identity(expected)?;
         // SAFETY: null optional arguments select system defaults; result checked.
         let transaction = unsafe {
             CreateTransaction(
@@ -412,6 +431,7 @@ pub fn open_cleanup_stream(path: &Path) -> io::Result<File> {
 /// Delete only the object owned by this handle. Windows rejects nonempty
 /// directories and readonly files; no path traversal or recursive delete occurs.
 fn remove_owned(file: &File, expected: &Identity) -> io::Result<()> {
+    require_move_identity(expected)?;
     if is_reparse(&file.metadata()?) || identity(file)? != *expected {
         return Err(io::Error::other("cleanup identity changed"));
     }
@@ -501,7 +521,68 @@ pub fn identity(file: &File) -> io::Result<Identity> {
     Ok(Identity {
         volume_serial: info.VolumeSerialNumber,
         file_id: info.FileId.Identifier,
+        kind: IdentityKind::Native128,
     })
+}
+
+/// Read-only source identity. FAT path-scoped IDs must not authorize publication,
+/// adoption, OpenFileById lookup, or Move cleanup. A moved/changed source fails
+/// snapshot validation; recorded data is independently rehashed during resume.
+pub fn source_identity(file: &File) -> io::Result<Identity> {
+    match identity(file) {
+        Ok(identity) => Ok(identity),
+        Err(error) if unsupported_identity_filesystem(&error).is_some_and(fat_without_ads) => {
+            // SAFETY: integer-only output and a live metadata/data handle.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid handle and exactly sized writable output structure.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+            let mut file_id = [0; 16];
+            file_id[..8].copy_from_slice(&index.to_le_bytes());
+            let created = (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
+                | u64::from(info.ftCreationTime.dwLowDateTime);
+            file_id[8..].copy_from_slice(&created.to_le_bytes());
+            Ok(Identity {
+                volume_serial: u64::from(info.dwVolumeSerialNumber),
+                file_id,
+                kind: IdentityKind::FatSource,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn fat_without_ads(filesystem: &str) -> bool {
+    filesystem.eq_ignore_ascii_case("FAT") || filesystem.eq_ignore_ascii_case("FAT32")
+}
+
+/// Preflight rejects FAT Move before accepting any job or modifying any file.
+pub fn require_move_identity(identity: &Identity) -> io::Result<()> {
+    if identity.kind == IdentityKind::FatSource {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            UnsupportedFatMove,
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct UnsupportedFatMove;
+impl std::fmt::Display for UnsupportedFatMove {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Переміщення з FAT/FAT32 через VartaCopy поки не підтримується: захищене видалення джерела потребує NTFS. Оберіть копіювання або Explorer. Джерела не видалялися.")
+    }
+}
+impl std::error::Error for UnsupportedFatMove {}
+
+pub fn is_unsupported_fat_move(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<UnsupportedFatMove>())
 }
 
 #[derive(Debug)]
@@ -623,6 +704,7 @@ mod identity_error_tests {
 /// lookup. Only local drive-letter paths are supported; other namespaces and
 /// any lookup/volume-verification failure must be handled as unresolved.
 pub fn identity_exists_on_source_volume(source: &Path, expected: &Identity) -> io::Result<bool> {
+    require_move_identity(expected)?;
     use std::os::windows::ffi::OsStringExt;
     use std::path::{Component, Prefix};
     let drive = match source.components().next() {
@@ -737,6 +819,33 @@ pub fn streams(path: &Path) -> io::Result<Vec<Stream>> {
         if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
             return Ok(Vec::new());
         }
+        if matches!(error.raw_os_error(), Some(1 | 50 | 87)) {
+            // FAT does not implement stream enumeration. Pin the actual base
+            // object, confirm its filesystem has no ADS, and expose its unnamed
+            // data only. Never infer this from error 87 or a drive letter alone.
+            let file = OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)?;
+            let metadata = file.metadata()?;
+            let volume = volume_information(&file)?;
+            if !is_reparse(&metadata)
+                && fat_without_ads(&volume.filesystem)
+                && volume.flags & FILE_NAMED_STREAMS == 0
+            {
+                return if metadata.is_file() {
+                    Ok(vec![Stream {
+                        name: OsString::new(),
+                        size: metadata.len(),
+                    }])
+                } else if metadata.is_dir() {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                };
+            }
+        }
         return Err(error);
     }
     let result = (|| {
@@ -825,6 +934,12 @@ impl Stage {
 
     /// Adopt only an exact recorded staging identity. Never clean a mismatching file.
     pub fn reopen(path: &Path, expected: &Identity) -> io::Result<Self> {
+        if expected.kind != IdentityKind::Native128 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "FAT source identity cannot own a staging file",
+            ));
+        }
         // Clear readonly only on the exact owned object, then recheck identity
         // after reopening for data writes. No write is made on a mismatching handle.
         let attributes = OpenOptions::new()
@@ -912,6 +1027,12 @@ impl Stage {
     }
 
     pub fn reopen_directory(path: &Path, expected: &Identity) -> io::Result<Self> {
+        if expected.kind != IdentityKind::Native128 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "FAT source identity cannot own a staging directory",
+            ));
+        }
         let file = Self::directory_handle(path)?;
         if identity(&file)? != *expected {
             return Err(io::Error::other("staging directory identity mismatch"));

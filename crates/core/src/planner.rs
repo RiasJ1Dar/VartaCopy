@@ -70,7 +70,7 @@ impl Snapshot {
     pub(crate) fn validate_cleanup_directory(&self, file: &File, path: &Path) -> Result<()> {
         // Removing our own children changes LastWriteTime. Identity, attributes
         // and ADS must remain unchanged; Windows enforces empty-only deletion.
-        if self.identity != platform::identity(file)?
+        if self.identity != platform::source_identity(file)?
             || self.attributes != file.metadata()?.file_attributes()
             || self.streams != platform::streams(path)?
         {
@@ -82,7 +82,7 @@ impl Snapshot {
     }
     pub(crate) fn validate(&self, file: &File, path: &Path, directory: bool) -> Result<()> {
         let metadata = file.metadata()?;
-        if self.identity != platform::identity(file)?
+        if self.identity != platform::source_identity(file)?
             || self.modified != metadata.last_write_time()
             || (!directory && self.length != metadata.len())
             || self.attributes != metadata.file_attributes()
@@ -276,9 +276,9 @@ fn inspect(
     entry.streams = streams.len();
     entry.snapshot = Some(Snapshot {
         identity: dio(
-            "GetFileInformationByHandleEx(FileIdInfo)",
+            "source_identity(FileIdInfo/legacy FAT)",
             &path,
-            platform::identity(&file),
+            platform::source_identity(&file),
         )?,
         modified: metadata.last_write_time(),
         length: metadata.len(),
@@ -440,10 +440,17 @@ pub fn scan(
         destination_dir.canonicalize(),
     )?;
     let source_identity = dio(
-        "GetFileInformationByHandleEx(FileIdInfo):source",
+        "source_identity(FileIdInfo/legacy FAT):source",
         &source,
-        platform::identity(&root_guard),
+        platform::source_identity(&root_guard),
     )?;
+    diagnostics::event(
+        "scan.source_identity_policy",
+        serde_json::json!({
+            "source":diagnostics::path(&source),"kind":source_identity.kind,
+            "path_scoped_read_only":source_identity.kind == platform::IdentityKind::FatSource,
+        }),
+    );
     if metadata.is_dir() {
         // Identity, not spelling/case, detects a destination inside the source.
         for ancestor in destination_dir.ancestors() {

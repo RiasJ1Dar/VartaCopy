@@ -231,7 +231,7 @@ fn copy_with_hook(
     let mut input = source_file(&source)?;
     let stamp = input.metadata()?;
     let manifest = platform::streams(&source)?;
-    let source_identity = platform::identity(&input)?;
+    let source_identity = platform::source_identity(&input)?;
     // Open every named source stream before writing anything.
     let mut named_inputs = Vec::new();
     for stream in &manifest {
@@ -276,7 +276,7 @@ fn copy_with_hook(
         if primary.1 != stamp.len()
             || after.len() != stamp.len()
             || after.modified()? != stamp.modified()?
-            || source_identity != platform::identity(&input)?
+            || source_identity != platform::source_identity(&input)?
             || platform::streams(&source)? != manifest
         {
             return Err(Error::Verification("source changed during transfer".into()));

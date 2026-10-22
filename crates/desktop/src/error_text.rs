@@ -5,7 +5,12 @@ pub(crate) struct Explanation<'a> {
 }
 
 pub(crate) fn explain(details: &str) -> Explanation<'_> {
-    let (summary, action) = if details.contains("FileIdInfo")
+    let (summary, action) = if details.contains("Переміщення з FAT/FAT32") {
+        (
+            "Переміщення з FAT/FAT32 через VartaCopy поки недоступне.",
+            "Оберіть копіювання з перевіркою або передайте переміщення через Windows. Джерела не видалялися.",
+        )
+    } else if details.contains("FileIdInfo")
         && (details.contains("FAT32") || details.contains("exFAT") || details.contains("FAT:"))
     {
         (

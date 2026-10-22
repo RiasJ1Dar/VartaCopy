@@ -564,6 +564,15 @@ impl Journal {
             return Err(Error::Journal("batch requires 1..512 ready plans".into()));
         }
         let mut ids = Vec::with_capacity(plans.len());
+        if operation == OperationKind::Move {
+            for plan in plans {
+                for entry in &plan.entries {
+                    if let Some(snapshot) = &entry.snapshot {
+                        platform::require_move_identity(&snapshot.identity)?;
+                    }
+                }
+            }
+        }
         for plan in plans {
             tx.execute("INSERT INTO jobs(source,destination,parent_identity,conflict,entry_count,operation,queue_position) VALUES(?1,?2,?3,?4,?5,?6,(SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs))",
             params![encode_path(&plan.source),encode_path(&plan.destination),
