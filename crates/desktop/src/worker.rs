@@ -37,6 +37,7 @@ pub struct State {
     pub details: Option<Arc<JobDetails>>,
     pub files: Option<Arc<EntryPage>>,
     pub notice: Option<String>,
+    pub windows_retry: Option<vartacopy_shell_windows::transfer::TransferRequest>,
 }
 #[derive(Debug, Clone)]
 pub struct Active {
@@ -97,7 +98,10 @@ pub enum Command {
 }
 enum Message {
     Diagnostic(String),
-    Dispatched(Result<(String, bool)>),
+    Dispatched(
+        Result<(String, bool)>,
+        Option<vartacopy_shell_windows::transfer::TransferRequest>,
+    ),
     Wake,
     ViewTick,
     Command(Command),
@@ -309,7 +313,10 @@ fn scan_request(
         ));
     }
     scan_cancel.store(false, Ordering::Relaxed);
-    edit(state, |s| s.planning = true)?;
+    edit(state, |s| {
+        s.planning = true;
+        s.windows_retry = None;
+    })?;
     let tx = sender.clone();
     let cancel = scan_cancel.clone();
     let diagnostic = diagnostics::current();
@@ -453,6 +460,7 @@ fn actor(
                         let diagnostic_path = path.clone();
                         let diagnostic = diagnostics::current();
                         cancel.store(false, Ordering::Release);
+                        edit(state, |s| s.windows_retry = None)?;
                         let handle = thread::Builder::new()
                             .name("vartacopy-dispatch".into())
                             .spawn(move || {
@@ -463,6 +471,7 @@ fn actor(
                                             &mut peer, &request, engine, conflict, &cancel,
                                         )
                                     }));
+                                let mut retry = None;
                                 let result = outcome
                                     .unwrap_or_else(|_| {
                                         Err(Error::Journal(
@@ -471,6 +480,11 @@ fn actor(
                                         ))
                                     })
                                     .map_err(|error| {
+                                        if crate::transfer_failure::windows_retry(
+                                            &peer, &request, engine, &error,
+                                        ) {
+                                            retry = Some(request.clone());
+                                        }
                                         crate::transfer_failure::describe(
                                             &peer,
                                             &diagnostic_path,
@@ -479,20 +493,23 @@ fn actor(
                                             error,
                                         )
                                     });
-                                if let Err(error) = tx.send(Message::Dispatched(result)) {
+                                if let Err(error) = tx.send(Message::Dispatched(result, retry)) {
                                     eprintln!("VartaCopy: dispatch result undelivered: {error}");
                                 }
                             })?;
                         dispatch = Some(handle);
                         edit(state, |s| s.dispatching = true)?;
                     }
-                    Message::Dispatched(result) => {
+                    Message::Dispatched(result, retry) => {
                         if let Some(handle) = dispatch.take() {
                             handle
                                 .join()
                                 .map_err(|_| Error::Journal("dispatch worker panicked".into()))?;
                         }
-                        edit(state, |s| s.dispatching = false)?;
+                        edit(state, |s| {
+                            s.dispatching = false;
+                            s.windows_retry = retry;
+                        })?;
                         let (notice, start) = result?;
                         automatic |= start;
                         edit(state, |s| s.notice = Some(notice))?;
@@ -617,6 +634,7 @@ fn actor(
                         edit(state, |s| {
                             s.errors.clear();
                             s.notice = None;
+                            s.windows_retry = None;
                         })?;
                     }
                     Message::Command(Command::RunQueue(value)) => automatic = value,

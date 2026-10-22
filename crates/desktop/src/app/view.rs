@@ -291,9 +291,12 @@ impl App {
         if let Some(e) = &job.last_error
             && ui
                 .add(
-                    egui::Button::new(RichText::new(e).color(ui.visuals().error_fg_color))
-                        .frame(false)
-                        .wrap_mode(egui::TextWrapMode::Truncate),
+                    egui::Button::new(
+                        RichText::new(crate::error_text::explain(e).summary)
+                            .color(ui.visuals().error_fg_color),
+                    )
+                    .frame(false)
+                    .wrap_mode(egui::TextWrapMode::Truncate),
                 )
                 .clicked()
         {
@@ -621,9 +624,12 @@ impl App {
         } else if let Some(message) = self.banner.as_ref().or_else(|| self.state.errors.back()) {
             if ui
                 .add(
-                    egui::Button::new(RichText::new(message).color(ui.visuals().error_fg_color))
-                        .frame(false)
-                        .wrap_mode(egui::TextWrapMode::Truncate),
+                    egui::Button::new(
+                        RichText::new(crate::error_text::explain(message).summary)
+                            .color(ui.visuals().error_fg_color),
+                    )
+                    .frame(false)
+                    .wrap_mode(egui::TextWrapMode::Truncate),
                 )
                 .clicked()
             {

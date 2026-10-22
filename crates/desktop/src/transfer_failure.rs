@@ -14,6 +14,32 @@ use vartacopy_core::{
 use vartacopy_shell_windows::transfer::{TransferOperation, TransferRequest, encode_transfer};
 const FORMAT: &str = "vartacopy.transfer-error";
 const LIMIT: usize = 2 * 1024 * 1024;
+
+/// Windows retry requires a known capability failure and proof no request was accepted.
+/// A plain error 87 or an unreadable receipt is never sufficient.
+pub(crate) fn windows_retry(
+    journal: &Journal,
+    request: &TransferRequest,
+    engine: DispatchEngine,
+    error: &Error,
+) -> bool {
+    if engine != DispatchEngine::VartaCopy
+        || !matches!(journal.dispatch_receipt(request.id), Ok(None))
+    {
+        return false;
+    }
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    for _ in 0..16 {
+        let Some(current) = next else { break };
+        if let Some(io) = current.downcast_ref::<io::Error>()
+            && vartacopy_platform_windows::unsupported_identity_filesystem(io).is_some()
+        {
+            return true;
+        }
+        next = current.source();
+    }
+    false
+}
 fn units(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().collect()
 }
@@ -175,6 +201,12 @@ mod tests {
             )
             .unwrap();
         for engine in [DispatchEngine::Explorer, DispatchEngine::VartaCopy] {
+            assert!(!windows_retry(
+                &journal,
+                &request,
+                engine,
+                &io::Error::from_raw_os_error(87).into()
+            ));
             let message = describe(
                 &journal,
                 &path,
@@ -222,6 +254,12 @@ mod tests {
             io::Error::from_raw_os_error(87).into(),
         );
         assert!(error.to_string().contains("не розпочато"));
+        assert!(!windows_retry(
+            &journal,
+            &request,
+            DispatchEngine::VartaCopy,
+            &io::Error::from_raw_os_error(87).into()
+        ));
         assert!(error.to_string().contains("87"));
         assert!(journal.jobs(10, 0).unwrap().is_empty());
         assert!(journal.dispatch_receipt(request.id).unwrap().is_none());

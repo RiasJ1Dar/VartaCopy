@@ -62,6 +62,41 @@ fn new_worker_error_opens_readable_messages_once_without_changing_selected_job()
     app.begin_close();
     update(&mut app, |s| s.closed);
 }
+
+#[test]
+fn fat_failure_shows_reason_and_explicit_windows_choice_with_collapsed_evidence() {
+    let (_root, mut app) = fixture();
+    let request = vartacopy_shell_windows::transfer::TransferRequest {
+        id: [91; 16],
+        operation: vartacopy_shell_windows::transfer::TransferOperation::Copy,
+        origin: vartacopy_shell_windows::transfer::TransferOrigin::Explorer,
+        sources: vec![PathBuf::from(r"D:\source.txt")],
+        destination: PathBuf::from(r"E:\destination"),
+    };
+    let raw = "journal rejected: Копіювання не розпочато; запит не додано до черги. FAT32: FileIdInfo недоступний. Windows: The parameter is incorrect. (os error 87)";
+    let mut state = app.state.clone();
+    state.errors.push_back(raw.into());
+    state.windows_retry = Some(request);
+    app.accept_snapshot(state);
+    render(&mut app, [900.0, 700.0], None); // Resolve the new window's scroll geometry.
+    let nodes = render(&mut app, [900.0, 700.0], None);
+    let labels = nodes
+        .iter()
+        .flat_map(|(_, n)| [n.label(), n.value()])
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(labels.iter().any(|s| s.contains("FAT/exFAT")));
+    assert!(labels.contains(&"Передати через Windows"));
+    assert!(
+        labels.join(" ").contains("Джерела не видалялися"),
+        "{labels:?}"
+    );
+    assert!(!labels.iter().any(|s| s.contains("os error 87")));
+    assert!(!app.state.dispatching);
+    assert!(app.chooser.is_none()); // Rendering never retries the operation.
+    app.begin_close();
+    update(&mut app, |s| s.closed);
+}
 #[test]
 fn tray_exit_uses_durable_shutdown_and_hide_requires_an_available_icon() {
     let (_root, mut app) = fixture();

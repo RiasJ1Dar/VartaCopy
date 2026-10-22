@@ -509,6 +509,14 @@ struct UnsupportedIdentity {
     filesystem: String,
     source: io::Error,
 }
+
+/// A known capability failure, rather than an arbitrary Windows error 87.
+pub fn unsupported_identity_filesystem(error: &io::Error) -> Option<&str> {
+    error
+        .get_ref()?
+        .downcast_ref::<UnsupportedIdentity>()
+        .map(|error| error.filesystem.as_str())
+}
 impl std::fmt::Display for UnsupportedIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -573,6 +581,7 @@ mod identity_error_tests {
                     identity_error(io::Error::from_raw_os_error(code), || volume(filesystem));
                 assert_eq!(error.kind(), io::ErrorKind::Unsupported);
                 assert!(error.to_string().contains(filesystem));
+                assert_eq!(unsupported_identity_filesystem(&error), Some(filesystem));
                 assert!(error.to_string().contains("Explorer"));
                 let mut cause: &(dyn std::error::Error + 'static) = &error;
                 loop {
@@ -593,6 +602,7 @@ mod identity_error_tests {
                 let error =
                     identity_error(io::Error::from_raw_os_error(code), || volume(filesystem));
                 assert_eq!(error.raw_os_error(), Some(code));
+                assert_eq!(unsupported_identity_filesystem(&error), None);
             }
             let error = identity_error(io::Error::from_raw_os_error(code), || {
                 Err(io::Error::from_raw_os_error(5))

@@ -266,7 +266,7 @@ impl App {
                             ui.ctx().copy_text(source.to_string_lossy().into_owned());
                         }
                         if let Some(error) = &e.error {
-                            ui.colored_label(ui.visuals().error_fg_color, error);
+                            error_message(ui, "file_error", error);
                         }
                         if let Some(size) = e.bytes {
                             ui.label(format!("Розмір усіх потоків: {}", bytes(size)));
@@ -286,6 +286,7 @@ impl App {
         }
         if self.messages_open {
             let mut open = true;
+            let mut retry_request = None;
             egui::Window::new("Повідомлення")
                 .open(&mut open)
                 .default_width(580.0)
@@ -295,22 +296,41 @@ impl App {
                         .max_height((ctx.content_rect().height() - 110.0).clamp(80.0, 360.0))
                         .show(ui, |ui| {
                             if let Some(e) = &self.banner {
-                                ui.colored_label(ui.visuals().error_fg_color, e);
+                                error_message(ui, "banner_error", e);
                             }
                             // Latest failure first, including when the bounded log rotates.
-                            for e in self.state.errors.iter().rev() {
-                                ui.colored_label(ui.visuals().error_fg_color, e);
+                            for (index, e) in self.state.errors.iter().rev().enumerate() {
+                                error_message(ui, ("worker_error", index), e);
                                 ui.separator();
                             }
                             if let Some(n) = &self.state.notice {
                                 ui.label(n);
                             }
                         });
+                    if let Some(request) = self.state.windows_retry.clone() {
+                        ui.separator();
+                        ui.label(format!("Джерел: {}. Призначення: {}", request.sources.len(), request.destination.display()));
+                        ui.label("Windows виконає передачу за системними правилами, без перевірки BLAKE3 та відновлення VartaCopy. Конфлікти й скасування — у системному діалозі.");
+                        let ready = self.state.ready && !self.state.dispatching && !self.state.planning && self.state.active.is_none() && !self.closing;
+                        if ui.add_enabled(ready, egui::Button::new("Передати через Windows")).clicked() {
+                            retry_request = Some(request);
+                        }
+                    }
                     if ui.button("Очистити повідомлення").clicked() {
                         self.banner = None;
                         self.command(Command::ClearErrors);
                     }
                 });
+            if let Some(request) = retry_request
+                && self.command(Command::Dispatch {
+                    request,
+                    engine: vartacopy_core::journal::DispatchEngine::Explorer,
+                    conflict: Conflict::Error,
+                })
+            {
+                open = false;
+                self.banner = None;
+            }
             self.messages_open = open;
         }
         if self.settings_open {
@@ -384,4 +404,26 @@ impl App {
                 ));
             });
     }
+}
+
+fn error_message(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, details: &str) {
+    let explanation = crate::error_text::explain(details);
+    ui.colored_label(ui.visuals().error_fg_color, explanation.summary);
+    if !explanation.action.is_empty() {
+        ui.label(explanation.action);
+    }
+    if details.contains("не розпочато; запит не додано до черги") {
+        ui.label("Передача не починалася. Джерела не видалялися.");
+    } else if details.contains("не підтверджене; перевірте стан у журналі")
+    {
+        ui.label("Результат передачі не підтверджено. Перевірте файли та історію перед повтором.");
+    }
+    egui::CollapsingHeader::new("Технічні деталі")
+        .id_salt(id)
+        .show(ui, |ui| {
+            if ui.button("Копіювати деталі").clicked() {
+                ui.ctx().copy_text(details.to_owned());
+            }
+            ui.add(egui::Label::new(details).wrap());
+        });
 }
