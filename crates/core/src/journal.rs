@@ -1,5 +1,6 @@
 //! Local SQLite journal. Filesystem mutations and SQL commits are reconciled, never treated as one transaction.
 mod dispatch;
+mod operations;
 #[cfg(test)]
 mod tests;
 use crate::{
@@ -20,7 +21,7 @@ use std::time::Duration;
 use vartacopy_platform_windows as platform;
 
 const APPLICATION_ID: i32 = 0x56415254;
-const VERSION: i32 = 4;
+const VERSION: i32 = 5;
 pub fn default_path() -> Result<PathBuf> {
     let root = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| Error::Journal("LOCALAPPDATA is not configured".into()))?;
@@ -155,6 +156,8 @@ impl EntryState {
 #[derive(Debug, Clone, Serialize)]
 pub struct Job {
     pub id: i64,
+    /// User-operation projections may contain several independently recovered roots.
+    pub source_count: usize,
     pub operation: OperationKind,
     #[serde(serialize_with = "crate::planner::serialize_path")]
     pub source: PathBuf,
@@ -205,6 +208,8 @@ pub struct JobDetails {
 pub struct EntrySummary {
     pub ordinal: usize,
     pub relative: PathBuf,
+    /// Actual source, independent of an operation's displayed relative name.
+    pub source: PathBuf,
     pub kind: EntryKind,
     /// Total logical bytes across all file streams, including ADS; directories have no size.
     pub bytes: Option<u64>,
@@ -329,6 +334,7 @@ impl Journal {
             let memory = Connection::open_in_memory()?;
             memory.execute_batch(SCHEMA)?;
             memory.execute_batch(dispatch::SCHEMA)?;
+            memory.execute_batch(operations::SCHEMA)?;
             memory.pragma_update(None, "application_id", APPLICATION_ID)?;
             memory.pragma_update(None, "user_version", VERSION)?;
             let image = memory.serialize("main")?;
@@ -380,6 +386,15 @@ impl Journal {
                 "BEGIN IMMEDIATE; {} PRAGMA user_version=4; COMMIT;",
                 dispatch::SCHEMA
             ))?;
+        }
+        if version <= 4 {
+            db.execute_batch(&format!(
+                "BEGIN IMMEDIATE; {} {}",
+                operations::SCHEMA,
+                operations::MIGRATE
+            ))?;
+            operations::split_legacy_destinations(&db)?;
+            db.execute_batch("PRAGMA user_version=5; COMMIT;")?;
         }
         let mode: String = db.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         db.pragma_update(None, "synchronous", "FULL")?;
@@ -563,6 +578,9 @@ impl Journal {
         if plans.is_empty() || plans.len() > 512 || plans.iter().any(|p| !p.is_ready()) {
             return Err(Error::Journal("batch requires 1..512 ready plans".into()));
         }
+        let grouped = plans
+            .iter()
+            .all(|p| p.destination.parent() == plans[0].destination.parent());
         let mut ids = Vec::with_capacity(plans.len());
         if operation == OperationKind::Move {
             for plan in plans {
@@ -604,6 +622,17 @@ impl Journal {
             tx.execute("INSERT INTO events(job_id,state) VALUES(?1,'queued')", [id])?;
             ids.push(id);
         }
+        let leader = ids[0];
+        for (ordinal, id) in ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO operation_members(operation_id,ordinal,job_id) VALUES(?1,?2,?3)",
+                params![
+                    if grouped { leader } else { *id },
+                    if grouped { sql_num(ordinal)? } else { 0 },
+                    id
+                ],
+            )?;
+        }
         Ok(ids)
     }
 
@@ -617,6 +646,7 @@ impl Journal {
         }
         Ok(Job {
             id,
+            source_count: 1,
             operation: OperationKind::parse(&self.db.query_row(
                 "SELECT operation FROM jobs WHERE id=?1",
                 [id],
@@ -705,7 +735,8 @@ impl Journal {
                 "file page must contain 1..128 entries".into(),
             ));
         }
-        let total = self.job(id)?.entry_count;
+        let job = self.job(id)?;
+        let total = job.entry_count;
         let mut statement = self.db.prepare("SELECT ordinal,relative,kind,snapshot,state,last_error FROM entries WHERE job_id=?1 ORDER BY ordinal LIMIT ?2 OFFSET ?3")?;
         let rows = statement.query_map(params![id, sql_num(limit)?, sql_num(offset)?], |r| {
             Ok((
@@ -735,9 +766,16 @@ impl Journal {
             } else {
                 None
             };
+            let relative = decode_path(relative, true)?;
+            let source = if relative.as_os_str().is_empty() {
+                job.source.clone()
+            } else {
+                job.source.join(&relative)
+            };
             entries.push(EntrySummary {
                 ordinal: ordinal as usize,
-                relative: decode_path(relative, true)?,
+                relative,
+                source,
                 kind,
                 bytes,
                 state: EntryState::parse(&state)?,
@@ -1228,6 +1266,9 @@ impl Journal {
         Ok(chunks)
     }
 
+    /// Commits are durable in FULL-synchronous WAL even when truncation is deferred.
+    /// This is not a standalone-main-file backup barrier: use SQLite backup or
+    /// preserve a coherent database/WAL pair when acquiring a snapshot.
     pub fn flush(&self) -> Result<()> {
         // End a fresh WAL connection's schema-read transaction before checkpointing.
         self.db.execute_batch("BEGIN IMMEDIATE; COMMIT;")?;
@@ -1237,11 +1278,23 @@ impl Journal {
         if std::sync::Arc::strong_count(&self._writer) > 1 {
             return Ok(());
         }
-        let busy: i32 = self
-            .db
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        let (busy, frames, checkpointed): (i32, i64, i64) =
+            self.db
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
         if busy != 0 {
-            return Err(Error::Journal("WAL checkpoint is busy".into()));
+            // FULL commits are already durable in WAL. A retained SQLite read
+            // snapshot may defer truncation; that is maintenance, not a failed
+            // transfer or lost commit. Keep the evidence and let SQLite retry
+            // on a later checkpoint/last-connection close.
+            crate::diagnostics::durable(
+                "journal.checkpoint_deferred",
+                serde_json::json!({"busy":busy,"wal_frames":frames,"checkpointed_frames":checkpointed,"durability":"synchronous_full_wal_retained"}),
+            );
+            eprintln!(
+                "VartaCopy: очищення WAL відкладено через зайнятий журнал; підтверджені зміни збережені у WAL ({checkpointed}/{frames})."
+            );
         }
         Ok(())
     }

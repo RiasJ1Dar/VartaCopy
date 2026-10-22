@@ -229,7 +229,7 @@ impl App {
         .on_hover_text(state);
         if ui.available_width() >= 620.0 {
             ui.columns(2, |columns| {
-                path_line(&mut columns[0], "З:", &job.source);
+                source_line(&mut columns[0], job);
                 path_line(
                     &mut columns[1],
                     "До:",
@@ -237,7 +237,7 @@ impl App {
                 );
             });
         } else {
-            path_line(ui, "З:", &job.source);
+            source_line(ui, job);
             path_line(
                 ui,
                 "До:",

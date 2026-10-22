@@ -720,6 +720,21 @@ fn name(path: &Path) -> String {
         .to_string_lossy()
         .into_owned()
 }
+
+fn source_caption(job: &Job) -> String {
+    if job.source_count > 1 {
+        format!("Джерел: {}", job.source_count)
+    } else {
+        name(&job.source)
+    }
+}
+fn source_line(ui: &mut egui::Ui, job: &Job) {
+    if job.source_count > 1 {
+        ui.label(source_caption(job));
+    } else {
+        path_line(ui, "З:", &job.source);
+    }
+}
 // Explorer uses shell paths. Strip only the verbatim DOS/UNC prefix, preserving native names.
 fn explorer_path(path: &Path) -> PathBuf {
     use std::{

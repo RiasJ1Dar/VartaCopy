@@ -36,6 +36,48 @@ fn fixture() -> (tempfile::TempDir, App) {
     update(&mut app, |s| s.ready && s.files.is_some());
     (root, app)
 }
+
+#[test]
+fn one_selection_renders_one_operation_with_all_files_and_their_real_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let dest = root.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    let sources = [
+        root.path().join("first.txt"),
+        root.path().join("second.txt"),
+    ];
+    for source in &sources {
+        fs::write(source, b"fixture").unwrap();
+    }
+    let plans = sources
+        .iter()
+        .map(|s| planner::scan(s, &dest, ScanOptions::default(), &AtomicBool::new(false)).unwrap())
+        .collect::<Vec<_>>();
+    let path = root.path().join("jobs.sqlite");
+    let mut journal = Journal::open(&path).unwrap();
+    let id = journal.enqueue_many(&plans, Conflict::Error).unwrap()[0];
+    drop(journal);
+    let context = egui::Context::default();
+    let mut app = App::new(&eframe::CreationContext::_new_kittest(context), path).unwrap();
+    app.select(id);
+    update(&mut app, |s| s.ready && s.files.is_some());
+    let nodes = render(&mut app, [900.0, 650.0], None);
+    let operations = nodes
+        .iter()
+        .filter(|(_, n)| n.role() == Role::ListBoxOption)
+        .collect::<Vec<_>>();
+    assert_eq!(operations.len(), 1);
+    assert!(operations[0].1.label().unwrap().contains("Джерел: 2"));
+    assert_eq!(app.state.files.as_ref().unwrap().total, 2);
+    app.file_selected = Some(1);
+    app.inspect_file();
+    assert_eq!(
+        app.file_details.as_ref().unwrap().1.source,
+        sources[1].canonicalize().unwrap()
+    );
+    app.begin_close();
+    update(&mut app, |s| s.closed);
+}
 #[test]
 fn new_worker_error_opens_readable_messages_once_without_changing_selected_job() {
     let (_root, mut app) = fixture();

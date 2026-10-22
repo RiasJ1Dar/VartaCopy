@@ -29,7 +29,7 @@ impl App {
                                 ui.visuals_mut().override_text_color =
                                     Some(ui.visuals().selection.stroke.color);
                             }
-                            ui.add(egui::Label::new(name(&job.source)).truncate());
+                            ui.add(egui::Label::new(source_caption(job)).truncate());
                             ui.label(RichText::new(&caption).small());
                         });
                 },
@@ -39,7 +39,7 @@ impl App {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Other,
                 ui.is_enabled(),
-                format!("{} {caption}", name(&job.source)),
+                format!("{} {caption}", source_caption(job)),
             )
         });
         ui.ctx().accesskit_node_builder(row.id, |n| {
@@ -234,7 +234,7 @@ impl App {
                 RichText::new(format!(
                     "{} · {} · #{}",
                     operation_name(job.operation),
-                    name(&job.source),
+                    source_caption(job),
                     job.id
                 ))
                 .strong(),
@@ -242,7 +242,7 @@ impl App {
             .truncate(),
         );
         if self.compact || ui.available_height() >= 330.0 {
-            path_line(ui, "З:", &job.source);
+            source_line(ui, job);
             path_line(
                 ui,
                 "До:",
@@ -636,9 +636,14 @@ impl App {
                 self.messages_open = true;
             }
         } else if let Some(message) = self.state.notice.as_ref() {
+            let caption = if crate::error_text::technical_notice(message) {
+                crate::error_text::explain(message).summary
+            } else {
+                message
+            };
             if ui
                 .add(
-                    egui::Button::new(message)
+                    egui::Button::new(caption)
                         .frame(false)
                         .wrap_mode(egui::TextWrapMode::Truncate),
                 )

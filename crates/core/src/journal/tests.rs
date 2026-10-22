@@ -89,6 +89,45 @@ fn atomic_initialization_enqueue_reopen_and_pragmas() {
 }
 
 #[test]
+fn busy_checkpoint_retains_durable_wal_and_records_deferred_maintenance() {
+    let (root, plan) = fixture();
+    let path = root.path().join("jobs.sqlite");
+    let mut journal = Journal::open(&path).unwrap();
+    journal.enqueue(&plan, Conflict::Error).unwrap();
+    journal.flush().unwrap();
+    let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    reader.execute_batch("BEGIN;").unwrap();
+    assert_eq!(
+        reader
+            .query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    journal.enqueue(&plan, Conflict::Error).unwrap();
+    let session = crate::diagnostics::Session::open(&path, "checkpoint-test").unwrap();
+    let scope = crate::diagnostics::enter(Some(session.clone()));
+    journal.flush().unwrap(); // Reader's older snapshot prevents truncation, not durability.
+    drop(scope);
+    drop(session);
+    let log = fs::read_to_string(path.with_file_name("jobs.sqlite.diagnostics.jsonl")).unwrap();
+    assert!(log.contains("journal.checkpoint_deferred"));
+    assert!(log.contains("synchronous_full_wal_retained"));
+    reader.execute_batch("ROLLBACK;").unwrap();
+    drop(reader);
+    journal.flush().unwrap();
+    drop(journal);
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.jobs(10, 0).unwrap().len(), 2);
+    assert_eq!(
+        journal
+            .db
+            .query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+}
+
+#[test]
 fn unrelated_and_future_databases_are_not_modified() {
     let (root, _) = fixture();
     let unrelated = root.path().join("unrelated.sqlite");
@@ -337,7 +376,7 @@ fn migrates_version_one_atomically_and_recovers_running_jobs() {
         journal.set_job_status(id, "running", None).unwrap();
         journal
             .db
-            .execute_batch("DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; ALTER TABLE jobs DROP COLUMN queue_position; PRAGMA user_version=1;")
+            .execute_batch("DROP TABLE operation_members; DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; ALTER TABLE jobs DROP COLUMN queue_position; PRAGMA user_version=1;")
             .unwrap();
         journal.flush().unwrap();
     }
@@ -367,7 +406,7 @@ fn migrates_version_two_jobs_to_copy_and_persists_move() {
     {
         let mut journal = Journal::open(&path).unwrap();
         id = journal.enqueue(&plan, Conflict::Error).unwrap();
-        journal.db.execute_batch("DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; PRAGMA user_version=2;").unwrap();
+        journal.db.execute_batch("DROP TABLE operation_members; DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; PRAGMA user_version=2;").unwrap();
         journal.flush().unwrap();
     }
     let mut journal = Journal::open(&path).unwrap();

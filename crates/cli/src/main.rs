@@ -308,7 +308,7 @@ fn run(
                 None => journal::default_path()?,
             };
             let journal = Journal::open(&path)?;
-            emit(&journal.jobs(limit, offset)?, json)?;
+            emit(&journal.operations(limit, offset, false)?, json)?;
             Ok(0)
         }
         Command::Show {
@@ -318,7 +318,10 @@ fn run(
             json,
         } => {
             let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
-            emit(&Journal::open(&path)?.details(job_id, limit, offset)?, json)?;
+            emit(
+                &Journal::open(&path)?.operation_details(job_id, limit, offset)?,
+                json,
+            )?;
             Ok(0)
         }
         Command::Export {
@@ -327,7 +330,7 @@ fn run(
             json,
         } => {
             let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
-            Journal::open(&path)?.export_report(job_id, &output)?;
+            Journal::open(&path)?.export_operation_report(job_id, &output)?;
             emit(
                 &serde_json::json!({"status":"exported","job_id":job_id}),
                 json,
@@ -343,14 +346,19 @@ fn run(
             let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
             let mut journal = Journal::open(&path)?;
             if !run {
-                emit(&journal.queue(limit, offset)?, json)?;
+                emit(&journal.operations(limit, offset, true)?, json)?;
                 return Ok(0);
             }
             let mut code = 0;
-            // NDJSON with one result per job; no unbounded in-memory report list.
-            while let Some(job) = journal.queue(1, 0)?.into_iter().next() {
+            // NDJSON with one result per user operation, regardless of its root count.
+            while let Some(job) = journal.operations(1, 0, true)?.into_iter().next() {
                 control.checkpoint()?;
-                let report = recovery::run(&mut journal, job.id, control, &mut |_| Ok(()))?;
+                let mut report =
+                    recovery::run_operation(&mut journal, job.id, control, &mut |_| Ok(()))?;
+                if control.is_cancelled() {
+                    journal.hold_operation(job.id, job.operation == OperationKind::Move)?;
+                    report.status = journal.operation(job.id)?.status;
+                }
                 code = code.max(report.exit_code());
                 emit(&report, json)?;
                 if control.is_cancelled() {
@@ -367,18 +375,18 @@ fn run(
             let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
             let mut journal = Journal::open(&path)?;
             if recheck {
-                journal.recheck(job_id)?;
+                journal.recheck_operation(job_id)?;
             } else {
-                journal.schedule(job_id)?;
+                journal.schedule_operation(job_id)?;
             }
-            emit(&journal.job(job_id)?, json)?;
+            emit(&journal.operation(job_id)?, json)?;
             Ok(0)
         }
         Command::Pause { job_id, json } | Command::Cancel { job_id, json } => {
             let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
             let mut journal = Journal::open(&path)?;
-            journal.hold(job_id, matches!(args.command, Command::Cancel { .. }))?;
-            emit(&journal.job(job_id)?, json)?;
+            journal.hold_operation(job_id, matches!(args.command, Command::Cancel { .. }))?;
+            emit(&journal.operation(job_id)?, json)?;
             Ok(0)
         }
         Command::Order {
@@ -388,8 +396,8 @@ fn run(
         } => {
             let path = args.journal.map(Ok).unwrap_or_else(journal::default_path)?;
             let mut journal = Journal::open(&path)?;
-            journal.move_queued(job_id, matches!(direction, Direction::Up))?;
-            emit(&journal.queue(256, 0)?, json)?;
+            journal.move_operation(job_id, matches!(direction, Direction::Up))?;
+            emit(&journal.operations(256, 0, true)?, json)?;
             Ok(0)
         }
         Command::Resume { job_id, json } => {
@@ -398,7 +406,21 @@ fn run(
                 None => journal::default_path()?,
             };
             let mut journal = Journal::open(&path)?;
-            let report = recovery::run(&mut journal, job_id, control, &mut |_| Ok(()))?;
+            journal.recover_running_jobs()?;
+            let operation = journal.operation(job_id)?;
+            if operation.status != "completed" {
+                if operation.status == "partial" && operation.operation == OperationKind::Copy {
+                    journal.recheck_operation(job_id)?;
+                } else {
+                    journal.schedule_operation(job_id)?;
+                }
+            }
+            let mut report =
+                recovery::run_operation(&mut journal, job_id, control, &mut |_| Ok(()))?;
+            if control.is_cancelled() {
+                journal.hold_operation(job_id, operation.operation == OperationKind::Move)?;
+                report.status = journal.operation(job_id)?.status;
+            }
             let code = report.exit_code();
             emit(&report, json)?;
             Ok(code)

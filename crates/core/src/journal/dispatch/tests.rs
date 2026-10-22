@@ -417,7 +417,7 @@ fn version_three_migration_preserves_copy_move_queue_and_cleanup() {
     journal
         .db
         .execute_batch(
-            "DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; PRAGMA user_version=3;",
+            "DROP TABLE operation_members; DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; PRAGMA user_version=3;",
         )
         .unwrap();
     journal.flush().unwrap();
@@ -428,7 +428,7 @@ fn version_three_migration_preserves_copy_move_queue_and_cleanup() {
             .db
             .pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))
             .unwrap(),
-        4
+        VERSION
     );
     assert_eq!(journal.job(copy).unwrap().operation, OperationKind::Copy);
     assert_eq!(journal.job(moved).unwrap().operation, OperationKind::Move);

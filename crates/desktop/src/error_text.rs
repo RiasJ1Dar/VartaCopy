@@ -4,8 +4,19 @@ pub(crate) struct Explanation<'a> {
     pub action: &'a str,
 }
 
+pub(crate) fn technical_notice(details: &str) -> bool {
+    details.starts_with("Спроба Windows:")
+        || details.contains("(os error ")
+        || details.contains("(0x800")
+}
+
 pub(crate) fn explain(details: &str) -> Explanation<'_> {
-    let (summary, action) = if details.contains("Переміщення з FAT/FAT32") {
+    let (summary, action) = if details.starts_with("Спроба Windows:") {
+        (
+            "Windows не підтвердила результат передачі.",
+            "Перевірте файли у призначенні перед повтором. Причину відмови збережено в технічних деталях.",
+        )
+    } else if details.contains("Переміщення з FAT/FAT32") {
         (
             "Переміщення з FAT/FAT32 через VartaCopy поки недоступне.",
             "Оберіть копіювання з перевіркою або передайте переміщення через Windows. Джерела не видалялися.",
@@ -15,7 +26,7 @@ pub(crate) fn explain(details: &str) -> Explanation<'_> {
     {
         (
             "VartaCopy поки не може виконати цю передачу на носії FAT/exFAT.",
-            "Передайте файли через Windows кнопкою нижче або оберіть Explorer у вікні вибору обробника.",
+            "Для цієї передачі оберіть Explorer (Windows) або інший носій призначення.",
         )
     } else if details.contains("os error 112)") || details.contains("os error 39)") {
         (
@@ -110,5 +121,9 @@ mod tests {
                 .contains("FAT")
         );
         assert!(!explain("NTFS: os error 87)").summary.contains("FAT"));
+        let notice = "Спроба Windows: Windows file operation (perform): invalid parameter (0x80070057). Автоматичного повтору не буде.";
+        assert!(technical_notice(notice));
+        assert!(!explain(notice).summary.contains("0x800"));
+        assert!(explain(notice).summary.contains("не підтвердила"));
     }
 }

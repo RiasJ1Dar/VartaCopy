@@ -1,5 +1,7 @@
 //! Resumable verified file transfers. Every reused byte is rehashed in source and stage.
 mod move_cleanup;
+mod operation;
+pub use operation::run_operation;
 #[cfg(test)]
 mod tests;
 mod tree;

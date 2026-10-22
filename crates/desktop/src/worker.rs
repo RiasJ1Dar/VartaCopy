@@ -367,17 +367,19 @@ fn scan_request(
 
 fn refresh(journal: &Journal, state: &Shared) -> Result<()> {
     let offset = quiet(state, |s| s.offset)?;
-    let queue = journal.queue(32, 0)?;
-    let history = journal.jobs(32, offset)?;
+    let active = quiet(state, |s| s.active.as_ref().map(|a| a.id))?;
+    let mut queue = journal.operations(32, 0, true)?;
+    queue.retain(|job| Some(job.id) != active);
+    let history = journal.operations(32, offset, false)?;
     let selected = quiet(state, |s| {
         s.details.as_ref().map(|d| (d.job.id, d.issues_offset))
     })?;
     let details = selected
-        .map(|(id, offset)| journal.details(id, 32, offset).map(Arc::new))
+        .map(|(id, offset)| journal.operation_details(id, 32, offset).map(Arc::new))
         .transpose()?;
     let selected_files = quiet(state, |s| s.files.as_ref().map(|p| (p.job_id, p.offset)))?;
     let files = selected_files
-        .map(|(id, offset)| journal.entry_page(id, 128, offset).map(Arc::new))
+        .map(|(id, offset)| journal.operation_files(id, 128, offset).map(Arc::new))
         .transpose()?;
     edit(state, |s| {
         s.queue = queue;
@@ -606,11 +608,11 @@ fn actor(
                         refresh(&journal, state)?;
                     }
                     Message::Command(Command::Inspect { id, offset }) => {
-                        let details = journal.details(id, 32, offset)?;
+                        let details = journal.operation_details(id, 32, offset)?;
                         edit(state, |s| s.details = Some(Arc::new(details)))?;
                     }
                     Message::Command(Command::Files { id, offset }) => {
-                        let files = journal.entry_page(id, 128, offset)?;
+                        let files = journal.operation_files(id, 128, offset)?;
                         edit(state, |s| s.files = Some(Arc::new(files)))?;
                     }
                     Message::ViewTick => refresh(&journal, state)?,
@@ -620,13 +622,13 @@ fn actor(
                                 "Pause this job before exporting a final report".into(),
                             ));
                         }
-                        journal.export_report(id, &path)?;
+                        journal.export_operation_report(id, &path)?;
                         edit(state, |s| {
                             s.notice = Some(format!("Звіт збережено: {}", path.display()))
                         })?;
                     }
                     Message::Command(Command::Recheck(id)) => {
-                        journal.recheck(id)?;
+                        journal.recheck_operation(id)?;
                         automatic = true;
                         refresh(&journal, state)?;
                     }
@@ -643,7 +645,7 @@ fn actor(
                         if active_id == Some(id) {
                             return Err(Error::Journal("job is already active".into()));
                         }
-                        journal.schedule(id)?;
+                        journal.schedule_operation(id)?;
                         automatic = true;
                         refresh(&journal, state)?;
                     }
@@ -665,7 +667,7 @@ fn actor(
                                 }
                             })?;
                         } else {
-                            journal.hold(id, false)?;
+                            journal.hold_operation(id, false)?;
                             refresh(&journal, state)?;
                         }
                     }
@@ -686,12 +688,12 @@ fn actor(
                                 }
                             })?;
                         } else {
-                            journal.hold(id, true)?;
+                            journal.hold_operation(id, true)?;
                             refresh(&journal, state)?;
                         }
                     }
                     Message::Command(Command::Reorder { id, earlier }) => {
-                        journal.move_queued(id, earlier)?;
+                        journal.move_operation(id, earlier)?;
                         refresh(&journal, state)?;
                     }
                     Message::Command(Command::Page(offset)) => {
@@ -712,20 +714,16 @@ fn actor(
                         edit(state, |s| s.last_transfer = s.active.take())?;
                         match result {
                             Ok(mut report) => {
-                                let normalized = match (stop_request, report.status.as_str()) {
-                                    (Some(StopRequest::Pause), "cancelled") => Some((
-                                        "paused",
-                                        "Paused by user; verified outputs and remaining sources are retained for resume",
-                                    )),
-                                    (Some(StopRequest::Cancel), "paused") => Some((
-                                        "cancelled",
-                                        "Stopped by user; verified outputs and remaining sources are retained for recovery",
-                                    )),
-                                    _ => None,
-                                };
-                                if let Some((status, message)) = normalized {
-                                    journal.set_job_status(id, status, Some(message))?;
-                                    report.status = status.into();
+                                if stop_request.is_some() || shutdown.load(Ordering::Acquire) {
+                                    journal.hold_operation(
+                                        id,
+                                        matches!(stop_request, Some(StopRequest::Cancel))
+                                            || (stop_request.is_none()
+                                                && shutdown.load(Ordering::Acquire)
+                                                && journal.operation(id)?.operation
+                                                    == OperationKind::Move),
+                                    )?;
+                                    report.status = journal.operation(id)?.status;
                                 }
                                 edit(state, |s| s.last_report = Some(Arc::new(report)))?;
                             }
@@ -735,7 +733,7 @@ fn actor(
                                     &e,
                                     serde_json::json!({"job_id":id}),
                                 );
-                                journal.set_job_status(id, "interrupted", Some(&e.to_string()))?;
+                                journal.interrupt_operation(id, &e.to_string())?;
                                 error(state, e);
                             }
                         }
@@ -761,7 +759,7 @@ fn actor(
             && dispatch.is_none()
             && !shutdown.load(Ordering::Acquire)
         {
-            if let Some(job) = journal.queue(1, 0)?.into_iter().next() {
+            if let Some(job) = journal.operations(1, 0, true)?.into_iter().next() {
                 let mut peer = journal.peer()?;
                 let view = journal.peer()?;
                 let control = Arc::new(Control::default());
@@ -769,7 +767,6 @@ fn actor(
                     .lock()
                     .map_err(|_| Error::Journal("transfer control poisoned".into()))? =
                     Some(control.clone());
-                journal.set_job_status(job.id, "running", None)?;
                 let tx = sender.clone();
                 let shared = state.clone();
                 let progress_hook = hook.clone();
@@ -779,7 +776,7 @@ fn actor(
                     .ok_or_else(|| Error::Journal("transfer run counter exhausted".into()))?;
                 let run_started = Instant::now();
                 let mut meter = Meter::new(run_id);
-                let source_root = job.source.clone();
+                let source_roots = journal.operation_members(job.id)?;
                 active_id = Some(id);
                 edit(state, |s| {
                     s.active = Some(Active {
@@ -808,15 +805,32 @@ fn actor(
                             let mut current_source = None;
                             let outcome =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    recovery::run(&mut peer, id, &control, &mut |event| {
+                                    recovery::run_operation(&mut peer, id, &control, &mut |event| {
                                         meter.observe(run_started.elapsed(), &event);
                                         if current_entry != Some(event.entry) {
-                                            let entry = view.entry(id, event.entry)?;
+                                            let mut ordinal = event.entry;
+                                            let root = source_roots
+                                                .iter()
+                                                .find(|root| {
+                                                    if ordinal < root.entry_count {
+                                                        true
+                                                    } else {
+                                                        ordinal -= root.entry_count;
+                                                        false
+                                                    }
+                                                })
+                                                .ok_or_else(|| {
+                                                    Error::Journal(
+                                                        "operation progress entry out of range"
+                                                            .into(),
+                                                    )
+                                                })?;
+                                            let entry = view.entry(root.id, ordinal)?;
                                             current_source =
                                                 Some(if entry.relative.as_os_str().is_empty() {
-                                                    source_root.clone()
+                                                    root.source.clone()
                                                 } else {
-                                                    source_root.join(entry.relative)
+                                                    root.source.join(entry.relative)
                                                 });
                                             current_entry = Some(event.entry);
                                         }
@@ -886,6 +900,71 @@ fn actor(
 mod tests {
     use super::*;
     use std::{fs, sync::atomic::AtomicUsize, time::Instant};
+    #[test]
+    fn selected_roots_share_one_pause_resume_history_and_write_meter() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.txt");
+        let second = root.path().join("second.txt");
+        let dest = root.path().join("dest");
+        let path = root.path().join("jobs.sqlite");
+        fs::write(&first, b"one").unwrap();
+        fs::write(&second, b"three").unwrap();
+        fs::create_dir(&dest).unwrap();
+        let (at_tx, at_rx) = mpsc::sync_channel(1);
+        let (go_tx, go_rx) = mpsc::sync_channel(1);
+        let go_rx = Mutex::new(go_rx);
+        let hook: ProgressHook = Arc::new(move |event| {
+            if event.entry == 0 && event.phase == recovery::Phase::Committed {
+                at_tx.send(()).unwrap();
+                go_rx.lock().unwrap().recv().unwrap();
+            }
+        });
+        let client = Client::start_with_hook(path.clone(), Some(hook)).unwrap();
+        wait(&client, |s| s.ready);
+        client
+            .send(Command::SubmitMany {
+                sources: vec![first.clone(), second.clone()],
+                destination: dest.clone(),
+                conflict: Conflict::Error,
+                reparse: ReparsePolicy::Reject,
+                operation: OperationKind::Copy,
+                start: true,
+            })
+            .unwrap();
+        at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let active = client.snapshot().unwrap().active.unwrap();
+        assert_eq!(active.job.source_count, 2);
+        assert_eq!(active.entry_count, 2);
+        client.send(Command::Pause(active.id)).unwrap();
+        wait(&client, |s| {
+            s.active.as_ref().is_some_and(|a| a.request == "pause")
+        });
+        go_tx.send(()).unwrap();
+        let paused = wait(&client, |s| {
+            s.active.is_none() && s.history.first().is_some_and(|j| j.status == "paused")
+        });
+        assert_eq!(paused.history.len(), 1);
+        assert!(paused.queue.is_empty());
+        assert_eq!(paused.last_transfer.unwrap().telemetry.written, 3);
+        client.shutdown();
+        wait(&client, |s| s.closed);
+        drop(client);
+        fs::remove_file(&first).unwrap(); // A completed root must not be copied again during resume.
+        let client = Client::start(path).unwrap();
+        wait(&client, |s| s.ready);
+        client.send(Command::Resume(active.id)).unwrap();
+        let done = wait(&client, |s| {
+            s.active.is_none() && s.history.first().is_some_and(|j| j.status == "completed")
+        });
+        assert_eq!(done.history.len(), 1);
+        assert_eq!(done.last_transfer.as_ref().unwrap().telemetry.written, 5);
+        assert_eq!(done.last_report.unwrap().entries_committed, 2);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(fs::read(dest.join("first.txt")).unwrap(), b"one");
+        assert_eq!(fs::read(dest.join("second.txt")).unwrap(), b"three");
+        client.shutdown();
+        wait(&client, |s| s.closed);
+    }
     #[test]
     fn unavailable_diagnostics_are_reported_without_blocking_a_verified_copy() {
         let root = tempfile::tempdir().unwrap();
@@ -1514,7 +1593,7 @@ mod tests {
             })
             .unwrap();
         let done = wait(&client, |s| {
-            s.history.len() == 2
+            s.history.len() == 1
                 && s.history.iter().all(|j| j.status == "completed")
                 && s.active.is_none()
         });

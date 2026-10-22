@@ -173,7 +173,7 @@ impl App {
                                     job.id,
                                     job_status(&job)
                                 ));
-                                ui.label(job.source.display().to_string());
+                                source_line(ui, &job);
                                 ui.label(
                                     job.output_root
                                         .as_ref()
@@ -253,12 +253,8 @@ impl App {
                 .default_width(560.0)
                 .max_width((ctx.content_rect().width() - 32.0).max(240.0))
                 .show(&ctx, |ui| {
-                    if let Some((job, e)) = self.file_details.as_ref() {
-                        let source = if e.relative.as_os_str().is_empty() {
-                            job.source.clone()
-                        } else {
-                            job.source.join(&e.relative)
-                        };
+                    if let Some((_job, e)) = self.file_details.as_ref() {
+                        let source = e.source.clone();
                         ui.label(entry_status(e.state));
                         ui.label(source.display().to_string());
                         let copy = ui.button("Копіювати повний шлях");
@@ -304,7 +300,7 @@ impl App {
                                 ui.separator();
                             }
                             if let Some(n) = &self.state.notice {
-                                ui.label(n);
+                                if crate::error_text::technical_notice(n) {error_message(ui,"native_notice",n);} else {ui.label(n);}
                             }
                         });
                     if let Some(request) = self.state.windows_retry.clone() {
