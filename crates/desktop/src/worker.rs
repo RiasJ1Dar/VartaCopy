@@ -33,6 +33,7 @@ pub struct State {
     pub history: Vec<Job>,
     pub offset: usize,
     pub errors: VecDeque<String>,
+    pub current_error: Option<String>,
     pub last_report: Option<Arc<RunReport>>,
     pub details: Option<Arc<JobDetails>>,
     pub files: Option<Arc<EntryPage>>,
@@ -146,6 +147,7 @@ fn error(state: &Shared, message: impl ToString) {
             s.errors.pop_front();
         }
         s.errors.push_back(message.clone());
+        s.current_error = Some(message.clone());
     }) {
         eprintln!("VartaCopy: {message}; {failure}");
     }
@@ -316,6 +318,8 @@ fn scan_request(
     edit(state, |s| {
         s.planning = true;
         s.windows_retry = None;
+        s.current_error = None;
+        s.notice = None;
     })?;
     let tx = sender.clone();
     let cancel = scan_cancel.clone();
@@ -462,7 +466,11 @@ fn actor(
                         let diagnostic_path = path.clone();
                         let diagnostic = diagnostics::current();
                         cancel.store(false, Ordering::Release);
-                        edit(state, |s| s.windows_retry = None)?;
+                        edit(state, |s| {
+                            s.windows_retry = None;
+                            s.current_error = None;
+                            s.notice = None;
+                        })?;
                         let handle = thread::Builder::new()
                             .name("vartacopy-dispatch".into())
                             .spawn(move || {
@@ -635,6 +643,7 @@ fn actor(
                     Message::Command(Command::ClearErrors) => {
                         edit(state, |s| {
                             s.errors.clear();
+                            s.current_error = None;
                             s.notice = None;
                             s.windows_retry = None;
                         })?;
@@ -1110,12 +1119,40 @@ mod tests {
         assert!(failed.active.is_none());
         assert_eq!(fs::read(&source).unwrap(), b"untouched source");
         assert_eq!(fs::read(&destination).unwrap(), b"not a directory");
+        assert_eq!(failed.current_error.as_ref(), failed.errors.back());
+        let valid_destination = root.path().join("valid-destination");
+        fs::create_dir(&valid_destination).unwrap();
+        client
+            .send(Command::Dispatch {
+                request: TransferRequest {
+                    id: [52; 16],
+                    operation: TransferOperation::Copy,
+                    origin: TransferOrigin::Explorer,
+                    sources: vec![source.clone()],
+                    destination: valid_destination.clone(),
+                },
+                engine: vartacopy_core::journal::DispatchEngine::VartaCopy,
+                conflict: Conflict::Error,
+            })
+            .unwrap();
+        let completed = wait(&client, |s| {
+            !s.dispatching
+                && s.active.is_none()
+                && s.history.iter().any(|j| j.status == "completed")
+        });
+        assert!(completed.current_error.is_none());
+        assert_eq!(completed.errors, failed.errors); // Historical evidence remains available.
+        assert_eq!(
+            fs::read(valid_destination.join(source.file_name().unwrap())).unwrap(),
+            b"untouched source"
+        );
         client.shutdown();
         wait(&client, |s| s.closed);
         drop(client);
         let journal = Journal::open(&path).unwrap();
         assert!(journal.dispatch_receipt([51; 16]).unwrap().is_none());
-        assert!(journal.jobs(10, 0).unwrap().is_empty());
+        assert_eq!(journal.jobs(10, 0).unwrap().len(), 1);
+        assert!(journal.dispatch_receipt([52; 16]).unwrap().is_some());
         let report: serde_json::Value = serde_json::from_slice(
             &fs::read(path.with_file_name("jobs.sqlite.last-transfer-error.json")).unwrap(),
         )

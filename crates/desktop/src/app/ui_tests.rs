@@ -86,6 +86,7 @@ fn new_worker_error_opens_readable_messages_once_without_changing_selected_job()
     state.errors.push_back(
         "Копіювання не розпочато; запит не додано до черги. Причина: os error 87.".into(),
     );
+    state.current_error = state.errors.back().cloned();
     app.accept_snapshot(state.clone());
     assert!(app.messages_open);
     assert_eq!(app.selected, selected);
@@ -118,6 +119,7 @@ fn fat_failure_shows_reason_and_explicit_windows_choice_with_collapsed_evidence(
     let raw = "journal rejected: Копіювання не розпочато; запит не додано до черги. FAT32: FileIdInfo недоступний. Windows: The parameter is incorrect. (os error 87)";
     let mut state = app.state.clone();
     state.errors.push_back(raw.into());
+    state.current_error = Some(raw.into());
     state.windows_retry = Some(request);
     app.accept_snapshot(state);
     render(&mut app, [900.0, 700.0], None); // Resolve the new window's scroll geometry.
@@ -139,6 +141,48 @@ fn fat_failure_shows_reason_and_explicit_windows_choice_with_collapsed_evidence(
     app.begin_close();
     update(&mut app, |s| s.closed);
 }
+#[test]
+fn footer_uses_current_result_without_discarding_previous_error_evidence() {
+    let (_root, mut app) = fixture();
+    let previous = "journal rejected: FAT32: FileIdInfo недоступний. Windows: The parameter is incorrect. (os error 87)";
+    app.state.errors.push_back(previous.into());
+    app.state.current_error = Some(previous.into());
+    let nodes = render(&mut app, [900.0, 650.0], None);
+    assert!(
+        nodes
+            .iter()
+            .any(|(_, n)| n.label().is_some_and(|s| s.contains("FAT/exFAT")))
+    );
+
+    app.state.current_error = None;
+    app.state.notice = Some("Нову передачу додано до черги".into());
+    let nodes = render(&mut app, [900.0, 650.0], None);
+    assert!(
+        nodes
+            .iter()
+            .any(|(_, n)| n.label() == Some("Нову передачу додано до черги"))
+    );
+    assert!(
+        !nodes
+            .iter()
+            .any(|(_, n)| n.label().is_some_and(|s| s.contains("FAT/exFAT")))
+    );
+    assert_eq!(app.state.errors.back().map(String::as_str), Some(previous));
+
+    app.messages_open = true;
+    render(&mut app, [900.0, 700.0], None);
+    let nodes = render(&mut app, [900.0, 700.0], None);
+    assert!(
+        nodes
+            .iter()
+            .flat_map(|(_, n)| [n.label(), n.value()])
+            .flatten()
+            .any(|s| s.contains("FAT/exFAT"))
+    );
+    app.begin_close();
+    update(&mut app, |s| s.closed);
+}
+
 #[test]
 fn tray_exit_uses_durable_shutdown_and_hide_requires_an_available_icon() {
     let (_root, mut app) = fixture();
