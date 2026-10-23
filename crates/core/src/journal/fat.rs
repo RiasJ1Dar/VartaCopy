@@ -301,6 +301,20 @@ mod tests {
                         .unwrap(),
                     0
                 );
+                journal.db.pragma_update(None, "user_version", 6).unwrap();
+                drop(journal);
+                let journal = Journal::open(&path).unwrap();
+                assert_eq!(
+                    journal
+                        .db
+                        .pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))
+                        .unwrap(),
+                    VERSION
+                );
+                assert_eq!(
+                    serde_json::to_value(journal.job(id).unwrap()).unwrap(),
+                    before
+                );
             }
         }
     }

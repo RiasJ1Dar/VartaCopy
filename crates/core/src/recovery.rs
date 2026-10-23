@@ -726,7 +726,7 @@ pub fn run(
         issues: Vec::new(),
         issues_omitted: 0,
     };
-    let mut result = if job.parent_identity.kind == platform::IdentityKind::FatSource {
+    let mut result = if job.parent_identity.kind.is_path_scoped() {
         fat::copy_root(journal, &job, control, observer, &mut report)
     } else if entry.kind == EntryKind::File && job.entry_count == 1 {
         resume_file(journal, &job, entry, &job.destination, control, observer).map(

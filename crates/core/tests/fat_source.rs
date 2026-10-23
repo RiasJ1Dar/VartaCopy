@@ -24,6 +24,20 @@ fn path_scoped_source_identity_never_authorizes_staging_or_source_deletion() {
     assert!(platform::identity_exists_on_source_volume(&source, &legacy).is_err());
     assert!(platform::Stage::reopen(&source, &legacy).is_err());
     assert!(platform::Stage::reopen_directory(root.path(), &legacy).is_err());
+    for kind in [
+        platform::IdentityKind::ExFatSource,
+        platform::IdentityKind::PathSource,
+    ] {
+        let witness = platform::Identity {
+            kind,
+            ..legacy.clone()
+        };
+        assert!(platform::require_move_identity(&witness).is_err());
+        assert!(platform::CleanupOwner::open(&source, &witness, false, true).is_err());
+        assert!(platform::identity_exists_on_source_volume(&source, &witness).is_err());
+        assert!(platform::Stage::reopen(&source, &witness).is_err());
+        assert!(platform::Stage::reopen_directory(root.path(), &witness).is_err());
+    }
     assert_eq!(fs::read(&source).unwrap(), b"keep source");
     let old = serde_json::json!({"volume_serial":1,"file_id":vec![2;16]});
     let native: platform::Identity = serde_json::from_value(old.clone()).unwrap();
@@ -42,10 +56,26 @@ fn verified_fat_source_copy_tree_resume_and_move_preflight() {
     let selected = PathBuf::from(
         std::env::var_os("VARTACOPY_TEST_FAT_ROOT").expect("explicit FAT fixture root required"),
     );
+    source_fixture(selected, Some(platform::IdentityKind::FatSource));
+}
+
+#[test]
+#[ignore = "requires VARTACOPY_TEST_COMPATIBLE_ROOT pointing to an authorized exFAT/driver fixture"]
+fn verified_path_scoped_source_copy_tree_resume_and_move_preflight() {
+    source_fixture(
+        PathBuf::from(
+            std::env::var_os("VARTACOPY_TEST_COMPATIBLE_ROOT")
+                .expect("explicit compatible fixture required"),
+        ),
+        None,
+    );
+}
+
+fn source_fixture(selected: PathBuf, expected: Option<platform::IdentityKind>) {
     assert!(selected.is_absolute());
     let guard = platform::open_directory(&selected, false).unwrap();
     let volume = platform::volume_information(&guard).unwrap();
-    assert!(matches!(volume.filesystem.as_str(), "FAT" | "FAT32"));
+    assert!(volume.copy_capabilities().identity_kind().is_path_scoped());
     let source_fixture = tempfile::Builder::new()
         .prefix("vartacopy-owned-fat-probe-")
         .tempdir_in(&selected)
@@ -60,11 +90,11 @@ fn verified_fat_source_copy_tree_resume_and_move_preflight() {
     let source_file = source.join("дані-😀.bin");
     fs::write(&source_file, &payload).unwrap();
     let opened = platform::open_source(&source_file).unwrap();
-    assert_eq!(
-        platform::source_identity(&opened).unwrap().kind,
-        platform::IdentityKind::FatSource
-    );
-    assert!(platform::identity(&opened).is_err()); // No weakening of staging/publication identity.
+    let kind = platform::source_identity(&opened).unwrap().kind;
+    assert!(kind.is_path_scoped());
+    if let Some(expected) = expected {
+        assert_eq!(kind, expected);
+    }
     assert_eq!(
         platform::streams(&source_file).unwrap(),
         vec![platform::Stream {

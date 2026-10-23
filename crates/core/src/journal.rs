@@ -23,7 +23,7 @@ use std::time::Duration;
 use vartacopy_platform_windows as platform;
 
 const APPLICATION_ID: i32 = 0x56415254;
-const VERSION: i32 = 6;
+const VERSION: i32 = 7;
 pub fn default_path() -> Result<PathBuf> {
     let root = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| Error::Journal("LOCALAPPDATA is not configured".into()))?;
@@ -405,6 +405,10 @@ impl Journal {
                 fat::SCHEMA
             ))?;
         }
+        if version <= 6 {
+            // ExFatSource/PathSource witnesses must be rejected by older readers.
+            db.execute_batch("BEGIN IMMEDIATE; PRAGMA user_version=7; COMMIT;")?;
+        }
         let mode: String = db.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "foreign_keys", true)?;
@@ -596,9 +600,9 @@ impl Journal {
         let mut ids = Vec::with_capacity(plans.len());
         if operation == OperationKind::Move {
             for plan in plans {
-                if plan.destination_parent_identity.kind == platform::IdentityKind::FatSource {
+                if plan.destination_parent_identity.kind.is_path_scoped() {
                     return Err(io::Error::new(io::ErrorKind::Unsupported,
-                        "Переміщення на FAT/FAT32 нашим рушієм поки не підтримується; можна виконати копіювання. Джерела не видалялися.").into());
+                        "Переміщення на FAT/FAT32, exFAT або інший носій без постійних ID нашим рушієм поки не підтримується; можна виконати копіювання. Джерела не видалялися.").into());
                 }
                 for entry in &plan.entries {
                     if let Some(snapshot) = &entry.snapshot {

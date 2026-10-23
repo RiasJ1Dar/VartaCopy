@@ -16,15 +16,35 @@ fn native_fat_destination_file_tree_and_recovery() {
     let selected = PathBuf::from(
         std::env::var_os("VARTACOPY_TEST_FAT_ROOT").expect("explicit FAT fixture root required"),
     );
+    destination_fixture(selected, Some(platform::IdentityKind::FatSource));
+}
+
+#[test]
+#[ignore = "requires VARTACOPY_TEST_COMPATIBLE_ROOT pointing to an authorized exFAT/driver fixture"]
+fn native_path_scoped_destination_file_tree_and_recovery() {
+    destination_fixture(
+        PathBuf::from(
+            std::env::var_os("VARTACOPY_TEST_COMPATIBLE_ROOT")
+                .expect("explicit compatible fixture required"),
+        ),
+        None,
+    );
+}
+
+fn destination_fixture(selected: PathBuf, expected: Option<platform::IdentityKind>) {
     assert!(selected.is_absolute());
     let guard = platform::open_directory(&selected, false).unwrap();
-    assert!(matches!(
-        platform::volume_information(&guard)
-            .unwrap()
-            .filesystem
-            .as_str(),
-        "FAT" | "FAT32"
-    ));
+    let profile = platform::volume_information(&guard)
+        .unwrap()
+        .copy_capabilities();
+    assert!(
+        profile.identity_kind().is_path_scoped(),
+        "{}",
+        profile.filesystem
+    );
+    if let Some(expected) = expected {
+        assert_eq!(profile.identity_kind(), expected);
+    }
     let payload = vec![193u8; 4 * 1024 * 1024 + 17];
     for directory in [false, true] {
         for phase in [
@@ -104,7 +124,12 @@ fn native_fat_destination_file_tree_and_recovery() {
             };
             assert_eq!(fs::read(input).unwrap(), payload);
             assert_eq!(fs::read(&file).unwrap(), payload);
-            assert!(platform::identity(&platform::open_source(&file).unwrap()).is_err());
+            assert!(
+                platform::source_identity(&platform::open_source(&file).unwrap())
+                    .unwrap()
+                    .kind
+                    .is_path_scoped()
+            );
             assert_eq!(
                 journal.counts(id).unwrap(),
                 (if directory { 5 } else { 1 }, 0)

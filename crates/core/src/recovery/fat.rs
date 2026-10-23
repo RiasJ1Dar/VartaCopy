@@ -100,30 +100,52 @@ fn copy_file_inner(
 ) -> Result<()> {
     let source = source_path(job, entry);
     let _parents = platform::guard_parents(&source)?;
-    let mut input = crate::source_file(&source)?;
+    let input = crate::source_file(&source)?;
     let snapshot = required(entry.snapshot.as_ref(), "FAT source snapshot missing")?;
     snapshot.validate(&input, &source, false)?;
-    if snapshot.streams.len() != 1
-        || !snapshot.streams[0].name.is_empty()
-        || snapshot.streams[0].size > u32::MAX as u64
+    let capabilities = platform::volume_information(stage.file())?.copy_capabilities();
+    capabilities.validate_streams(&snapshot.streams)?;
+    if snapshot
+        .streams
+        .iter()
+        .filter(|s| s.name.is_empty())
+        .count()
+        != 1
     {
         return Err(Error::Journal(
-            "FAT copy requires one unnamed stream of at most 4 GiB - 1 byte".into(),
+            "copy requires exactly one unnamed stream".into(),
         ));
     }
-    transfer_stream(
-        journal,
-        StreamTask {
-            job: job.id,
-            ordinal: entry.ordinal,
-            stream_index: 0,
-            size: snapshot.streams[0].size,
-        },
-        &mut input,
-        stage.file(),
-        control,
-        observer,
-    )?;
+    let mut inputs = Vec::with_capacity(snapshot.streams.len());
+    for stream in &snapshot.streams {
+        inputs.push(if stream.name.is_empty() {
+            input.try_clone()?
+        } else {
+            platform::open_source(&platform::stream_path(&source, &stream.name))?
+        });
+    }
+    for (index, stream) in snapshot.streams.iter().enumerate() {
+        let mut named;
+        let output = if stream.name.is_empty() {
+            stage.file()
+        } else {
+            named = stage.create_stream(&stream.name)?;
+            &mut named
+        };
+        transfer_stream(
+            journal,
+            StreamTask {
+                job: job.id,
+                ordinal: entry.ordinal,
+                stream_index: index,
+                size: stream.size,
+            },
+            &mut inputs[index],
+            output,
+            control,
+            observer,
+        )?;
+    }
     snapshot.validate(&input, &source, false)?;
     platform::copy_basic_metadata(&input, stage.file())?;
     journal.transition(
@@ -349,25 +371,36 @@ pub(super) fn copy_root(
         if previous.is_some() && entry.kind == EntryKind::File {
             // A restart writes a fresh root, but must still reject changes to
             // bytes already witnessed by the interrupted copy's checkpoints.
-            let mut input = guard;
             let mut buffer = vec![0; CHUNK_BYTES];
-            for chunk in journal.chunks(job.id, entry.ordinal, 0)? {
-                control.checkpoint()?;
-                input.seek(SeekFrom::Start(chunk.offset))?;
-                input.read_exact(&mut buffer[..chunk.length])?;
-                if blake3::hash(&buffer[..chunk.length]).as_bytes() != &chunk.hash {
-                    return Err(Error::Verification(
-                        "source changed after interrupted FAT copy".into(),
-                    ));
+            for (index, stream) in required(entry.snapshot.as_ref(), "source snapshot missing")?
+                .streams
+                .iter()
+                .enumerate()
+            {
+                let mut input = if stream.name.is_empty() {
+                    guard.try_clone()?
+                } else {
+                    platform::open_source(&platform::stream_path(&source, &stream.name))?
+                };
+                for chunk in journal.chunks(job.id, entry.ordinal, index)? {
+                    control.checkpoint()?;
+                    input.seek(SeekFrom::Start(chunk.offset))?;
+                    input.read_exact(&mut buffer[..chunk.length])?;
+                    if blake3::hash(&buffer[..chunk.length]).as_bytes() != &chunk.hash {
+                        return Err(Error::Verification(
+                            "source changed after interrupted FAT copy".into(),
+                        ));
+                    }
+                    observer(Progress {
+                        job_id: job.id,
+                        entry: entry.ordinal,
+                        phase: Phase::Checking,
+                        bytes: chunk.offset + chunk.length as u64,
+                        total: stream.size,
+                        fresh_written_delta: 0,
+                        stream_index: Some(index),
+                    })?;
                 }
-                notify(
-                    observer,
-                    job.id,
-                    entry.ordinal,
-                    Phase::Checking,
-                    chunk.offset + chunk.length as u64,
-                    0,
-                )?;
             }
         }
     }
@@ -378,7 +411,7 @@ pub(super) fn copy_root(
         );
         if report.issues.len() < 256 {
             report.issues.push(crate::tree::EntryProblem{path:attempt.stage.as_path().into(),status:"retained_partial",
-                message:"Незавершене джерело на FAT32 копіюється заново. Попередні тимчасові дані збережено без змін; вони не використовуються для запису або видалення.".into()});
+                message:"Незавершене джерело на цьому носії копіюється заново. Попередні тимчасові дані збережено без змін; вони не використовуються для запису або видалення.".into()});
         }
     }
     let mut root = if directory {
@@ -608,6 +641,77 @@ mod tests {
         assert!(execute(&mut journal, id, &mut |_| Ok(())).is_err());
         assert_eq!(fs::read(&output).unwrap(), b"changed destination");
         assert_eq!(fs::read(&stage).unwrap(), b"foreign replacement must stay");
+    }
+
+    #[test]
+    fn conservative_driver_copy_preserves_named_streams_and_rehashes_them_before_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        let destination = root.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, b"main data").unwrap();
+        let ads = platform::stream_path(&source, std::ffi::OsStr::new(":note:$DATA"));
+        let data = vec![37; CHUNK_BYTES + 17];
+        fs::write(&ads, &data).unwrap();
+        let modified = fs::metadata(&source).unwrap().modified().unwrap();
+        let plan = planner::scan(
+            &source,
+            &destination,
+            ScanOptions::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let mut journal = Journal::open(&root.path().join("jobs.sqlite")).unwrap();
+        let id = journal.enqueue(&plan, Conflict::Error).unwrap();
+        let mut stopped = false;
+        assert!(
+            execute(&mut journal, id, &mut |event| {
+                if event.phase == Phase::CheckpointCommitted && event.stream_index == Some(1) {
+                    stopped = true;
+                    return Err(Error::Cancelled);
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(stopped);
+        let old = journal.fat_attempt(id).unwrap().unwrap().stage;
+        let mut changed = data.clone();
+        changed[0] ^= 1;
+        fs::write(&ads, &changed).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(
+            execute(&mut journal, id, &mut |_| Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
+        fs::write(&ads, &data).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let done = execute(&mut journal, id, &mut |_| Ok(())).unwrap();
+        assert_eq!(done.verified_bytes, 9 + data.len() as u64);
+        let output = destination.join("source.bin");
+        assert_eq!(fs::read(&output).unwrap(), b"main data");
+        assert_eq!(
+            fs::read(platform::stream_path(
+                &output,
+                std::ffi::OsStr::new(":note:$DATA")
+            ))
+            .unwrap(),
+            data
+        );
+        assert!(old.exists());
+        execute(&mut journal, id, &mut |_| Ok(())).unwrap();
     }
 
     #[test]

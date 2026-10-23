@@ -150,6 +150,7 @@ pub struct OperationPlan {
     pub(crate) entries: Vec<PlannedEntry>,
     #[serde(skip)]
     pub(crate) destination_parent_identity: platform::Identity,
+    pub(crate) destination_capabilities: platform::CopyCapabilities,
 }
 impl OperationPlan {
     pub fn entries(&self) -> &[PlannedEntry] {
@@ -501,6 +502,17 @@ pub fn scan(
             &destination_dir,
             platform::source_identity(&destination_guard),
         )?,
+        destination_capabilities: match platform::volume_information(&destination_guard) {
+            Ok(volume) => volume.copy_capabilities(),
+            Err(error) => {
+                diagnostics::failure(
+                    "scan.destination_capabilities_unavailable",
+                    &error,
+                    serde_json::json!({"path":diagnostics::path(&destination_dir),"policy":"driver_decides; no features assumed"}),
+                );
+                platform::CopyCapabilities::unknown()
+            }
+        },
     };
     let mut stack = Vec::new();
     let mut identities = HashMap::new();
@@ -583,20 +595,48 @@ pub fn scan(
 }
 
 pub(crate) fn validate_fat_destination(plan: &OperationPlan) -> Result<()> {
-    if plan.destination_parent_identity.kind != platform::IdentityKind::FatSource {
-        return Ok(());
+    let capabilities = &plan.destination_capabilities;
+    if capabilities.read_only == Some(true) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "Носій {} доступний лише для читання. Оберіть інше призначення.",
+                capabilities.filesystem
+            ),
+        )
+        .into());
     }
     for entry in &plan.entries {
         if let Some(snapshot) = &entry.snapshot {
-            if snapshot.streams.iter().any(|s| !s.name.is_empty()) {
-                return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
-                    "FAT32 не підтримує додаткові потоки NTFS (ADS): {}. Копіювання не розпочато, щоб не втратити ці дані.",
-                    plan.source_path(entry).display())).into());
-            }
-            if snapshot.streams.iter().any(|s| s.size > u32::MAX as u64) {
-                return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
-                    "FAT32 не підтримує файл понад 4 ГіБ − 1 байт: {}. Виберіть NTFS або exFAT.",
-                    plan.source_path(entry).display())).into());
+            capabilities
+                .validate_streams(&snapshot.streams)
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("{error} Файл: {}", plan.source_path(entry).display()),
+                    )
+                })?;
+        }
+        if let Some(limit) = capabilities.maximum_component_length {
+            use std::os::windows::ffi::OsStrExt;
+            let target = if entry.relative.as_os_str().is_empty() {
+                plan.destination.clone()
+            } else {
+                plan.destination.join(&entry.relative)
+            };
+            if target
+                .file_name()
+                .is_some_and(|name| name.encode_wide().count() > limit as usize)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Назва файла задовга для {} (ліміт {limit}): {}. Оберіть коротшу назву.",
+                        capabilities.filesystem,
+                        target.display()
+                    ),
+                )
+                .into());
             }
         }
     }
@@ -621,6 +661,13 @@ mod fat_policy_tests {
         )
         .unwrap();
         plan.destination_parent_identity.kind = platform::IdentityKind::FatSource;
+        plan.destination_capabilities = platform::VolumeInformation {
+            filesystem: "FAT32".into(),
+            flags: 0,
+            serial: 1,
+            maximum_component_length: 255,
+        }
+        .copy_capabilities();
         plan.entries[0].snapshot.as_mut().unwrap().streams[0].size = u32::MAX as u64;
         validate_fat_destination(&plan).unwrap();
         plan.entries[0].snapshot.as_mut().unwrap().streams[0].size += 1;
@@ -651,5 +698,60 @@ mod fat_policy_tests {
         assert!(journal.enqueue(&plan, crate::Conflict::Error).is_err());
         assert!(journal.jobs(10, 0).unwrap().is_empty());
         assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn exfat_and_other_driver_preflight_use_advertised_capabilities() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("sample.bin");
+        fs::write(&source, b"fixture").unwrap();
+        let destination = root.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        let mut plan = scan(
+            &source,
+            &destination,
+            ScanOptions::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        plan.entries[0].snapshot.as_mut().unwrap().streams[0].size = u32::MAX as u64 + 1;
+        for name in ["exFAT", "ReFS", "UDF", "third-party"] {
+            plan.destination_capabilities = platform::VolumeInformation {
+                filesystem: name.into(),
+                flags: 0,
+                serial: 1,
+                maximum_component_length: 255,
+            }
+            .copy_capabilities();
+            validate_fat_destination(&plan).unwrap();
+        }
+        plan.destination_capabilities.read_only = Some(true);
+        assert!(
+            validate_fat_destination(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("лише для читання")
+        );
+        plan.destination_capabilities.read_only = Some(false);
+        plan.destination_capabilities.maximum_component_length = Some(3);
+        assert!(
+            validate_fat_destination(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("задовга")
+        );
+        plan.destination_capabilities.maximum_component_length = Some(255);
+        plan.entries[0]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .streams
+            .push(platform::Stream {
+                name: ":note:$DATA".into(),
+                size: 3,
+            });
+        assert!(validate_fat_destination(&plan).is_err());
+        plan.destination_capabilities.named_streams = Some(true);
+        validate_fat_destination(&plan).unwrap();
     }
 }

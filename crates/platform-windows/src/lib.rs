@@ -93,6 +93,8 @@ use std::os::windows::{
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+mod filesystem;
+pub use filesystem::CopyCapabilities;
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::SystemServices::FILE_NAMED_STREAMS;
@@ -113,8 +115,15 @@ pub enum IdentityKind {
     /// FAT IDs are read-only witnesses at a recorded, pinned path. Never use
     /// these as staging/publication ownership or as authorization for deletion.
     FatSource,
+    /// exFAT witness, with no FAT32 size limit and no persistent ownership.
+    ExFatSource,
+    /// Other drivers: read-only path witness, never ownership/deletion authority.
+    PathSource,
 }
 impl IdentityKind {
+    pub fn is_path_scoped(self) -> bool {
+        self != Self::Native128
+    }
     fn is_native(&self) -> bool {
         *self == Self::Native128
     }
@@ -526,43 +535,52 @@ pub fn identity(file: &File) -> io::Result<Identity> {
 }
 
 /// Read-only identity for source snapshots and output/parent witnesses.
-/// FAT path-scoped IDs must not authorize publication,
+/// Path-scoped IDs must not authorize publication,
 /// adoption, OpenFileById lookup, or Move cleanup. A moved/changed source fails
 /// snapshot validation; recorded data is independently rehashed during resume.
 pub fn source_identity(file: &File) -> io::Result<Identity> {
-    match identity(file) {
-        Ok(identity) => Ok(identity),
-        Err(error) if unsupported_identity_filesystem(&error).is_some_and(fat_without_ads) => {
-            // SAFETY: integer-only output and a live metadata/data handle.
-            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-            // SAFETY: valid handle and exactly sized writable output structure.
-            if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-            let mut file_id = [0; 16];
-            file_id[..8].copy_from_slice(&index.to_le_bytes());
-            let created = (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
-                | u64::from(info.ftCreationTime.dwLowDateTime);
-            file_id[8..].copy_from_slice(&created.to_le_bytes());
-            Ok(Identity {
-                volume_serial: u64::from(info.dwVolumeSerialNumber),
-                file_id,
-                kind: IdentityKind::FatSource,
-            })
-        }
-        Err(error) => Err(error),
+    let native = identity(file);
+    if let Err(error) = &native
+        && !matches!(error.raw_os_error(), Some(1 | 50 | 87))
+        && unsupported_identity_filesystem(error).is_none()
+    {
+        return native; // Access denied and unrelated failures are never downgraded.
     }
-}
-
-fn fat_without_ads(filesystem: &str) -> bool {
-    filesystem.eq_ignore_ascii_case("FAT") || filesystem.eq_ignore_ascii_case("FAT32")
+    let volume = match volume_information(file) {
+        Ok(volume) => volume,
+        Err(error) => {
+            // Some remote drivers cannot report volume capabilities. Preserve
+            // the original strict identity result, with an explicit diagnostic.
+            eprintln!("VartaCopy: volume profile unavailable for read-only identity: {error}");
+            return native;
+        }
+    };
+    let kind = volume.copy_capabilities().identity_kind();
+    if !kind.is_path_scoped() {
+        return native;
+    }
+    // SAFETY: integer-only output and a live metadata/data handle.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid handle and exactly sized writable output structure.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    let mut file_id = [0; 16];
+    file_id[..8].copy_from_slice(&index.to_le_bytes());
+    let created = (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
+        | u64::from(info.ftCreationTime.dwLowDateTime);
+    file_id[8..].copy_from_slice(&created.to_le_bytes());
+    Ok(Identity {
+        volume_serial: u64::from(info.dwVolumeSerialNumber),
+        file_id,
+        kind,
+    })
 }
 
 /// Preflight rejects FAT Move before accepting any job or modifying any file.
 pub fn require_move_identity(identity: &Identity) -> io::Result<()> {
-    if identity.kind == IdentityKind::FatSource {
+    if identity.kind.is_path_scoped() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             UnsupportedFatMove,
@@ -575,7 +593,7 @@ pub fn require_move_identity(identity: &Identity) -> io::Result<()> {
 struct UnsupportedFatMove;
 impl std::fmt::Display for UnsupportedFatMove {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Переміщення з FAT/FAT32 через VartaCopy поки не підтримується: захищене видалення джерела потребує NTFS. Оберіть копіювання або Explorer. Джерела не видалялися.")
+        f.write_str("Переміщення з FAT/FAT32, exFAT або іншого носія без постійних ID через VartaCopy поки не підтримується: захищене видалення джерела потребує NTFS. Оберіть копіювання або Explorer. Джерела не видалялися.")
     }
 }
 impl std::error::Error for UnsupportedFatMove {}
@@ -821,8 +839,8 @@ pub fn streams(path: &Path) -> io::Result<Vec<Stream>> {
             return Ok(Vec::new());
         }
         if matches!(error.raw_os_error(), Some(1 | 50 | 87)) {
-            // FAT does not implement stream enumeration. Pin the actual base
-            // object, confirm its filesystem has no ADS, and expose its unnamed
+            // Some drivers do not implement stream enumeration. Pin the base
+            // object, confirm the volume advertises no ADS, and expose unnamed
             // data only. Never infer this from error 87 or a drive letter alone.
             let file = OpenOptions::new()
                 .access_mode(FILE_READ_ATTRIBUTES)
@@ -831,10 +849,7 @@ pub fn streams(path: &Path) -> io::Result<Vec<Stream>> {
                 .open(path)?;
             let metadata = file.metadata()?;
             let volume = volume_information(&file)?;
-            if !is_reparse(&metadata)
-                && fat_without_ads(&volume.filesystem)
-                && volume.flags & FILE_NAMED_STREAMS == 0
-            {
+            if !is_reparse(&metadata) && volume.flags & FILE_NAMED_STREAMS == 0 {
                 return if metadata.is_file() {
                     Ok(vec![Stream {
                         name: OsString::new(),

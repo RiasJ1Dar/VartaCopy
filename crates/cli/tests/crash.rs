@@ -181,6 +181,22 @@ fn native_fat_copy_terminate_process_then_resume() {
     let selected = std::path::PathBuf::from(
         std::env::var_os("VARTACOPY_TEST_FAT_ROOT").expect("explicit FAT fixture root required"),
     );
+    path_scoped_crash_fixture(selected, Some("fat_source"));
+}
+
+#[test]
+#[ignore = "requires VARTACOPY_TEST_COMPATIBLE_ROOT pointing to an authorized exFAT/driver fixture"]
+fn native_path_scoped_copy_terminate_process_then_resume() {
+    path_scoped_crash_fixture(
+        std::path::PathBuf::from(
+            std::env::var_os("VARTACOPY_TEST_COMPATIBLE_ROOT")
+                .expect("explicit compatible fixture required"),
+        ),
+        None,
+    );
+}
+
+fn path_scoped_crash_fixture(selected: std::path::PathBuf, expected: Option<&str>) {
     assert!(selected.is_absolute());
     for directory in [false, true] {
         for phase in [
@@ -229,10 +245,18 @@ fn native_fat_copy_terminate_process_then_resume() {
                 let journal = Journal::open(&path).unwrap();
                 let identity =
                     serde_json::to_value(journal.job(id).unwrap().parent_identity).unwrap();
-                assert_eq!(
-                    identity["kind"], "fat_source",
-                    "the test requires a real FAT/FAT32 destination"
+                assert!(
+                    journal
+                        .job(id)
+                        .unwrap()
+                        .parent_identity
+                        .kind
+                        .is_path_scoped(),
+                    "hardware test must exercise the conservative destination backend"
                 );
+                if let Some(expected) = expected {
+                    assert_eq!(identity["kind"], expected);
+                }
             }
             kill_at(&path, id, phase);
             let mut journal = Journal::open(&path).unwrap();
@@ -261,7 +285,7 @@ fn native_fat_copy_terminate_process_then_resume() {
                 assert_eq!(fs::read(copied).unwrap(), data);
             }
             println!(
-                "FAT32 hard process termination: directory={directory}, phase={phase}: recovered and rechecked"
+                "Path-scoped hard process termination: directory={directory}, phase={phase}: recovered and rechecked"
             );
         }
     }
