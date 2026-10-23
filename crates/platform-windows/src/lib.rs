@@ -110,7 +110,7 @@ pub struct Identity {
 pub enum IdentityKind {
     #[default]
     Native128,
-    /// FAT IDs are valid only at the recorded, pinned source path. Never use
+    /// FAT IDs are read-only witnesses at a recorded, pinned path. Never use
     /// these as staging/publication ownership or as authorization for deletion.
     FatSource,
 }
@@ -525,7 +525,8 @@ pub fn identity(file: &File) -> io::Result<Identity> {
     })
 }
 
-/// Read-only source identity. FAT path-scoped IDs must not authorize publication,
+/// Read-only identity for source snapshots and output/parent witnesses.
+/// FAT path-scoped IDs must not authorize publication,
 /// adoption, OpenFileById lookup, or Move cleanup. A moved/changed source fails
 /// snapshot validation; recorded data is independently rehashed during resume.
 pub fn source_identity(file: &File) -> io::Result<Identity> {

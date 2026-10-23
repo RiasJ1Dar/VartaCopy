@@ -41,7 +41,56 @@ fn private_parents(root: &Path, path: &Path) -> Result<Vec<File>> {
     Ok(guards)
 }
 
+fn at_entry<T>(
+    journal: &mut Journal,
+    job: &Job,
+    entry: &Entry,
+    path: &Path,
+    phase: &str,
+    action: impl FnOnce(&mut Journal) -> Result<T>,
+) -> Result<T> {
+    let result = action(journal);
+    if let Err(error) = &result {
+        if matches!(error, Error::Cancelled) {
+            return result;
+        }
+        diagnostics::failure(
+            "fat.entry_failed",
+            error,
+            serde_json::json!({"job_id":job.id,"entry":entry.ordinal,"phase":phase,
+                "source":diagnostics::path(&source_path(job,entry)),"path":diagnostics::path(path)}),
+        );
+        let message = format!("{phase}: {}: {error}", path.display());
+        if let Err(storage) = journal.entry_error(job.id, entry.ordinal, &message) {
+            diagnostics::failure(
+                "fat.entry_error_persist_failed",
+                &storage,
+                serde_json::json!({"job_id":job.id,"entry":entry.ordinal,"original_error":message}),
+            );
+            return Err(Error::Journal(format!(
+                "{message}; could not persist entry error: {storage}"
+            )));
+        }
+    }
+    // Preserve the original typed error and its native Windows error chain.
+    result
+}
+
 fn copy_file(
+    journal: &mut Journal,
+    job: &Job,
+    entry: &Entry,
+    stage: &mut platform::Stage,
+    control: &Control,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    let path = stage.path().to_path_buf();
+    at_entry(journal, job, entry, &path, "copy", |journal| {
+        copy_file_inner(journal, job, entry, stage, control, observer)
+    })
+}
+
+fn copy_file_inner(
     journal: &mut Journal,
     job: &Job,
     entry: &Entry,
@@ -89,7 +138,7 @@ fn copy_file(
 /// A read-only proof of contents, never authority to reopen a stage for writes
 /// or remove a source. The stable NTFS ownership guards remain untouched.
 fn verify_output(
-    journal: &Journal,
+    journal: &mut Journal,
     job: &Job,
     target: &Path,
     control: &Control,
@@ -114,9 +163,9 @@ fn verify_output(
     let mut witnesses = Vec::with_capacity(expected.len());
     let mut bytes = 0;
     if root.kind == EntryKind::File {
-        let guard = crate::source_file(target)?;
-        bytes = verify_recorded(journal, job.id, root, target, None, control, observer)?;
-        witnesses.push((root.ordinal, platform::source_identity(&guard)?));
+        let (verified, identity) = verify_file(journal, job, root, target, control, observer)?;
+        bytes = verified;
+        witnesses.push((root.ordinal, identity));
         return Ok((bytes, witnesses));
     }
     let guard = platform::open_directory(target, false)?;
@@ -159,9 +208,10 @@ fn verify_output(
                 stack.push((relative, fs::read_dir(&path)?, guard));
             }
             EntryKind::File => {
-                let guard = crate::source_file(&path)?;
-                bytes += verify_recorded(journal, job.id, entry, &path, None, control, observer)?;
-                witnesses.push((entry.ordinal, platform::source_identity(&guard)?));
+                let (verified, identity) =
+                    verify_file(journal, job, entry, &path, control, observer)?;
+                bytes += verified;
+                witnesses.push((entry.ordinal, identity));
             }
             _ => {
                 return Err(Error::Verification(
@@ -174,6 +224,21 @@ fn verify_output(
         return Err(Error::Verification("FAT output is incomplete".into()));
     }
     Ok((bytes, witnesses))
+}
+
+fn verify_file(
+    journal: &mut Journal,
+    job: &Job,
+    entry: &Entry,
+    path: &Path,
+    control: &Control,
+    observer: &mut Observer<'_>,
+) -> Result<(u64, platform::Identity)> {
+    at_entry(journal, job, entry, path, "verify_output", |journal| {
+        let guard = crate::source_file(path)?;
+        let bytes = verify_recorded(journal, job.id, entry, path, None, control, observer)?;
+        Ok((bytes, platform::source_identity(&guard)?))
+    })
 }
 
 fn finish(
@@ -565,6 +630,50 @@ mod tests {
         fs::write(&foreign, b"keep unrelated data").unwrap();
         assert!(execute(&mut journal, id, &mut |_| Ok(())).is_err());
         assert_eq!(fs::read(&foreign).unwrap(), b"keep unrelated data");
+    }
+
+    #[test]
+    fn corrupt_tree_file_records_exact_entry_path_and_preserves_verification_error() {
+        let (root, source, destination, path, id) = fixture(true);
+        let mut journal = Journal::open(&path).unwrap();
+        execute(&mut journal, id, &mut |_| Ok(())).unwrap();
+        let output = destination
+            .join(source.file_name().unwrap())
+            .join("дані.bin");
+        fs::write(&output, b"corrupt published child").unwrap();
+        let error = execute(&mut journal, id, &mut |_| Ok(())).unwrap_err();
+        assert!(matches!(error, Error::Verification(_)), "{error}");
+        let entry = journal
+            .entry_page(id, 128, 0)
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|e| e.relative == Path::new("дані.bin"))
+            .unwrap();
+        let saved = entry.error.unwrap();
+        assert!(saved.contains("verify_output"));
+        // The persisted path may expand Windows 8.3 aliases in TempDir's path.
+        let recorded_output = journal
+            .fat_attempt(id)
+            .unwrap()
+            .unwrap()
+            .target
+            .join("дані.bin");
+        assert!(
+            saved.contains(&recorded_output.display().to_string()),
+            "{saved}"
+        );
+        let export = root.path().join("failure-report.json");
+        journal.export_report(id, &export).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(export).unwrap()).unwrap();
+        assert!(
+            report["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["message"].as_str() == Some(saved.as_str()))
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"corrupt published child");
     }
 
     #[test]
