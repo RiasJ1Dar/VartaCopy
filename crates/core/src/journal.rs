@@ -1,6 +1,8 @@
 //! Local SQLite journal. Filesystem mutations and SQL commits are reconciled, never treated as one transaction.
 mod dispatch;
+mod fat;
 mod operations;
+pub(crate) use fat::FatAttempt;
 #[cfg(test)]
 mod tests;
 use crate::{
@@ -21,7 +23,7 @@ use std::time::Duration;
 use vartacopy_platform_windows as platform;
 
 const APPLICATION_ID: i32 = 0x56415254;
-const VERSION: i32 = 5;
+const VERSION: i32 = 6;
 pub fn default_path() -> Result<PathBuf> {
     let root = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| Error::Journal("LOCALAPPDATA is not configured".into()))?;
@@ -335,6 +337,7 @@ impl Journal {
             memory.execute_batch(SCHEMA)?;
             memory.execute_batch(dispatch::SCHEMA)?;
             memory.execute_batch(operations::SCHEMA)?;
+            memory.execute_batch(fat::SCHEMA)?;
             memory.pragma_update(None, "application_id", APPLICATION_ID)?;
             memory.pragma_update(None, "user_version", VERSION)?;
             let image = memory.serialize("main")?;
@@ -395,6 +398,12 @@ impl Journal {
             ))?;
             operations::split_legacy_destinations(&db)?;
             db.execute_batch("PRAGMA user_version=5; COMMIT;")?;
+        }
+        if version <= 5 {
+            db.execute_batch(&format!(
+                "BEGIN IMMEDIATE; {} PRAGMA user_version=6; COMMIT;",
+                fat::SCHEMA
+            ))?;
         }
         let mode: String = db.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         db.pragma_update(None, "synchronous", "FULL")?;
@@ -578,12 +587,19 @@ impl Journal {
         if plans.is_empty() || plans.len() > 512 || plans.iter().any(|p| !p.is_ready()) {
             return Err(Error::Journal("batch requires 1..512 ready plans".into()));
         }
+        for plan in plans {
+            crate::planner::validate_fat_destination(plan)?;
+        }
         let grouped = plans
             .iter()
             .all(|p| p.destination.parent() == plans[0].destination.parent());
         let mut ids = Vec::with_capacity(plans.len());
         if operation == OperationKind::Move {
             for plan in plans {
+                if plan.destination_parent_identity.kind == platform::IdentityKind::FatSource {
+                    return Err(io::Error::new(io::ErrorKind::Unsupported,
+                        "Переміщення на FAT/FAT32 нашим рушієм поки не підтримується; можна виконати копіювання. Джерела не видалялися.").into());
+                }
                 for entry in &plan.entries {
                     if let Some(snapshot) = &entry.snapshot {
                         platform::require_move_identity(&snapshot.identity)?;
@@ -886,6 +902,8 @@ impl Journal {
             }
             offset += 256;
         }
+        stage.file().write_all(b"],\"fat_attempts\":[")?;
+        self.write_fat_attempts(id, stage.file(), &mut true)?;
         stage.file().write_all(b"]}\n")?;
         stage.file().sync_all()?;
         tx.commit()?;

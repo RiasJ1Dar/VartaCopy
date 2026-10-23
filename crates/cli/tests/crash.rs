@@ -1,6 +1,7 @@
 #![cfg(feature = "test-harness")]
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{atomic::AtomicBool, mpsc};
 use std::time::Duration;
@@ -174,8 +175,101 @@ fn kill_at(path: &std::path::Path, id: i64, phase: &str) {
     kill_at_operation(path, id, phase, OperationKind::Copy);
 }
 
+#[test]
+#[ignore = "requires VARTACOPY_TEST_FAT_ROOT pointing to an authorized FAT32 fixture directory"]
+fn native_fat_copy_terminate_process_then_resume() {
+    let selected = std::path::PathBuf::from(
+        std::env::var_os("VARTACOPY_TEST_FAT_ROOT").expect("explicit FAT fixture root required"),
+    );
+    assert!(selected.is_absolute());
+    for directory in [false, true] {
+        for phase in [
+            "stage_recorded",
+            "block_written",
+            "block_flushed",
+            "checkpoint_committed",
+            "verified",
+            "publish_intent",
+            "published",
+            "committed",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let destination = tempfile::Builder::new()
+                .prefix("vartacopy-owned-fat-crash-")
+                .tempdir_in(&selected)
+                .unwrap();
+            let source = root.path().join(if directory {
+                "дерево-😀"
+            } else {
+                "дані-😀.bin"
+            });
+            let data = vec![53; CHUNK_BYTES + 701];
+            if directory {
+                fs::create_dir_all(source.join("nested/empty")).unwrap();
+                fs::write(source.join("nested/data.bin"), &data).unwrap();
+                fs::write(source.join("zero.txt"), []).unwrap();
+            } else {
+                fs::write(&source, &data).unwrap();
+            }
+            let path = root.path().join("jobs.sqlite");
+            let id = {
+                let plan = scan(
+                    &source,
+                    destination.path(),
+                    ScanOptions::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                Journal::open(&path)
+                    .unwrap()
+                    .enqueue(&plan, Conflict::Error)
+                    .unwrap()
+            };
+            {
+                let journal = Journal::open(&path).unwrap();
+                let identity =
+                    serde_json::to_value(journal.job(id).unwrap().parent_identity).unwrap();
+                assert_eq!(
+                    identity["kind"], "fat_source",
+                    "the test requires a real FAT/FAT32 destination"
+                );
+            }
+            kill_at(&path, id, phase);
+            let mut journal = Journal::open(&path).unwrap();
+            journal.recover_running_jobs().unwrap();
+            for _ in 0..2 {
+                let result =
+                    recovery::run(&mut journal, id, &Control::default(), &mut |_| Ok(())).unwrap();
+                assert_eq!(
+                    result.status, "completed",
+                    "{directory}/{phase}: {result:?}"
+                );
+                assert_eq!(
+                    result.resumed_bytes, 0,
+                    "FAT never adopts old stages for writes"
+                );
+                let output = destination.path().join(source.file_name().unwrap());
+                let (original, copied) = if directory {
+                    (
+                        source.join("nested/data.bin"),
+                        output.join("nested/data.bin"),
+                    )
+                } else {
+                    (source.clone(), output)
+                };
+                assert_eq!(fs::read(original).unwrap(), data);
+                assert_eq!(fs::read(copied).unwrap(), data);
+            }
+            println!(
+                "FAT32 hard process termination: directory={directory}, phase={phase}: recovered and rechecked"
+            );
+        }
+    }
+}
+
 fn kill_at_operation(path: &std::path::Path, id: i64, phase: &str, operation: OperationKind) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_vartacopy-fault"))
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW: hardware tests never take over the desktop.
         .arg(path)
         .arg(id.to_string())
         .arg(phase)

@@ -1,4 +1,5 @@
 //! Resumable verified file transfers. Every reused byte is rehashed in source and stage.
+mod fat;
 mod move_cleanup;
 mod operation;
 pub use operation::run_operation;
@@ -705,7 +706,7 @@ pub fn run(
     if diagnostics::io(
         "GetFileInformationByHandleEx(FileIdInfo):recovery_destination",
         parent,
-        platform::identity(&parent_guard),
+        platform::source_identity(&parent_guard),
     )? != job.parent_identity
     {
         return Err(Error::Verification("destination parent replaced".into()));
@@ -725,7 +726,9 @@ pub fn run(
         issues: Vec::new(),
         issues_omitted: 0,
     };
-    let mut result = if entry.kind == EntryKind::File && job.entry_count == 1 {
+    let mut result = if job.parent_identity.kind == platform::IdentityKind::FatSource {
+        fat::copy_root(journal, &job, control, observer, &mut report)
+    } else if entry.kind == EntryKind::File && job.entry_count == 1 {
         resume_file(journal, &job, entry, &job.destination, control, observer).map(
             |(_, resumed, bytes)| {
                 report.resumed_bytes = resumed;

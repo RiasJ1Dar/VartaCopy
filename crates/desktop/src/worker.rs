@@ -1224,6 +1224,39 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
     }
+    #[track_caller]
+    fn wait_for_transfer(client: &Client, condition: impl Fn(&State) -> bool) -> State {
+        let hard_deadline = Instant::now() + Duration::from_secs(120);
+        let mut idle_deadline = Instant::now() + Duration::from_secs(15);
+        let mut previous = None;
+        loop {
+            let state = client.snapshot().unwrap();
+            if condition(&state) {
+                return state;
+            }
+            let cursor = state.active.as_ref().and_then(|a| {
+                a.progress.as_ref().map(|p| {
+                    (
+                        a.telemetry.run_id,
+                        a.id,
+                        p.entry,
+                        p.phase,
+                        p.stream_index,
+                        p.bytes,
+                    )
+                })
+            });
+            if cursor.is_some() && cursor != previous {
+                idle_deadline = Instant::now() + Duration::from_secs(15);
+            }
+            previous = cursor;
+            assert!(
+                Instant::now() < idle_deadline && Instant::now() < hard_deadline,
+                "transfer stalled or exceeded its total bound: state={state:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
     fn submit(client: &Client, source: PathBuf, destination: PathBuf) {
         client
             .send(Command::Submit {
@@ -1565,7 +1598,7 @@ mod tests {
                 start: true,
             })
             .unwrap();
-        let done = wait(&client, |s| {
+        let done = wait_for_transfer(&client, |s| {
             s.history.first().is_some_and(|j| j.status == "completed") && s.active.is_none()
         });
         assert!(done.errors.is_empty(), "{:?}", done.errors);
@@ -1584,7 +1617,7 @@ mod tests {
         );
         let old_report = done.last_report.unwrap();
         client.send(Command::Recheck(id)).unwrap();
-        wait(&client, |s| {
+        wait_for_transfer(&client, |s| {
             s.last_report
                 .as_ref()
                 .is_some_and(|r| r.job_id == id && !Arc::ptr_eq(r, &old_report))

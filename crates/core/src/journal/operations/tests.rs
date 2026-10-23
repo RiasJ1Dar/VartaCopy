@@ -168,7 +168,9 @@ fn version_four_dispatch_history_migrates_without_changing_root_jobs_or_checkpoi
     let before = serde_json::to_value(journal.jobs(32, 0).unwrap()).unwrap();
     journal
         .db
-        .execute_batch("DROP TABLE operation_members; PRAGMA user_version=4;")
+        .execute_batch(
+            "DROP TABLE fat_attempts; DROP TABLE operation_members; PRAGMA user_version=4;",
+        )
         .unwrap();
     journal.flush().unwrap();
     drop(journal);

@@ -400,6 +400,11 @@ impl Journal {
             }
             offset += 256;
         }
+        stage.file().write_all(b"],\"fat_attempts\":[")?;
+        let mut first = true;
+        for member in self.operation_members(operation.id)? {
+            self.write_fat_attempts(member.id, stage.file(), &mut first)?;
+        }
         stage.file().write_all(b"]}\n")?;
         stage.file().sync_all()?;
         tx.commit()?;

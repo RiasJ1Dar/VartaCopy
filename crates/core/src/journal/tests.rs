@@ -376,7 +376,7 @@ fn migrates_version_one_atomically_and_recovers_running_jobs() {
         journal.set_job_status(id, "running", None).unwrap();
         journal
             .db
-            .execute_batch("DROP TABLE operation_members; DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; ALTER TABLE jobs DROP COLUMN queue_position; PRAGMA user_version=1;")
+            .execute_batch("DROP TABLE fat_attempts; DROP TABLE operation_members; DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; ALTER TABLE jobs DROP COLUMN queue_position; PRAGMA user_version=1;")
             .unwrap();
         journal.flush().unwrap();
     }
@@ -406,7 +406,7 @@ fn migrates_version_two_jobs_to_copy_and_persists_move() {
     {
         let mut journal = Journal::open(&path).unwrap();
         id = journal.enqueue(&plan, Conflict::Error).unwrap();
-        journal.db.execute_batch("DROP TABLE operation_members; DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; PRAGMA user_version=2;").unwrap();
+        journal.db.execute_batch("DROP TABLE fat_attempts; DROP TABLE operation_members; DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; DROP TABLE cleanup; ALTER TABLE jobs DROP COLUMN operation; PRAGMA user_version=2;").unwrap();
         journal.flush().unwrap();
     }
     let mut journal = Journal::open(&path).unwrap();

@@ -417,7 +417,7 @@ fn version_three_migration_preserves_copy_move_queue_and_cleanup() {
     journal
         .db
         .execute_batch(
-            "DROP TABLE operation_members; DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; PRAGMA user_version=3;",
+            "DROP TABLE fat_attempts; DROP TABLE operation_members; DROP TABLE dispatch_jobs; DROP TABLE dispatch_requests; PRAGMA user_version=3;",
         )
         .unwrap();
     journal.flush().unwrap();

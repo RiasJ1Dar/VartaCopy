@@ -21,6 +21,21 @@ pub(crate) fn explain(details: &str) -> Explanation<'_> {
             "Переміщення з FAT/FAT32 через VartaCopy поки недоступне.",
             "Оберіть копіювання з перевіркою або передайте переміщення через Windows. Джерела не видалялися.",
         )
+    } else if details.contains("Переміщення на FAT/FAT32") {
+        (
+            "Переміщення на FAT/FAT32 нашим рушієм поки недоступне.",
+            "Оберіть копіювання з перевіркою. Джерела не видалялися.",
+        )
+    } else if details.contains("FAT32 не підтримує додаткові потоки") {
+        (
+            "Файл містить додаткові потоки NTFS, які FAT32 не може зберегти.",
+            "Виберіть NTFS, щоб зберегти всі дані. Передачу не розпочато; назва файла є в подробицях.",
+        )
+    } else if details.contains("FAT32 не підтримує файл понад") {
+        (
+            "Файл перевищує обмеження FAT32: 4 ГіБ − 1 байт.",
+            "Для цього файла виберіть NTFS або exFAT. Передачу не розпочато.",
+        )
     } else if details.contains("FileIdInfo")
         && (details.contains("FAT32") || details.contains("exFAT") || details.contains("FAT:"))
     {
@@ -108,6 +123,18 @@ mod tests {
             ("disk full (os error 112)", "недостатньо"),
             ("sharing violation (os error 32)", "зайнятий"),
             ("access denied (os error 5)", "дозволу"),
+            (
+                "FAT32 не підтримує додаткові потоки NTFS (ADS): source.bin",
+                "додаткові потоки",
+            ),
+            (
+                "FAT32 не підтримує файл понад 4 ГіБ − 1 байт: source.bin",
+                "обмеження FAT32",
+            ),
+            (
+                "Переміщення на FAT/FAT32 нашим рушієм поки не підтримується",
+                "Переміщення на FAT",
+            ),
         ] {
             let result = explain(raw);
             assert!(result.summary.contains(expected));

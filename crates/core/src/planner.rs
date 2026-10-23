@@ -462,7 +462,7 @@ pub fn scan(
             if dio(
                 "GetFileInformationByHandleEx(FileIdInfo):ancestor",
                 ancestor,
-                platform::identity(&guard),
+                platform::source_identity(&guard),
             )? == source_identity
             {
                 return Err(io::Error::new(
@@ -499,7 +499,7 @@ pub fn scan(
         destination_parent_identity: dio(
             "GetFileInformationByHandleEx(FileIdInfo):destination",
             &destination_dir,
-            platform::identity(&destination_guard),
+            platform::source_identity(&destination_guard),
         )?,
     };
     let mut stack = Vec::new();
@@ -569,6 +569,7 @@ pub fn scan(
         )?;
     }
     plan.accounted_plan_bytes = budget.used;
+    validate_fat_destination(&plan)?;
     if plan.totals.unsupported > 0
         || (plan.totals.reparse_points > 0 && options.reparse == ReparsePolicy::Reject)
     {
@@ -579,4 +580,76 @@ pub fn scan(
         serde_json::json!({"status":plan.status,"source":diagnostics::path(&plan.source),"destination":diagnostics::path(&plan.destination),"totals":plan.totals,"plan_bytes":plan.accounted_plan_bytes}),
     );
     Ok(plan)
+}
+
+pub(crate) fn validate_fat_destination(plan: &OperationPlan) -> Result<()> {
+    if plan.destination_parent_identity.kind != platform::IdentityKind::FatSource {
+        return Ok(());
+    }
+    for entry in &plan.entries {
+        if let Some(snapshot) = &entry.snapshot {
+            if snapshot.streams.iter().any(|s| !s.name.is_empty()) {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
+                    "FAT32 не підтримує додаткові потоки NTFS (ADS): {}. Копіювання не розпочато, щоб не втратити ці дані.",
+                    plan.source_path(entry).display())).into());
+            }
+            if snapshot.streams.iter().any(|s| s.size > u32::MAX as u64) {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
+                    "FAT32 не підтримує файл понад 4 ГіБ − 1 байт: {}. Виберіть NTFS або exFAT.",
+                    plan.source_path(entry).display())).into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fat_policy_tests {
+    use super::*;
+    #[test]
+    fn fat_size_boundary_and_named_streams_are_checked_before_acceptance() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        fs::write(&source, b"fixture").unwrap();
+        let destination = root.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        let mut plan = scan(
+            &source,
+            &destination,
+            ScanOptions::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        plan.destination_parent_identity.kind = platform::IdentityKind::FatSource;
+        plan.entries[0].snapshot.as_mut().unwrap().streams[0].size = u32::MAX as u64;
+        validate_fat_destination(&plan).unwrap();
+        plan.entries[0].snapshot.as_mut().unwrap().streams[0].size += 1;
+        assert!(
+            validate_fat_destination(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("4 ГіБ")
+        );
+        plan.entries[0].snapshot.as_mut().unwrap().streams[0].size = 0;
+        plan.entries[0]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .streams
+            .push(platform::Stream {
+                name: ":note:$DATA".into(),
+                size: 1,
+            });
+        assert!(
+            validate_fat_destination(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("ADS")
+        );
+        let path = root.path().join("jobs.sqlite");
+        let mut journal = crate::journal::Journal::open(&path).unwrap();
+        assert!(journal.enqueue(&plan, crate::Conflict::Error).is_err());
+        assert!(journal.jobs(10, 0).unwrap().is_empty());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    }
 }
