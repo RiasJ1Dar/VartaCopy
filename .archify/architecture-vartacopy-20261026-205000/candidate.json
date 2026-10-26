@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "VartaCopy: перевірене копіювання з журналом",
+    "output": ".archify/architecture-vartacopy-20261026-205000/vartacopy.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/RiasJ1Dar/VartaCopy.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "69cc5beb6c2bdb97668f8ddf07ca55393b1da0c7"
+    }
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [40, 40],
+    "cols": 5,
+    "cellW": 125,
+    "cellH": 70,
+    "gapX": 70,
+    "gapY": 90
+  },
+  "components": [
+    {
+      "id": "explorer", "type": "external", "label": "Провідник", "sublabel": "меню VartaCopy",
+      "row": 0, "col": 0,
+      "sources": [
+        { "path": "crates/shell-windows/src/registration.rs", "line": 1, "end_line": 7, "label": "власні verb-и" },
+        { "path": "crates/explorer-command/src/lib.rs", "label": "команда меню" }
+      ]
+    },
+    {
+      "id": "cli", "type": "frontend", "label": "CLI", "sublabel": "clap",
+      "row": 0, "col": 1,
+      "sources": [{ "path": "crates/cli/src/main.rs", "line": 16, "end_line": 25 }]
+    },
+    {
+      "id": "fssrc", "type": "external", "label": "джерело", "sublabel": "файли й дерева",
+      "row": 0, "col": 2,
+      "sources": [{ "path": "crates/core/src/planner.rs", "line": 1, "end_line": 19, "label": "межі обходу" }]
+    },
+    {
+      "id": "gui", "type": "frontend", "label": "GUI", "sublabel": "вікно, прогрес",
+      "row": 1, "col": 0,
+      "sources": [
+        { "path": "crates/desktop/src/app.rs", "label": "вікно" },
+        { "path": "crates/desktop/src/worker.rs", "label": "робочий потік" }
+      ]
+    },
+    {
+      "id": "planner", "type": "backend", "label": "planner", "sublabel": "обмежений сканер",
+      "row": 1, "col": 1,
+      "sources": [{ "path": "crates/core/src/planner.rs", "line": 17, "end_line": 19, "label": "ліміти плану" }]
+    },
+    {
+      "id": "journal", "type": "database", "label": "jobs.sqlite3", "sublabel": "журнал версії 7",
+      "row": 1, "col": 2,
+      "sources": [
+        { "path": "crates/core/src/journal.rs", "line": 25, "end_line": 33, "label": "версія і шлях" },
+        { "path": "crates/core/src/journal.rs", "line": 1, "label": "ФС і SQL не одна транзакція" }
+      ]
+    },
+    {
+      "id": "recovery", "type": "backend", "label": "recovery", "sublabel": "продовження",
+      "row": 2, "col": 1,
+      "sources": [
+        { "path": "crates/core/src/recovery.rs", "line": 1, "end_line": 5, "label": "перехешує байти" },
+        { "path": "crates/core/src/recovery.rs", "line": 22, "end_line": 25, "label": "фази" }
+      ]
+    },
+    {
+      "id": "stage", "type": "database", "label": "стейджинг", "sublabel": "тимчасове дерево",
+      "row": 2, "col": 2,
+      "sources": [{ "path": "crates/platform-windows/src/lib.rs", "line": 911, "label": "Stage" }]
+    },
+    {
+      "id": "verify", "type": "security", "label": "BLAKE3 verify", "sublabel": "readback потоків",
+      "row": 2, "col": 3,
+      "sources": [
+        { "path": "crates/core/src/lib.rs", "line": 227, "end_line": 270, "label": "порівняння потоків" },
+        { "path": "crates/core/src/lib.rs", "line": 161, "end_line": 183, "label": "хешування" }
+      ]
+    },
+    {
+      "id": "fsdest", "type": "external", "label": "носій цілі", "sublabel": "NTFS, FAT, exFAT",
+      "row": 2, "col": 4,
+      "sources": [{ "path": "crates/platform-windows/src/lib.rs", "line": 518, "end_line": 558, "label": "профіль носія" }]
+    },
+    {
+      "id": "publish", "type": "backend", "label": "publish", "sublabel": "лише після verify",
+      "row": 3, "col": 2,
+      "sources": [{ "path": "crates/platform-windows/src/lib.rs", "line": 1092, "label": "публікація" }]
+    }
+  ],
+  "connections": [
+    { "id": "expl-gui", "from": "explorer", "to": "gui", "label": "verb", "fromSide": "bottom", "toSide": "top" },
+    { "id": "gui-plan", "from": "gui", "to": "planner", "label": "вибір", "variant": "emphasis" },
+    { "id": "cli-plan", "from": "cli", "to": "planner", "label": "scan", "fromSide": "bottom", "toSide": "top" },
+    { "id": "src-plan", "from": "fssrc", "to": "planner", "label": "обхід" },
+    { "id": "plan-journal", "from": "planner", "to": "journal", "label": "план", "variant": "emphasis" },
+    { "id": "plan-recovery", "from": "planner", "to": "recovery", "label": "entries", "variant": "emphasis", "fromSide": "bottom", "toSide": "top" },
+    { "id": "recovery-journal", "from": "recovery", "to": "journal", "label": "checkpoint" },
+    { "id": "recovery-stage", "from": "recovery", "to": "stage", "label": "пише", "variant": "emphasis" },
+    { "id": "stage-verify", "from": "stage", "to": "verify", "label": "хеш", "variant": "emphasis" },
+    { "id": "src-verify", "from": "fssrc", "to": "verify", "label": "хеш джерела", "variant": "security" },
+    { "id": "verify-publish", "from": "verify", "to": "publish", "label": "ok", "variant": "emphasis" },
+    { "id": "publish-dest", "from": "publish", "to": "fsdest", "label": "публікує", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Чому дані не псуються",
+      "items": [
+        "Дані йдуть у новий тимчасовий файл або дерево, не поверх наявних",
+        "Публікація лише після readback і збігу BLAKE3",
+        "Move видаляє джерело лише після перевірки й фіксації копії",
+        "Передача не делегується Провіднику: типові обробники не підмінюються"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Одна операція",
+      "items": [
+        "Один вибір з одним призначенням — одна операція зі спільним графіком",
+        "Окремі джерела лишаються одиницями журналу для контрольних точок",
+        "Завершені джерела не копіюються повторно при продовженні",
+        "Пауза, скасування й продовження спільні для GUI і CLI"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Межі й носії",
+      "items": [
+        "Профіль цілі читається через відкритий handle до початку приймання",
+        "NTFS/ReFS із FileIdInfo беруть постійні ідентифікатори; інші — цілий тимчасовий корінь",
+        "ADS на FAT/exFAT не вміщуються: передача відхиляється до запису",
+        "Відсутній потрібний API зберігається як помилка, не як успішний пропуск",
+        "Ранній prerelease для Windows 10/11 x64, перевірений на локальній NTFS"
+      ]
+    }
+  ]
+}

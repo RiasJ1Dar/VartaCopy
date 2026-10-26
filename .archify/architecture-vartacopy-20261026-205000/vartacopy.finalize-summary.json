@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "finalize",
+  "status": "fail",
+  "type": "architecture",
+  "quality": "showcase",
+  "specification": {
+    "path": "C:\\Users\\Public\\archify-20261026\\VartaCopy\\.archify\\architecture-vartacopy-20261026-205000\\candidate.json",
+    "sha256": "48a304315cc7c9cd61b85c3180dfce4d8779284b5c2407eb9fa7672e5be62e6a",
+    "bytes": 7398
+  },
+  "artifact": {
+    "path": "C:\\Users\\Public\\archify-20261026\\VartaCopy\\.archify\\architecture-vartacopy-20261026-205000\\vartacopy.html",
+    "sha256": "849b0012e8156da67105a94dea56874fd5790d152b02b7295a42af6813eb01c0",
+    "bytes": 836345
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "fail"
+  },
+  "failedStage": "browser-check",
+  "diagnostics": [
+    {
+      "code": "viewer/browser-check-runtime",
+      "severity": "error",
+      "message": "browser-check could not complete its Chrome inspection.",
+      "subject": {
+        "artifact": "C:\\Users\\Public\\archify-20261026\\VartaCopy\\.archify\\architecture-vartacopy-20261026-205000\\vartacopy.html"
+      },
+      "evidence": {
+        "reason": "Chrome DevTools read pipe failed: stream ended\nChrome process: still running.\nWindows browser startup may have relaunched before connecting to the DevTools pipe. Retry from a non-elevated PowerShell opened normally, outside an elevated or compatibility-mode parent. Archify does not disable browser de-elevation or the sandbox to preserve pipe handles.\nChrome transport: Node v26.5.0, libuv 1.52.1, win32; pid=30340, exitCode=null, signalCode=null.\nChrome read pipe: readable=false, ended=true, destroyed=false, receivedBytes=0, messages=0, bufferedBytes=0.\nChrome write pipe: writable=true, ended=false, destroyed=false, completedWrites=1, writtenBytes=50, bufferedBytes=0."
+      },
+      "supportedFixes": [
+        "resolve the reported Chrome inspection error, then rerun browser-check"
+      ]
+    }
+  ],
+  "diagnosticSummary": {
+    "total": 1,
+    "shown": 1,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "C:\\Users\\Public\\archify-20261026\\VartaCopy\\.archify\\architecture-vartacopy-20261026-205000\\vartacopy.finalize.json",
+    "summaryReceipt": "C:\\Users\\Public\\archify-20261026\\VartaCopy\\.archify\\architecture-vartacopy-20261026-205000\\vartacopy.finalize-summary.json",
+    "browserCheckReceipt": "C:\\Users\\Public\\archify-20261026\\VartaCopy\\.archify\\architecture-vartacopy-20261026-205000\\vartacopy.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-26T17:28:59.599Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 3934,
+  "browserCheck": {
+    "requested": true,
+    "ran": false
+  }
+}

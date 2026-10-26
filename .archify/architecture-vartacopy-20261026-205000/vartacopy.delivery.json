@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "6df7dc7b-121b-4060-8e53-97ea3b975160",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\Public\\archify-20261026\\VartaCopy\\.archify\\architecture-vartacopy-20261026-205000\\candidate.json",
+  "output": "C:\\Users\\Public\\archify-20261026\\VartaCopy\\.archify\\architecture-vartacopy-20261026-205000\\vartacopy.html",
+  "specification": {
+    "sha256": "48a304315cc7c9cd61b85c3180dfce4d8779284b5c2407eb9fa7672e5be62e6a",
+    "bytes": 7398
+  },
+  "artifact": {
+    "sha256": "849b0012e8156da67105a94dea56874fd5790d152b02b7295a42af6813eb01c0",
+    "bytes": 836345
+  }
+}
